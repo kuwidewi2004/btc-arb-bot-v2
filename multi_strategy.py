@@ -229,7 +229,7 @@ def refresh_shared_data():
     # Basis (spot vs futures)
     if now - _basis_cache["fetched_at"] >= 10:
         try:
-            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/ticker/price",
+            r = requests.get(f"{OKX_BASE}/api/v5/public/mark-price",
                              params={"instId": "BTC-USDT-SWAP"}, timeout=5)
             r.raise_for_status()
             _basis_cache["futures"]    = float(r.json()["price"])
@@ -241,7 +241,7 @@ def refresh_shared_data():
     # Open interest
     if now - _oi_cache["fetched_at"] >= 30:
         try:
-            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/openInterest",
+            r = requests.get(f"{OKX_BASE}/api/v5/public/mark-price",
                              params={"instId": "BTC-USDT-SWAP"}, timeout=5)
             r.raise_for_status()
             _oi_cache["prev_oi"]    = _oi_cache["oi"]
@@ -253,7 +253,7 @@ def refresh_shared_data():
     # Liquidations
     if now - _liq_cache["fetched_at"] >= 60:
         try:
-            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/allForceOrders",
+            r = requests.get(f"{OKX_BASE}/api/v5/public/liquidation-orders",
                              params={"symbol": BTC_SYMBOL, "limit": 100}, timeout=5)
             r.raise_for_status()
             orders    = r.json()
@@ -275,7 +275,7 @@ def refresh_shared_data():
     global _volume_fetched
     if now - _volume_fetched >= 60:
         try:
-            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/klines",
+            r = requests.get(f"{OKX_BASE}/api/v5/market/candles",
                              params={"symbol": BTC_SYMBOL, "interval": "1m", "limit": 22},
                              timeout=8)
             r.raise_for_status()
@@ -791,4 +791,6 @@ def _max(a, b):
 if __name__ == "__main__":
     print("MULTI-STRATEGY BOT STARTING", flush=True)
     run()
+
+
 
