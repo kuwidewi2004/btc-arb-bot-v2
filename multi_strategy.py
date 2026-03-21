@@ -746,7 +746,6 @@ def run():
     last_market_fetch = 0
     last_summary      = 0
     last_snapshot     = 0
-    last_snapshot     = 0
 
     while True:
         try:
@@ -823,25 +822,6 @@ def run():
                     "liq_total_usd":  round(liq_total, 2),
                     "secs_left":      round(secs_left),
                     "market_question": current_market.question if current_market else "",
-                })
-                last_snapshot = time.time()
-
-            # Save signal snapshot every 5 minutes
-            if time.time() - last_snapshot > 300:
-                cl_price, cl_age = fetch_chainlink_price()
-                prices           = fetch_poly_prices(current_market)
-                supabase_snapshot({
-                    "timestamp":     datetime.now(timezone.utc).isoformat(),
-                    "btc_price":     round(spot, 2),
-                    "funding_rate":  round(_funding_cache["rate"], 6),
-                    "basis_pct":     round(basis, 4),
-                    "chainlink_div": round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0,
-                    "chainlink_age": round(cl_age or 0, 1),
-                    "up_mid":        round(prices["up_mid"], 4),
-                    "spread":        round(prices["spread"], 4),
-                    "liq_long":      round(_liq_cache["long"], 2),
-                    "liq_short":     round(_liq_cache["short"], 2),
-                    "question":      current_market.question,
                 })
                 last_snapshot = time.time()
 

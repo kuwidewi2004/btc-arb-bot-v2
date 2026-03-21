@@ -105,6 +105,29 @@ def fetch_strategy_summary() -> list:
         return []
 
 
+def resolve_snapshots(outcome: str, condition_id: str):
+    """Update all snapshot rows for this market with the resolved outcome."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/snapshots",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
+            json={"resolved_outcome": outcome},
+            timeout=10,
+        )
+        if resp.status_code in (200, 204):
+            log.info(f"Updated snapshots for {condition_id[:12]}... → {outcome}")
+    except Exception as e:
+        log.warning(f"Snapshot resolution failed: {e}")
+
+
 # --------------------------------------------------------- POLYMARKET --------
 
 def fetch_market_outcome(condition_id: str) -> dict:
@@ -204,6 +227,7 @@ def resolve_open_trades():
             log.info(f"Resolved: {status} | {side} vs {outcome} | "
                      f"PnL={actual_pnl:+.3f} | {trade.get('strategy','')} | "
                      f"{trade.get('question','')[:50]}")
+            resolve_snapshots(outcome, condition_id)
             resolved_count += 1
 
         time.sleep(0.2)  # avoid hammering APIs
