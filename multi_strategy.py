@@ -74,10 +74,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 def supabase_insert(record: dict):
     """Insert a trade record into Supabase. Never blocks on failure."""
     if not SUPABASE_URL or not SUPABASE_KEY:
-        log.warning("Supabase credentials missing")
         return
     try:
-        r = requests.post(
+        requests.post(
             f"{SUPABASE_URL}/rest/v1/trades",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -88,9 +87,57 @@ def supabase_insert(record: dict):
             json=record,
             timeout=5,
         )
-        log.info(f"Supabase insert status: {r.status_code}")
     except Exception as e:
         log.warning(f"Supabase insert failed: {e}")
+
+
+def supabase_snapshot(snapshot: dict):
+    """Insert a signal snapshot into Supabase every 5 minutes."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/signal_snapshots",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            json=snapshot,
+            timeout=5,
+        )
+        if r.status_code == 201:
+            log.info(f"Supabase snapshot saved: {r.status_code}")
+        else:
+            log.warning(f"Supabase snapshot failed: {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        log.warning(f"Supabase snapshot error: {e}")
+
+
+def supabase_snapshot(snapshot: dict):
+    """Insert a signal snapshot into Supabase every 5 minutes."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/signal_snapshots",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            json=snapshot,
+            timeout=5,
+        )
+        if r.status_code == 201:
+            log.info("Snapshot saved to Supabase")
+        else:
+            log.warning(f"Snapshot insert status: {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        log.warning(f"Snapshot insert failed: {e}")
+
 
 # --------------------------------------------------------------- DATACLASSES --
 
@@ -689,6 +736,8 @@ def run():
     current_market    = None
     last_market_fetch = 0
     last_summary      = 0
+    last_snapshot     = 0
+    last_snapshot     = 0
 
     while True:
         try:
@@ -740,6 +789,52 @@ def run():
 
             log.info(f"BTC=${spot:.2f} | {secs_left:.0f}s left | "
                      f"funding={_funding_cache['rate']:+.6f} | basis={basis:+.3f}%")
+
+            # Save signal snapshot every 5 minutes
+            if time.time() - last_snapshot > 300:
+                cl_price, cl_age = fetch_chainlink_price()
+                cl_div = round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0.0
+                candles = list(_volume_history)
+                recent_vol = candles[-3:] if len(candles) >= 3 else []
+                total_vol = sum(c["volume"] for c in recent_vol)
+                buy_vol   = sum(c["buy_vol"] for c in recent_vol)
+                buy_ratio = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
+                liq_total = _liq_cache["long"] + _liq_cache["short"]
+                prices    = fetch_poly_prices(current_market) if current_market else {}
+                supabase_snapshot({
+                    "timestamp":      datetime.now(timezone.utc).isoformat(),
+                    "btc_price":      round(spot, 2),
+                    "funding_rate":   round(_funding_cache["rate"], 6),
+                    "basis_pct":      round(basis, 4),
+                    "chainlink_div":  cl_div,
+                    "chainlink_age":  round(cl_age, 1) if cl_age else 30.0,
+                    "up_mid":         round(prices.get("up_mid", 0.5), 4),
+                    "spread":         round(prices.get("spread", 0.1), 4),
+                    "volume_buy_ratio": buy_ratio,
+                    "liq_total_usd":  round(liq_total, 2),
+                    "secs_left":      round(secs_left),
+                    "market_question": current_market.question if current_market else "",
+                })
+                last_snapshot = time.time()
+
+            # Save signal snapshot every 5 minutes
+            if time.time() - last_snapshot > 300:
+                cl_price, cl_age = fetch_chainlink_price()
+                prices           = fetch_poly_prices(current_market)
+                supabase_snapshot({
+                    "timestamp":     datetime.now(timezone.utc).isoformat(),
+                    "btc_price":     round(spot, 2),
+                    "funding_rate":  round(_funding_cache["rate"], 6),
+                    "basis_pct":     round(basis, 4),
+                    "chainlink_div": round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0,
+                    "chainlink_age": round(cl_age or 0, 1),
+                    "up_mid":        round(prices["up_mid"], 4),
+                    "spread":        round(prices["spread"], 4),
+                    "liq_long":      round(_liq_cache["long"], 2),
+                    "liq_short":     round(_liq_cache["short"], 2),
+                    "question":      current_market.question,
+                })
+                last_snapshot = time.time()
 
             # Run all 6 strategies
             positions["chainlink"]   = strategy_chainlink_arb(
