@@ -435,13 +435,22 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
         cl_history.append({"div": divergence, "dir": direction})
 
         if len(cl_history) < 3:
+            log.debug(f"[Chainlink] waiting for history ({len(cl_history)}/3)")
             return position
         recent = list(cl_history)[-3:]
         if not all(abs(s["div"]) >= 0.15 for s in recent):
+            log.info(f"[Chainlink] div too small: {[round(s['div'],4) for s in recent]}")
             return position
         if not all(s["dir"] == direction for s in recent):
+            log.info(f"[Chainlink] direction inconsistent")
             return position
-        if cl_age < 15 or secs_left < 90 or position:
+        if cl_age < 15:
+            log.info(f"[Chainlink] CL too fresh: {cl_age:.0f}s")
+            return position
+        if secs_left < 90:
+            log.info(f"[Chainlink] market closing soon: {secs_left:.0f}s")
+            return position
+        if position:
             return position
 
         prices = fetch_poly_prices(market)
@@ -471,7 +480,10 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
     """
     try:
         rate = _funding_cache["rate"]
-        if abs(rate) < 0.0005 or secs_left < 60 or position:
+        if abs(rate) < 0.0005:
+            log.info(f"[Funding] rate not extreme: {rate:+.6f} (need ±0.0005)")
+            return position
+        if secs_left < 60 or position:
             return position
 
         direction = "DOWN" if rate > 0.0005 else "UP"
@@ -544,6 +556,7 @@ def strategy_basis_arb(market, secs_left, tracker, position):
 
         basis_pct = (futures - spot) / spot * 100
         if abs(basis_pct) < 0.05:
+            log.info(f"[Basis] too small: {basis_pct:+.4f}% (need ±0.05%)")
             return position
 
         direction = "DOWN" if basis_pct > 0 else "UP"
@@ -581,7 +594,11 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         up_mid    = prices["up_mid"]
         deviation = up_mid - 0.50
 
-        if prices["spread"] > 0.04 or abs(deviation) < 0.04:
+        if prices["spread"] > 0.04:
+            log.info(f"[Odds] spread too wide: {prices['spread']:.4f}")
+            return position
+        if abs(deviation) < 0.04:
+            log.info(f"[Odds] deviation too small: {deviation:+.4f} (need ±0.04)")
             return position
 
         direction = "DOWN" if deviation > 0 else "UP"
@@ -625,10 +642,10 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 
         if buy_ratio > 0.58:
             direction = "UP"
-            intensity = min((buy_ratio - 0.60) / 0.20, 1.0)
+            intensity = min((buy_ratio - 0.58) / 0.20, 1.0)
         elif buy_ratio < 0.42:
             direction = "DOWN"
-            intensity = min((0.40 - buy_ratio) / 0.20, 1.0)
+            intensity = min((0.42 - buy_ratio) / 0.20, 1.0)
         else:
             return position
 
