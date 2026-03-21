@@ -50,11 +50,13 @@ def sb_headers() -> dict:
 
 
 def fetch_open_trades() -> list:
+    """Fetch all OPEN trades from Supabase that haven't been resolved yet."""
     try:
-        url = f"{SUPABASE_URL}/rest/v1/trades?action=eq.OPEN&resolved_outcome=is.null&select=id,strategy,side,price,size,condition_id,question,created_at"
-        resp = requests.get(url, headers={**sb_headers(), "Range": "0-999"}, timeout=10)
-        log.info(f"Fetch open trades status: {resp.status_code}")
-        log.info(f"Fetch open trades response: {resp.text[:200]}")
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/trades?action=eq.OPEN&resolved_outcome=is.null&select=id,strategy,side,price,size,condition_id,question,created_at",
+            headers={**sb_headers(), "Range": "0-999"},
+            timeout=10,
+        )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -124,6 +126,10 @@ def resolve_snapshots(outcome: str, condition_id: str):
 # --------------------------------------------------------- POLYMARKET --------
 
 def fetch_market_outcome(condition_id: str) -> dict:
+    """
+    Fetch the actual resolved outcome from Polymarket.
+    Returns dict with resolved, outcome, up_price, down_price.
+    """
     try:
         resp = requests.get(
             f"{GAMMA_API}/markets",
@@ -132,16 +138,35 @@ def fetch_market_outcome(condition_id: str) -> dict:
         )
         resp.raise_for_status()
         data = resp.json()
-        log.info(f"Outcome fetch for {condition_id[:12]}... status={resp.status_code} items={len(data) if data else 0}")
         if not data:
-            log.info("No data returned from Polymarket")
             return {"resolved": False}
 
         m      = data[0] if isinstance(data, list) else data
         closed = m.get("closed", False)
-        log.info(f"Market closed={closed} outcomePrices={m.get('outcomePrices','none')}")
         if not closed:
             return {"resolved": False}
+
+        outcome_prices = json.loads(m.get("outcomePrices", "[0,0]"))
+        up_price   = float(outcome_prices[0])
+        down_price = float(outcome_prices[1])
+
+        if up_price > 0.9:
+            outcome = "UP"
+        elif down_price > 0.9:
+            outcome = "DOWN"
+        else:
+            return {"resolved": False}
+
+        return {
+            "resolved":   True,
+            "outcome":    outcome,
+            "up_price":   up_price,
+            "down_price": down_price,
+        }
+    except Exception as e:
+        log.warning(f"Outcome fetch failed for {condition_id}: {e}")
+        return {"resolved": False}
+
 
 # --------------------------------------------------------- MAIN LOOP ---------
 
