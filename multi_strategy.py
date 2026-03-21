@@ -74,9 +74,10 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 def supabase_insert(record: dict):
     """Insert a trade record into Supabase. Never blocks on failure."""
     if not SUPABASE_URL or not SUPABASE_KEY:
+        log.warning("Supabase credentials missing")
         return
     try:
-        requests.post(
+        r = requests.post(
             f"{SUPABASE_URL}/rest/v1/trades",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -87,9 +88,9 @@ def supabase_insert(record: dict):
             json=record,
             timeout=5,
         )
+        log.info(f"Supabase insert status: {r.status_code}")
     except Exception as e:
         log.warning(f"Supabase insert failed: {e}")
-
 
 # --------------------------------------------------------------- DATACLASSES --
 
