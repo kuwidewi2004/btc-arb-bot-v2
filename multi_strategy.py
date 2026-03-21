@@ -6,7 +6,7 @@ Runs 6 independent mechanical edge strategies simultaneously in dry run.
 Strategies:
   1. Chainlink lag arb     — Coinbase (real-time) vs Chainlink (lagging oracle)
   2. Funding rate reversion — extreme funding predicts reversion (OKX data)
-  3. Liquidation cascade   — large liquidations predict direction
+  3. Liquidation cascade   — large liquidations predict direction (OKX data)
   4. Basis arbitrage       — futures premium/discount mean reversion (OKX data)
   5. Odds mispricing       — Polymarket odds deviating from 50/50
   6. Volume clock          — aggressive order flow before resolution
@@ -17,6 +17,11 @@ Data sources (all work on Railway US servers):
   - Volume:         OKX klines (no geo-blocking)
   - Liquidations:   OKX liquidation feed (no geo-blocking)
   - Chainlink:      CryptoCompare + Chainlink API
+
+FIXES (v2.1):
+  - Resolution: markets now resolve at 1.0/0.0 by fetching actual winner from Gamma API
+  - flat_pnl: now uses actual position size instead of hardcoded $10
+  - Signal logging: every non-firing signal evaluation is logged to Supabase signal_log table
 """
 
 import os
@@ -64,7 +69,6 @@ POLL_SEC         = 5
 SKIP_HOURS_UTC   = {0, 1, 2, 3, 4, 5}
 
 
-
 # ---------------------------------------------------------------- SUPABASE ---
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -108,35 +112,67 @@ def supabase_snapshot(snapshot: dict):
             timeout=5,
         )
         if r.status_code == 201:
-            log.info(f"Supabase snapshot saved: {r.status_code}")
+            log.info("Snapshot saved to Supabase")
         else:
-            log.warning(f"Supabase snapshot failed: {r.status_code} {r.text[:100]}")
+            log.warning(f"Snapshot insert status: {r.status_code} {r.text[:100]}")
     except Exception as e:
-        log.warning(f"Supabase snapshot error: {e}")
+        log.warning(f"Snapshot insert failed: {e}")
 
 
-def supabase_snapshot(snapshot: dict):
-    """Insert a signal snapshot into Supabase every 5 minutes."""
+# FIX 3: Signal-level logging — logs every evaluation that does NOT result in a trade
+def supabase_signal_log(entry: dict):
+    """
+    Log every signal evaluation that did NOT fire to Supabase signal_log table.
+    This is the most important diagnostic tool — shows exactly why strategies
+    aren't trading and by how much they're missing thresholds.
+
+    Required Supabase table (create if it doesn't exist):
+        CREATE TABLE signal_log (
+            id            bigserial PRIMARY KEY,
+            created_at    timestamptz DEFAULT now(),
+            strategy      text,
+            condition_id  text,
+            secs_left     float,
+            signal_value  float,
+            threshold     float,
+            fired         boolean,
+            reason        text,
+            market_question text
+        );
+    """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/signal_snapshots",
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/signal_log",
             headers={
                 "apikey":        SUPABASE_KEY,
                 "Authorization": f"Bearer {SUPABASE_KEY}",
                 "Content-Type":  "application/json",
                 "Prefer":        "return=minimal",
             },
-            json=snapshot,
+            json=entry,
             timeout=5,
         )
-        if r.status_code == 201:
-            log.info("Snapshot saved to Supabase")
-        else:
-            log.warning(f"Snapshot insert status: {r.status_code} {r.text[:100]}")
     except Exception as e:
-        log.warning(f"Snapshot insert failed: {e}")
+        log.warning(f"Supabase signal_log insert failed: {e}")
+
+
+def _log_signal(strategy: str, market, secs_left: float,
+                signal_value: float, threshold: float, reason: str):
+    """Helper — builds and sends a signal log entry for a non-firing evaluation."""
+    entry = {
+        "strategy":       strategy,
+        "condition_id":   market.condition_id if market else "",
+        "market_question": market.question if market else "",
+        "secs_left":      round(secs_left, 1),
+        "signal_value":   round(signal_value, 6),
+        "threshold":      round(threshold, 6),
+        "fired":          False,
+        "reason":         reason,
+    }
+    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f}")
+    supabase_signal_log(entry)
 
 
 # --------------------------------------------------------------- DATACLASSES --
@@ -209,6 +245,12 @@ class StrategyTracker:
 
     def close(self, side: str, entry_price: float, exit_price: float,
               size: float, market: Market, reason: str = "RESOLVED"):
+        """
+        FIX 1: exit_price is now 1.0 (win) or 0.0 (loss) when called from
+        resolve_positions(), giving accurate PnL.
+
+        FIX 2: flat_pnl now uses actual `size` instead of hardcoded $10.
+        """
         if side == "UP":
             pnl = (exit_price - entry_price) * size / entry_price
         else:
@@ -216,8 +258,11 @@ class StrategyTracker:
         fee = size * TAKER_FEE
         pnl -= fee
         self.balance += size + pnl
-        if pnl > 0: self.wins   += 1
-        else:       self.losses += 1
+        if pnl > 0:
+            self.wins   += 1
+        else:
+            self.losses += 1
+
         entry = {
             "timestamp":    datetime.now(timezone.utc).isoformat(),
             "action":       "CLOSE",
@@ -235,8 +280,14 @@ class StrategyTracker:
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
-        flat_pnl = (10 * (1 / entry_price - 1) - 10 * TAKER_FEE * 2) if pnl > 0                    else (-10 - 10 * TAKER_FEE * 2)
-        edge     = (1 / entry_price - 1) if pnl > 0 else -1.0
+
+        # FIX 2: flat_pnl now scales with actual size, not hardcoded $10
+        if pnl > 0:
+            flat_pnl = (size * (1 / entry_price - 1)) - (size * TAKER_FEE * 2)
+        else:
+            flat_pnl = -size - (size * TAKER_FEE * 2)
+        edge = (1 / entry_price - 1) if pnl > 0 else -1.0
+
         supabase_insert({
             "strategy":     self.name,
             "action":       "CLOSE",
@@ -252,8 +303,9 @@ class StrategyTracker:
         })
         total = self.wins + self.losses
         wr    = (self.wins / total * 100) if total else 0
-        log.info(f"[{self.name}] CLOSE {side} ({reason}) | PnL={pnl:+.3f} | "
-                 f"balance=${self.balance:.2f} | WR={wr:.0f}% ({self.wins}W/{self.losses}L)")
+        log.info(f"[{self.name}] CLOSE {side} ({reason}) | exit={exit_price:.2f} | "
+                 f"PnL={pnl:+.3f} | balance=${self.balance:.2f} | "
+                 f"WR={wr:.0f}% ({self.wins}W/{self.losses}L)")
 
     def summary(self) -> str:
         total = self.wins + self.losses
@@ -355,8 +407,8 @@ def refresh_shared_data():
                 if float(o.get("ts", 0)) < cutoff_ms:
                     continue
                 usd = float(o.get("sz", 0)) * float(o.get("bkPx", 0))
-                if o.get("side") == "buy":  short_liqs += usd  # short being liquidated
-                else:                       long_liqs  += usd  # long being liquidated
+                if o.get("side") == "buy":  short_liqs += usd
+                else:                       long_liqs  += usd
             _liq_cache["long"]       = long_liqs
             _liq_cache["short"]      = short_liqs
             _liq_cache["fetched_at"] = now
@@ -375,7 +427,6 @@ def refresh_shared_data():
             candles = r.json().get("data", [])
             _volume_history.clear()
             for c in candles:
-                # OKX format: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
                 close = float(c[4])
                 open_ = float(c[1])
                 vol   = float(c[5])
@@ -472,6 +523,91 @@ def fetch_poly_prices(market: Market) -> dict:
         return {"up_mid": 0.5, "down_mid": 0.5, "spread": 0.1}
 
 
+# FIX 1: Fetch the actual winner token from Gamma API after market resolves
+def fetch_market_winner(condition_id: str) -> Optional[str]:
+    """
+    Calls Gamma API to get the resolved winner of a market.
+    Returns "UP" if the up token won, "DOWN" if the down token won, None if unresolved.
+
+    Gamma API returns a `winner` field containing the winning token address
+    once the market has resolved. We compare this against the known token IDs
+    to determine which side won.
+    """
+    try:
+        r = requests.get(
+            f"{GAMMA_API}/markets",
+            params={"conditionId": condition_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        m = data[0]
+        # Market must be resolved/closed
+        if not m.get("closed") and not m.get("resolved"):
+            return None
+        winner_token = m.get("winner") or m.get("winnerOutcome")
+        if not winner_token:
+            return None
+        token_ids = json.loads(m.get("clobTokenIds", "[]"))
+        if not token_ids or len(token_ids) < 2:
+            return None
+        # token_ids[0] = UP token, token_ids[1] = DOWN token
+        if str(winner_token).lower() == str(token_ids[0]).lower():
+            return "UP"
+        elif str(winner_token).lower() == str(token_ids[1]).lower():
+            return "DOWN"
+        # Fallback: some markets use outcome index
+        outcome = m.get("outcomeIndex")
+        if outcome == 0:
+            return "UP"
+        elif outcome == 1:
+            return "DOWN"
+        return None
+    except Exception as e:
+        log.warning(f"fetch_market_winner failed for {condition_id}: {e}")
+        return None
+
+
+def resolve_positions(positions: dict, trackers: dict, market: Market):
+    """
+    FIX 1: Resolve all open positions at actual outcome (1.0 win / 0.0 loss)
+    instead of midpoint price.
+
+    Polls Gamma API up to 5 times with a 3-second delay to get the winner.
+    Falls back to midpoint price only if Gamma API doesn't return a winner
+    after all retries (e.g. very delayed resolution).
+    """
+    winner = None
+    for attempt in range(5):
+        winner = fetch_market_winner(market.condition_id)
+        if winner:
+            log.info(f"Market resolved: {market.question} → winner={winner} (attempt {attempt+1})")
+            break
+        log.info(f"Waiting for resolution... attempt {attempt+1}/5")
+        time.sleep(3)
+
+    for key, pos in positions.items():
+        if not pos:
+            continue
+        if winner:
+            # Correct resolution: 1.0 if we picked the right side, 0.0 if wrong
+            exit_price = 1.0 if pos.side == winner else 0.0
+            reason     = "RESOLVED_WIN" if pos.side == winner else "RESOLVED_LOSS"
+        else:
+            # Fallback: couldn't get winner, use midpoint (less accurate)
+            log.warning(f"Could not resolve winner for {market.condition_id}, using midpoint fallback")
+            prices     = fetch_poly_prices(market)
+            exit_price = prices["up_mid"] if pos.side == "UP" else prices["down_mid"]
+            reason     = "MARKET_CLOSE_FALLBACK"
+        trackers[key].close(
+            pos.side, pos.entry_price, exit_price, pos.size, market, reason
+        )
+
+    return {k: None for k in positions}
+
+
 # --------------------------------------------------------- STRATEGIES --------
 
 def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
@@ -494,24 +630,41 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
         if len(cl_history) < 3:
             log.debug(f"[Chainlink] waiting for history ({len(cl_history)}/3)")
             return position
+
         recent = list(cl_history)[-3:]
+
         if not all(abs(s["div"]) >= 0.15 for s in recent):
-            log.info(f"[Chainlink] div too small: {[round(s['div'],4) for s in recent]}")
+            _log_signal("Chainlink Arb", market, secs_left,
+                        signal_value=abs(divergence), threshold=0.15,
+                        reason="divergence_below_threshold")
             return position
+
         if not all(s["dir"] == direction for s in recent):
-            log.info(f"[Chainlink] direction inconsistent")
+            _log_signal("Chainlink Arb", market, secs_left,
+                        signal_value=abs(divergence), threshold=0.15,
+                        reason="direction_inconsistent")
             return position
+
         if cl_age < 15:
-            log.info(f"[Chainlink] CL too fresh: {cl_age:.0f}s")
+            _log_signal("Chainlink Arb", market, secs_left,
+                        signal_value=cl_age, threshold=15,
+                        reason="chainlink_too_fresh")
             return position
+
         if secs_left < 90:
-            log.info(f"[Chainlink] market closing soon: {secs_left:.0f}s")
+            _log_signal("Chainlink Arb", market, secs_left,
+                        signal_value=secs_left, threshold=90,
+                        reason="market_closing_soon")
             return position
+
         if position:
             return position
 
         prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
+            _log_signal("Chainlink Arb", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="spread_too_wide")
             return position
 
         price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
@@ -537,15 +690,28 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
     """
     try:
         rate = _funding_cache["rate"]
+
         if abs(rate) < 0.0005:
-            log.info(f"[Funding] rate not extreme: {rate:+.6f} (need ±0.0005)")
+            _log_signal("Funding Reversion", market, secs_left,
+                        signal_value=abs(rate), threshold=0.0005,
+                        reason="funding_rate_not_extreme")
             return position
-        if secs_left < 60 or position:
+
+        if secs_left < 60:
+            _log_signal("Funding Reversion", market, secs_left,
+                        signal_value=secs_left, threshold=60,
+                        reason="market_closing_soon")
+            return position
+
+        if position:
             return position
 
         direction = "DOWN" if rate > 0.0005 else "UP"
         prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
+            _log_signal("Funding Reversion", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="spread_too_wide")
             return position
 
         price     = prices["up_mid"] if direction == "UP" else prices["down_mid"]
@@ -575,13 +741,28 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         short_liqs = _liq_cache["short"]
         total      = long_liqs + short_liqs
 
-        if total < 300_000 or secs_left < 60 or position:
+        if total < 300_000:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=total, threshold=300_000,
+                        reason="liquidation_volume_too_low")
+            return position
+
+        if secs_left < 60:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=secs_left, threshold=60,
+                        reason="market_closing_soon")
+            return position
+
+        if position:
             return position
 
         direction = "DOWN" if long_liqs > short_liqs else "UP"
         intensity = min(total / 2_000_000, 1.0)
         prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="spread_too_wide")
             return position
 
         price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
@@ -608,18 +789,34 @@ def strategy_basis_arb(market, secs_left, tracker, position):
     try:
         spot    = _basis_cache["spot"]
         futures = _basis_cache["futures"]
-        if spot == 0 or futures == 0 or secs_left < 60 or position:
+
+        if spot == 0 or futures == 0:
             return position
 
         basis_pct = (futures - spot) / spot * 100
+
         if abs(basis_pct) < 0.10:
-            log.info(f"[Basis] too small: {basis_pct:+.4f}% (need ±0.10%)")
+            _log_signal("Basis Arb", market, secs_left,
+                        signal_value=abs(basis_pct), threshold=0.10,
+                        reason="basis_too_small")
+            return position
+
+        if secs_left < 60:
+            _log_signal("Basis Arb", market, secs_left,
+                        signal_value=secs_left, threshold=60,
+                        reason="market_closing_soon")
+            return position
+
+        if position:
             return position
 
         direction = "DOWN" if basis_pct > 0 else "UP"
         intensity = min(abs(basis_pct) / 0.3, 1.0)
         prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
+            _log_signal("Basis Arb", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="spread_too_wide")
             return position
 
         price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
@@ -644,7 +841,19 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
     bet on reversion back toward 0.50.
     """
     try:
-        if secs_left < 120 or secs_left > 270 or position:
+        if secs_left < 120:
+            _log_signal("Odds Mispricing", market, secs_left,
+                        signal_value=secs_left, threshold=120,
+                        reason="too_close_to_resolution")
+            return position
+
+        if secs_left > 270:
+            _log_signal("Odds Mispricing", market, secs_left,
+                        signal_value=secs_left, threshold=270,
+                        reason="too_early_in_market")
+            return position
+
+        if position:
             return position
 
         prices    = fetch_poly_prices(market)
@@ -652,10 +861,15 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         deviation = up_mid - 0.50
 
         if prices["spread"] > 0.04:
-            log.info(f"[Odds] spread too wide: {prices['spread']:.4f}")
+            _log_signal("Odds Mispricing", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.04,
+                        reason="spread_too_wide")
             return position
+
         if abs(deviation) < 0.08:
-            log.info(f"[Odds] deviation too small: {deviation:+.4f} (need ±0.08)")
+            _log_signal("Odds Mispricing", market, secs_left,
+                        signal_value=abs(deviation), threshold=0.08,
+                        reason="deviation_too_small")
             return position
 
         direction = "DOWN" if deviation > 0 else "UP"
@@ -682,9 +896,25 @@ def strategy_volume_clock(market, secs_left, tracker, position):
     from OKX klines predicts direction.
     """
     try:
-        if secs_left > 90 or secs_left < 20 or position:
+        if secs_left > 90:
+            _log_signal("Volume Clock", market, secs_left,
+                        signal_value=secs_left, threshold=90,
+                        reason="not_in_volume_window_yet")
             return position
+
+        if secs_left < 20:
+            _log_signal("Volume Clock", market, secs_left,
+                        signal_value=secs_left, threshold=20,
+                        reason="too_close_to_resolution")
+            return position
+
+        if position:
+            return position
+
         if len(_volume_history) < 5:
+            _log_signal("Volume Clock", market, secs_left,
+                        signal_value=len(_volume_history), threshold=5,
+                        reason="insufficient_volume_history")
             return position
 
         candles   = list(_volume_history)
@@ -704,10 +934,16 @@ def strategy_volume_clock(market, secs_left, tracker, position):
             direction = "DOWN"
             intensity = min((0.40 - buy_ratio) / 0.20, 1.0)
         else:
+            _log_signal("Volume Clock", market, secs_left,
+                        signal_value=buy_ratio, threshold=0.60,
+                        reason="buy_ratio_neutral")
             return position
 
         prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
+            _log_signal("Volume Clock", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="spread_too_wide")
             return position
 
         price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
@@ -727,8 +963,9 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v2")
+    log.info("Multi-Strategy Mechanical Edge Simulator v2.1")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
+    log.info("Fixes: resolution at 1.0/0.0 | flat_pnl uses actual size | signal logging")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
 
     trackers = {
@@ -777,16 +1014,11 @@ def run():
 
             secs_left = (current_market.end_time - now).total_seconds()
 
-            # Market expired — close all positions
+            # FIX 1: Market expired — resolve at actual outcome (1.0/0.0)
             if secs_left <= 0:
-                prices = fetch_poly_prices(current_market)
-                for key, pos in positions.items():
-                    if pos:
-                        exit_px = prices["up_mid"] if pos.side == "UP" else prices["down_mid"]
-                        trackers[key].close(pos.side, pos.entry_price, exit_px,
-                                            pos.size, current_market, "MARKET_CLOSE")
-                positions         = {k: None for k in trackers}
-                current_market    = None
+                log.info(f"Market expired: {current_market.question} — resolving positions")
+                positions      = resolve_positions(positions, trackers, current_market)
+                current_market = None
                 last_market_fetch = 0
                 time.sleep(5)
                 continue
@@ -873,5 +1105,5 @@ def run():
 
 
 if __name__ == "__main__":
-    print("MULTI-STRATEGY BOT STARTING", flush=True)
+    print("MULTI-STRATEGY BOT STARTING v2.1", flush=True)
     run()
