@@ -221,6 +221,7 @@ def refresh_shared_data():
                              params={"symbol": BTC_SYMBOL}, timeout=5)
             r.raise_for_status()
             _funding_cache["rate"]       = float(r.json()["lastFundingRate"])
+            print(f"FUNDING RATE: {_funding_cache['rate']}", flush=True)
             _funding_cache["fetched_at"] = now
         except Exception:
             pass
