@@ -525,50 +525,34 @@ def fetch_poly_prices(market: Market) -> dict:
 
 # FIX 1: Fetch the actual winner token from Gamma API after market resolves
 def fetch_market_winner(condition_id: str) -> Optional[str]:
-    """
-    Calls Gamma API to get the resolved winner of a market.
-    Returns "UP" if the up token won, "DOWN" if the down token won, None if unresolved.
-
-    Gamma API returns a `winner` field containing the winning token address
-    once the market has resolved. We compare this against the known token IDs
-    to determine which side won.
-    """
-    try:
-        r = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"conditionId": condition_id},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        m = data[0]
-        # Market must be resolved/closed
-        if not m.get("closed") and not m.get("resolved"):
-            return None
-        winner_token = m.get("winner") or m.get("winnerOutcome")
-        if not winner_token:
-            return None
-        token_ids = json.loads(m.get("clobTokenIds", "[]"))
-        if not token_ids or len(token_ids) < 2:
-            return None
-        # token_ids[0] = UP token, token_ids[1] = DOWN token
-        if str(winner_token).lower() == str(token_ids[0]).lower():
-            return "UP"
-        elif str(winner_token).lower() == str(token_ids[1]).lower():
-            return "DOWN"
-        # Fallback: some markets use outcome index
-        outcome = m.get("outcomeIndex")
-        if outcome == 0:
-            return "UP"
-        elif outcome == 1:
-            return "DOWN"
-        return None
-    except Exception as e:
-        log.warning(f"fetch_market_winner failed for {condition_id}: {e}")
-        return None
-
+    for attempt in range(10):          # was 5, now 10
+        try:
+            r = requests.get(
+                f"{GAMMA_API}/markets",
+                params={"conditionId": condition_id},
+                timeout=10,
+            )
+            data = r.json()
+            if not data:
+                time.sleep(5)
+                continue
+            m = data[0]
+            prices = json.loads(m.get("outcomePrices", '["0","0"]'))
+            up_price   = float(prices[0])
+            down_price = float(prices[1])
+            if up_price > 0.9:
+                log.info(f"Resolved UP (attempt {attempt+1})")
+                return "UP"
+            elif down_price > 0.9:
+                log.info(f"Resolved DOWN (attempt {attempt+1})")
+                return "DOWN"
+            else:
+                log.info(f"Not resolved yet, waiting... attempt {attempt+1}/10")
+                time.sleep(8)          # was 3, now 8 — gives Gamma more time
+        except Exception as e:
+            log.warning(f"fetch_market_winner error: {e}")
+            time.sleep(5)
+    return None
 
 def resolve_positions(positions: dict, trackers: dict, market: Market):
     """
