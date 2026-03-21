@@ -627,7 +627,9 @@ def fetch_current_btc_market() -> Optional[Market]:
         )
         resp.raise_for_status()
         markets = resp.json()
+        print(f"MARKETS RESPONSE: {len(markets)} items", flush=True)
         if not markets:
+            print("NO MARKETS FOUND", flush=True)
             return None
         now   = datetime.now(timezone.utc)
         valid = [(datetime.fromisoformat(m["endDate"].replace("Z", "+00:00")), m)
