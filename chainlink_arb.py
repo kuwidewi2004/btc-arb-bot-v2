@@ -550,72 +550,54 @@ def log_arb_trade(action: str, side: str, size: float, price: float,
 # --------------------------------------------------------- MARKET DISCOVERY --
  
 def fetch_current_btc_market() -> Optional[Market]:
-    """Fetch the currently active BTC Up/Down 5m market."""
+    """Fetch the currently active BTC Up/Down 5m market by calculating current slug."""
     try:
-        # Use the events API to find the BTC 5m series
-        resp = requests.get(
-            f"{GAMMA_API}/events",
-            params={"slug": "btc-up-or-down-5m", "limit": 5},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        events = resp.json()
- 
-        if not events:
-            # Fallback: search markets directly by question text
-            resp2 = requests.get(
-                f"{GAMMA_API}/markets",
-                params={"active": "true", "closed": "false", "limit": 100, "tag": "crypto"},
-                timeout=10,
-            )
-            resp2.raise_for_status()
-            all_markets = resp2.json()
-            print(f"ALL MARKETS COUNT: {len(all_markets)}", flush=True)
-            if all_markets:
-                print(f"FIRST SLUG: {all_markets[0].get('slug','')}", flush=True)
-            markets = [
-                m for m in all_markets
-                if "btc" in m.get("slug", "").lower() and "updown" in m.get("slug", "").lower()
-            ]
-            print(f"FILTERED COUNT: {len(markets)}", flush=True)
-        else:
-            markets = events[0].get("markets", [])
- 
-        if not markets:
-            log.warning("No BTC 5m markets found")
-            return None
- 
-        now   = datetime.now(timezone.utc)
-        valid = []
-        for m in markets:
+        now        = datetime.now(timezone.utc)
+        # Calculate current 5m window timestamp
+        # Polymarket 5m markets use Unix timestamps rounded to 5-minute boundaries
+        ts         = int(now.timestamp())
+        # Round down to nearest 5-minute boundary, then get next one
+        current_5m = (ts // 300) * 300
+        next_5m    = current_5m + 300
+
+        # Try current and next two 5m windows
+        for window_ts in [next_5m, current_5m + 600, current_5m + 900]:
+            slug = f"btc-updown-5m-{window_ts}"
+            print(f"Trying slug: {slug}", flush=True)
             try:
-                end = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
-                if end > now:
-                    valid.append((end, m))
+                resp = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={"slug": slug},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                markets = resp.json()
+                if not markets:
+                    continue
+                m        = markets[0]
+                if m.get("closed"):
+                    continue
+                end_time = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
+                if end_time <= now:
+                    continue
+                token_ids = json.loads(m["clobTokenIds"])
+                log.info(f"Market found: {m['question']}")
+                return Market(
+                    condition_id  = m["conditionId"],
+                    up_token_id   = token_ids[0],
+                    down_token_id = token_ids[1],
+                    question      = m["question"],
+                    end_time      = end_time,
+                )
             except Exception:
                 continue
- 
-        if not valid:
-            return None
- 
-        valid.sort(key=lambda x: x[0])
-        end_time, m = valid[0]
-        token_ids   = json.loads(m["clobTokenIds"])
- 
-        log.info(f"Market found: {m['question']} | ends in "
-                 f"{(end_time - now).total_seconds():.0f}s")
- 
-        return Market(
-            condition_id  = m["conditionId"],
-            up_token_id   = token_ids[0],
-            down_token_id = token_ids[1],
-            question      = m["question"],
-            end_time      = end_time,
-        )
+
+        log.warning("No active BTC 5m market found via slug calculation")
+        return None
+
     except Exception as e:
         log.error(f"Market fetch failed: {e}")
         return None
- 
  
 def fetch_poly_prices(market: Market) -> dict:
     try:
