@@ -18,10 +18,12 @@ Data sources (all work on Railway US servers):
   - Liquidations:   OKX liquidation feed (no geo-blocking)
   - Chainlink:      CryptoCompare + Chainlink API
 
-FIXES (v2.1):
-  - Resolution: markets now resolve at 1.0/0.0 by fetching actual winner from Gamma API
-  - flat_pnl: now uses actual position size instead of hardcoded $10
-  - Signal logging: every non-firing signal evaluation is logged to Supabase signal_log table
+FIXES (v2.2):
+  - Resolution: fetch_market_winner retries up to 10x with 8s delay (80s total window)
+  - resolve_positions: removed redundant outer retry loop
+  - Voided markets (outcomePrices stays ["0","0"]): positions skipped, balance refunded
+  - flat_pnl: uses actual position size instead of hardcoded $10
+  - Signal logging: every non-firing signal evaluation logged to Supabase signal_log
 """
 
 import os
@@ -119,25 +121,22 @@ def supabase_snapshot(snapshot: dict):
         log.warning(f"Snapshot insert failed: {e}")
 
 
-# FIX 3: Signal-level logging — logs every evaluation that does NOT result in a trade
 def supabase_signal_log(entry: dict):
     """
     Log every signal evaluation that did NOT fire to Supabase signal_log table.
-    This is the most important diagnostic tool — shows exactly why strategies
-    aren't trading and by how much they're missing thresholds.
 
-    Required Supabase table (create if it doesn't exist):
-        CREATE TABLE signal_log (
-            id            bigserial PRIMARY KEY,
-            created_at    timestamptz DEFAULT now(),
-            strategy      text,
-            condition_id  text,
-            secs_left     float,
-            signal_value  float,
-            threshold     float,
-            fired         boolean,
-            reason        text,
-            market_question text
+    Required Supabase table:
+        CREATE TABLE IF NOT EXISTS signal_log (
+            id               bigserial PRIMARY KEY,
+            created_at       timestamptz DEFAULT now(),
+            strategy         text,
+            condition_id     text,
+            secs_left        float,
+            signal_value     float,
+            threshold        float,
+            fired            boolean,
+            reason           text,
+            market_question  text
         );
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -162,14 +161,14 @@ def _log_signal(strategy: str, market, secs_left: float,
                 signal_value: float, threshold: float, reason: str):
     """Helper — builds and sends a signal log entry for a non-firing evaluation."""
     entry = {
-        "strategy":       strategy,
-        "condition_id":   market.condition_id if market else "",
+        "strategy":        strategy,
+        "condition_id":    market.condition_id if market else "",
         "market_question": market.question if market else "",
-        "secs_left":      round(secs_left, 1),
-        "signal_value":   round(signal_value, 6),
-        "threshold":      round(threshold, 6),
-        "fired":          False,
-        "reason":         reason,
+        "secs_left":       round(secs_left, 1),
+        "signal_value":    round(signal_value, 6),
+        "threshold":       round(threshold, 6),
+        "fired":           False,
+        "reason":          reason,
     }
     log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f}")
     supabase_signal_log(entry)
@@ -245,12 +244,6 @@ class StrategyTracker:
 
     def close(self, side: str, entry_price: float, exit_price: float,
               size: float, market: Market, reason: str = "RESOLVED"):
-        """
-        FIX 1: exit_price is now 1.0 (win) or 0.0 (loss) when called from
-        resolve_positions(), giving accurate PnL.
-
-        FIX 2: flat_pnl now uses actual `size` instead of hardcoded $10.
-        """
         if side == "UP":
             pnl = (exit_price - entry_price) * size / entry_price
         else:
@@ -281,7 +274,7 @@ class StrategyTracker:
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
-        # FIX 2: flat_pnl now scales with actual size, not hardcoded $10
+        # flat_pnl uses actual size (not hardcoded $10)
         if pnl > 0:
             flat_pnl = (size * (1 / entry_price - 1)) - (size * TAKER_FEE * 2)
         else:
@@ -306,6 +299,39 @@ class StrategyTracker:
         log.info(f"[{self.name}] CLOSE {side} ({reason}) | exit={exit_price:.2f} | "
                  f"PnL={pnl:+.3f} | balance=${self.balance:.2f} | "
                  f"WR={wr:.0f}% ({self.wins}W/{self.losses}L)")
+
+    def void(self, pos: "StrategyTrade", market: Market):
+        """
+        Market was voided — refund the position size (minus fees already paid).
+        Does not count as win or loss.
+        """
+        self.balance += pos.size  # refund stake, fees are lost
+        entry = {
+            "timestamp":    datetime.now(timezone.utc).isoformat(),
+            "action":       "VOID",
+            "strategy":     self.name,
+            "side":         pos.side,
+            "entry_price":  pos.entry_price,
+            "size":         pos.size,
+            "pnl":          0.0,
+            "balance":      round(self.balance, 2),
+            "condition_id": market.condition_id,
+        }
+        self.trades.append(entry)
+        with open(self.logfile, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        supabase_insert({
+            "strategy":     self.name,
+            "action":       "VOID",
+            "side":         pos.side,
+            "price":        pos.entry_price,
+            "size":         pos.size,
+            "pnl":          0.0,
+            "condition_id": market.condition_id,
+            "signal_data":  {"reason": "MARKET_VOIDED"},
+        })
+        log.info(f"[{self.name}] VOID {pos.side} | size refunded={pos.size:.2f} | "
+                 f"balance=${self.balance:.2f}")
 
     def summary(self) -> str:
         total = self.wins + self.losses
@@ -523,71 +549,125 @@ def fetch_poly_prices(market: Market) -> dict:
         return {"up_mid": 0.5, "down_mid": 0.5, "spread": 0.1}
 
 
-# FIX 1: Fetch the actual winner token from Gamma API after market resolves
+# --------------------------------------------------------- RESOLUTION --------
+
+# Return values from fetch_market_winner:
+#   "UP"    — up token won
+#   "DOWN"  — down token won
+#   "VOID"  — market closed but outcomePrices stayed ["0","0"] — treat as voided
+#   None    — couldn't determine (shouldn't happen after retries)
+
 def fetch_market_winner(condition_id: str) -> Optional[str]:
-    for attempt in range(10):          # was 5, now 10
+    """
+    Polls Gamma API every 5 seconds until a winner is found.
+    Gives up after 10 minutes and returns "VOID".
+
+    - Returns immediately as soon as outcomePrices shows a clear winner
+    - If closed=True and prices stay ["0","0"] for 2+ minutes, declares VOID
+    - Logs elapsed time on each attempt so you can see how long resolution takes
+    """
+    POLL_INTERVAL   = 5    # seconds between each check
+    MAX_WAIT        = 600  # 10 minutes total
+    VOID_THRESHOLD  = 120  # if closed + zero prices for this long, declare void
+
+    start_time      = time.time()
+    zero_price_since = None  # tracks when we first saw closed=True + prices=[0,0]
+
+    attempt = 0
+    while True:
+        elapsed = time.time() - start_time
+        attempt += 1
+
+        if elapsed > MAX_WAIT:
+            log.warning(f"[{condition_id}] No resolution after {MAX_WAIT}s — declaring VOID")
+            return "VOID"
+
         try:
             r = requests.get(
                 f"{GAMMA_API}/markets",
                 params={"conditionId": condition_id},
                 timeout=10,
             )
+            r.raise_for_status()
             data = r.json()
+
             if not data:
-                time.sleep(5)
+                log.warning(f"[{condition_id}] Gamma returned empty (attempt {attempt}, "
+                            f"{elapsed:.0f}s elapsed) — retrying")
+                time.sleep(POLL_INTERVAL)
                 continue
-            m = data[0]
-            prices = json.loads(m.get("outcomePrices", '["0","0"]'))
+
+            m          = data[0]
+            raw_prices = m.get("outcomePrices", '["0","0"]')
+            prices     = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
             up_price   = float(prices[0])
             down_price = float(prices[1])
+
+            log.info(f"[{condition_id}] attempt={attempt} elapsed={elapsed:.0f}s | "
+                     f"closed={m.get('closed')} up={up_price} down={down_price}")
+
+            # Winner found — return immediately
             if up_price > 0.9:
-                log.info(f"Resolved UP (attempt {attempt+1})")
+                log.info(f"[{condition_id}] Resolved UP after {elapsed:.0f}s")
                 return "UP"
             elif down_price > 0.9:
-                log.info(f"Resolved DOWN (attempt {attempt+1})")
+                log.info(f"[{condition_id}] Resolved DOWN after {elapsed:.0f}s")
                 return "DOWN"
+
+            # Closed but both prices zero — track how long this has been the case
+            if m.get("closed") and up_price == 0.0 and down_price == 0.0:
+                if zero_price_since is None:
+                    zero_price_since = time.time()
+                zero_duration = time.time() - zero_price_since
+                log.info(f"[{condition_id}] Closed with zero prices for {zero_duration:.0f}s")
+                if zero_duration >= VOID_THRESHOLD:
+                    log.warning(f"[{condition_id}] Prices stayed zero for {zero_duration:.0f}s "
+                                f"— declaring VOID")
+                    return "VOID"
             else:
-                log.info(f"Not resolved yet, waiting... attempt {attempt+1}/10")
-                time.sleep(8)          # was 3, now 8 — gives Gamma more time
+                # Prices changed away from zero — reset void tracker
+                zero_price_since = None
+
         except Exception as e:
-            log.warning(f"fetch_market_winner error: {e}")
-            time.sleep(5)
-    return None
+            log.warning(f"[{condition_id}] fetch error (attempt {attempt}, "
+                        f"{elapsed:.0f}s elapsed): {e}")
 
-def resolve_positions(positions: dict, trackers: dict, market: Market):
-    """
-    FIX 1: Resolve all open positions at actual outcome (1.0 win / 0.0 loss)
-    instead of midpoint price.
+        time.sleep(POLL_INTERVAL)
 
-    Polls Gamma API up to 5 times with a 3-second delay to get the winner.
-    Falls back to midpoint price only if Gamma API doesn't return a winner
-    after all retries (e.g. very delayed resolution).
+
+def resolve_positions(positions: dict, trackers: dict, market: Market) -> dict:
     """
-    winner = None
-    for attempt in range(5):
-        winner = fetch_market_winner(market.condition_id)
-        if winner:
-            log.info(f"Market resolved: {market.question} → winner={winner} (attempt {attempt+1})")
-            break
-        log.info(f"Waiting for resolution... attempt {attempt+1}/5")
-        time.sleep(3)
+    Resolves all open positions for an expired market.
+
+    - "UP" / "DOWN" winner: closes at 1.0 (win) or 0.0 (loss)
+    - "VOID": refunds position size, no win/loss recorded
+    - No outer retry loop — fetch_market_winner handles all retries internally
+    """
+    any_open = any(p is not None for p in positions.values())
+    if not any_open:
+        return {k: None for k in positions}
+
+    log.info(f"Resolving market: {market.question}")
+    outcome = fetch_market_winner(market.condition_id)
 
     for key, pos in positions.items():
         if not pos:
             continue
-        if winner:
-            # Correct resolution: 1.0 if we picked the right side, 0.0 if wrong
-            exit_price = 1.0 if pos.side == winner else 0.0
-            reason     = "RESOLVED_WIN" if pos.side == winner else "RESOLVED_LOSS"
+
+        if outcome == "VOID":
+            log.warning(f"[{trackers[key].name}] Market voided — refunding position")
+            trackers[key].void(pos, market)
+
+        elif outcome in ("UP", "DOWN"):
+            exit_price = 1.0 if pos.side == outcome else 0.0
+            reason     = "RESOLVED_WIN" if pos.side == outcome else "RESOLVED_LOSS"
+            trackers[key].close(
+                pos.side, pos.entry_price, exit_price, pos.size, market, reason
+            )
+
         else:
-            # Fallback: couldn't get winner, use midpoint (less accurate)
-            log.warning(f"Could not resolve winner for {market.condition_id}, using midpoint fallback")
-            prices     = fetch_poly_prices(market)
-            exit_price = prices["up_mid"] if pos.side == "UP" else prices["down_mid"]
-            reason     = "MARKET_CLOSE_FALLBACK"
-        trackers[key].close(
-            pos.side, pos.entry_price, exit_price, pos.size, market, reason
-        )
+            # Shouldn't reach here but handle gracefully
+            log.error(f"Unexpected outcome value: {outcome} — skipping close for {key}")
 
     return {k: None for k in positions}
 
@@ -947,9 +1027,8 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v2.1")
+    log.info("Multi-Strategy Mechanical Edge Simulator v2.2")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
-    log.info("Fixes: resolution at 1.0/0.0 | flat_pnl uses actual size | signal logging")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
 
     trackers = {
@@ -998,11 +1077,11 @@ def run():
 
             secs_left = (current_market.end_time - now).total_seconds()
 
-            # FIX 1: Market expired — resolve at actual outcome (1.0/0.0)
+            # Market expired — resolve all open positions at actual outcome
             if secs_left <= 0:
                 log.info(f"Market expired: {current_market.question} — resolving positions")
-                positions      = resolve_positions(positions, trackers, current_market)
-                current_market = None
+                positions         = resolve_positions(positions, trackers, current_market)
+                current_market    = None
                 last_market_fetch = 0
                 time.sleep(5)
                 continue
@@ -1017,14 +1096,14 @@ def run():
             # Save signal snapshot every 5 minutes
             if time.time() - last_snapshot > 300:
                 cl_price, cl_age = fetch_chainlink_price()
-                cl_div = round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0.0
-                candles = list(_volume_history)
+                cl_div     = round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0.0
+                candles    = list(_volume_history)
                 recent_vol = candles[-3:] if len(candles) >= 3 else []
-                total_vol = sum(c["volume"] for c in recent_vol)
-                buy_vol   = sum(c["buy_vol"] for c in recent_vol)
-                buy_ratio = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
-                liq_total = _liq_cache["long"] + _liq_cache["short"]
-                prices    = fetch_poly_prices(current_market) if current_market else {}
+                total_vol  = sum(c["volume"] for c in recent_vol)
+                buy_vol    = sum(c["buy_vol"] for c in recent_vol)
+                buy_ratio  = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
+                liq_total  = _liq_cache["long"] + _liq_cache["short"]
+                prices     = fetch_poly_prices(current_market) if current_market else {}
                 supabase_snapshot({
                     "btc_price":        round(spot, 2),
                     "funding_rate":     round(_funding_cache["rate"], 6),
@@ -1089,5 +1168,5 @@ def run():
 
 
 if __name__ == "__main__":
-    print("MULTI-STRATEGY BOT STARTING v2.1", flush=True)
+    print("MULTI-STRATEGY BOT STARTING v2.2", flush=True)
     run()
