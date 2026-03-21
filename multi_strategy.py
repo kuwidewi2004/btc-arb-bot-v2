@@ -680,6 +680,21 @@ def run():
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
 
+    supabase_insert({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "strategy": "SYSTEM",
+        "action": "STARTUP",
+        "side": "N/A",
+        "price": 0.0,
+        "size": 0.0,
+        "fee": 0.0,
+        "balance": 0.0,
+        "condition_id": "test",
+        "question": "Bot started",
+        "signal_data": {"version": "v2"},
+    })
+    log.info("Supabase connection test sent")
+
     trackers = {
         "chainlink":   StrategyTracker("Chainlink Arb"),
         "funding":     StrategyTracker("Funding Reversion"),
