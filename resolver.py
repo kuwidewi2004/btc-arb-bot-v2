@@ -50,13 +50,11 @@ def sb_headers() -> dict:
 
 
 def fetch_open_trades() -> list:
-    """Fetch all OPEN trades from Supabase that haven't been resolved yet."""
     try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/trades?action=eq.OPEN&resolved_outcome=is.null&select=id,strategy,side,price,size,condition_id,question,created_at",
-            headers={**sb_headers(), "Range": "0-999"},
-            timeout=10,
-        )
+        url = f"{SUPABASE_URL}/rest/v1/trades?action=eq.OPEN&resolved_outcome=is.null&select=id,strategy,side,price,size,condition_id,question,created_at"
+        resp = requests.get(url, headers={**sb_headers(), "Range": "0-999"}, timeout=10)
+        log.info(f"Fetch open trades status: {resp.status_code}")
+        log.info(f"Fetch open trades response: {resp.text[:200]}")
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
