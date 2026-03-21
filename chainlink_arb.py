@@ -570,10 +570,14 @@ def fetch_current_btc_market() -> Optional[Market]:
             )
             resp2.raise_for_status()
             all_markets = resp2.json()
+            print(f"ALL MARKETS COUNT: {len(all_markets)}", flush=True)
+            if all_markets:
+                print(f"FIRST SLUG: {all_markets[0].get('slug','')}", flush=True)
             markets = [
                 m for m in all_markets
                 if "btc" in m.get("slug", "").lower() and "updown" in m.get("slug", "").lower()
             ]
+            print(f"FILTERED COUNT: {len(markets)}", flush=True)
         else:
             markets = events[0].get("markets", [])
  
