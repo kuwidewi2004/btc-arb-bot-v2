@@ -622,7 +622,21 @@ def fetch_current_btc_market() -> Optional[Market]:
     try:
         resp = requests.get(
             f"{GAMMA_API}/markets",
-            params={"closed": "false", "active": "true", "limit": 100, "series_ticker": "btc-up-or-down-5m"},
+            resp = requests.get(
+    f"{GAMMA_API}/events",
+    params={"slug": "btc-up-or-down-5m", "limit": 5},
+    timeout=10,
+)
+resp.raise_for_status()
+raw = resp.text[:300]
+print(f"EVENTS RESPONSE: {raw}", flush=True)
+events = resp.json()
+if not events:
+    print("NO EVENTS FOUND", flush=True)
+    return None
+# Get markets from the event
+markets = events[0].get("markets", [])
+print(f"Markets in event: {len(markets)}", flush=True)
             timeout=10,
         )
         resp.raise_for_status()
