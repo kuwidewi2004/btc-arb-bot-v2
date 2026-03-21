@@ -622,11 +622,13 @@ def fetch_current_btc_market() -> Optional[Market]:
     try:
         resp = requests.get(
             f"{GAMMA_API}/markets",
-            params={"slug": "btc-updown-5m", "closed": "false", "active": "true", "limit": 10},
+            params={"closed": "false", "active": "true", "limit": 100, "series_ticker": "btc-up-or-down-5m"},
             timeout=10,
         )
         resp.raise_for_status()
         markets = resp.json()
+        markets = [m for m in markets if "btc" in m.get("question", "").lower() and "up or down" in m.get("question", "").lower()]
+        print(f"BTC 5m markets found: {len(markets)}", flush=True)
         print(f"MARKETS RESPONSE: {len(markets)} items", flush=True)
         if not markets:
             print("NO MARKETS FOUND", flush=True)
