@@ -194,13 +194,15 @@ class StrategyTracker:
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
         supabase_insert({
-            "timestamp": entry["timestamp"], "strategy": self.name,
-            "action": "OPEN", "side": side, "price": price,
-            "size": size, "fee": round(size * TAKER_FEE, 4),
-            "balance": round(self.balance, 2),
+            "strategy":     self.name,
+            "action":       "OPEN",
+            "side":         side,
+            "price":        price,
+            "size":         size,
+            "fee":          round(size * TAKER_FEE, 4),
             "condition_id": market.condition_id,
-            "question": market.question,
-            "signal_data": signal_data,
+            "question":     market.question,
+            "signal_data":  signal_data,
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
                  f"balance=${self.balance:.2f} | {json.dumps(signal_data)}")
@@ -233,13 +235,20 @@ class StrategyTracker:
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
+        flat_pnl = (10 * (1 / entry_price - 1) - 10 * TAKER_FEE * 2) if pnl > 0                    else (-10 - 10 * TAKER_FEE * 2)
+        edge     = (1 / entry_price - 1) if pnl > 0 else -1.0
         supabase_insert({
-            "timestamp": entry["timestamp"], "strategy": self.name,
-            "action": "CLOSE", "side": side, "price": exit_price,
-            "size": size, "pnl": round(pnl, 4), "fee": round(fee, 4),
-            "balance": round(self.balance, 2),
+            "strategy":     self.name,
+            "action":       "CLOSE",
+            "side":         side,
+            "price":        exit_price,
+            "size":         size,
+            "pnl":          round(pnl, 4),
+            "flat_pnl":     round(flat_pnl, 4),
+            "edge":         round(edge, 4),
+            "fee":          round(fee, 4),
             "condition_id": market.condition_id,
-            "signal_data": {"reason": reason, "entry_price": entry_price},
+            "signal_data":  {"reason": reason, "entry_price": entry_price},
         })
         total = self.wins + self.losses
         wr    = (self.wins / total * 100) if total else 0

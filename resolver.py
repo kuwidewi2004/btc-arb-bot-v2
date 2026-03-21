@@ -187,12 +187,16 @@ def resolve_open_trades():
 
         final_price = result["up_price"] if side == "UP" else result["down_price"]
 
+        flat_pnl = (10 * (1 / entry_px - 1) - 10 * TAKER_FEE * 2) if won                    else (-10 - 10 * TAKER_FEE * 2)
+        edge     = round((1 / entry_px - 1) if won else -1.0, 4)
         outcome_data = {
-            "resolved_outcome":      outcome,
-            "actual_win":            won,
+            "resolved_outcome":       outcome,
+            "actual_win":             won,
             "polymarket_final_price": final_price,
-            "resolved_at":           datetime.now(timezone.utc).isoformat(),
-            "pnl":                   round(actual_pnl, 4),
+            "resolved_at":            datetime.now(timezone.utc).isoformat(),
+            "pnl":                    round(actual_pnl, 4),
+            "flat_pnl":               round(flat_pnl, 4),
+            "edge":                   edge,
         }
 
         if update_trade_outcome(trade["id"], outcome_data):
