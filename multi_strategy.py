@@ -1,22 +1,26 @@
 """
-Multi-Strategy Mechanical Edge Simulator v2
-=============================================
+Multi-Strategy Mechanical Edge Simulator
+==========================================
 Runs 6 independent mechanical edge strategies simultaneously in dry run.
+Each strategy logs its own trades independently so you can compare them.
 
 Strategies:
-  1. Chainlink lag arb     — Coinbase (real-time) vs Chainlink (lagging oracle)
-  2. Funding rate reversion — extreme funding predicts reversion (OKX data)
-  3. Liquidation cascade   — large liquidations predict direction
-  4. Basis arbitrage       — futures premium/discount mean reversion (OKX data)
-  5. Odds mispricing       — Polymarket odds deviating from 50/50
-  6. Volume clock          — aggressive order flow before resolution
+  1. Chainlink lag arb          — Binance vs Chainlink price divergence
+  2. Funding rate reversion     — extreme funding predicts reversion
+  3. Liquidation cascade        — large liquidations predict direction
+  4. Basis arbitrage            — futures premium/discount mean reversion
+  5. Odds mispricing            — Polymarket odds deviating from 50/50
+  6. Volume clock               — aggressive order flow before resolution
 
-Data sources (all work on Railway US servers):
-  - Spot prices:    Coinbase + Kraken fallback
-  - Funding/Basis:  OKX public API (no geo-blocking)
-  - Volume:         OKX klines (no geo-blocking)
-  - Liquidations:   OKX liquidation feed (no geo-blocking)
-  - Chainlink:      CryptoCompare + Chainlink API
+Each strategy:
+  - Tracks its own simulated balance starting at $100
+  - Logs every trade to its own .jsonl file
+  - Prints its own win rate summary
+
+Run alongside resolver.py to track actual outcomes.
+
+Usage:
+    python multi_strategy.py
 """
 
 import os
@@ -50,10 +54,9 @@ log = logging.getLogger(__name__)
 
 POLYMARKET_HOST  = "https://clob.polymarket.com"
 GAMMA_API        = "https://gamma-api.polymarket.com"
-OKX_BASE         = "https://www.okx.com"
+BINANCE_FUTURES  = "https://fapi.binance.com"
 BTC_SYMBOL       = "BTCUSDT"
 ETH_SYMBOL       = "ETHUSDT"
-OKX_BTC          = "BTC-USDT-SWAP"
 
 TAKER_FEE        = 0.0025
 STARTING_BALANCE = 100.0
@@ -61,6 +64,7 @@ MAX_BET          = 50.0
 MIN_BET          = 5.0
 POLL_SEC         = 5
 
+# Skip low quality hours
 SKIP_HOURS_UTC   = {0, 1, 2, 3, 4, 5}
 
 
@@ -89,30 +93,31 @@ class StrategyTrade:
 # --------------------------------------------------------- STRATEGY TRACKER --
 
 class StrategyTracker:
-    def __init__(self, name: str):
-        self.name      = name
-        self.balance   = STARTING_BALANCE
-        self.start_bal = STARTING_BALANCE
-        self.wins      = 0
-        self.losses    = 0
-        self.trades    = []
-        self.logfile   = f"strategy_{name.lower().replace(' ', '_')}.jsonl"
+    """Tracks performance of a single strategy independently."""
 
-    def open(self, side: str, price: float, size: float,
-             signal_data: dict, market: Market):
+    def __init__(self, name: str):
+        self.name     = name
+        self.balance  = STARTING_BALANCE
+        self.start_bal = STARTING_BALANCE
+        self.wins     = 0
+        self.losses   = 0
+        self.trades   = []
+        self.logfile  = f"strategy_{name.lower().replace(' ', '_')}.jsonl"
+
+    def open(self, side: str, price: float, size: float, signal_data: dict, market: Market):
         fee = size * TAKER_FEE
         self.balance -= (size + fee)
         entry = {
-            "timestamp":    datetime.now(timezone.utc).isoformat(),
-            "action":       "OPEN",
-            "strategy":     self.name,
-            "side":         side,
-            "price":        price,
-            "size":         size,
-            "fee":          round(fee, 4),
-            "balance":      round(self.balance, 2),
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
+            "action":      "OPEN",
+            "strategy":    self.name,
+            "side":        side,
+            "price":       price,
+            "size":        size,
+            "fee":         round(fee, 4),
+            "balance":     round(self.balance, 2),
             "condition_id": market.condition_id,
-            "question":     market.question,
+            "question":    market.question,
             **signal_data,
         }
         self.trades.append(entry)
@@ -132,23 +137,25 @@ class StrategyTracker:
         self.balance += size + pnl
         if pnl > 0: self.wins   += 1
         else:       self.losses += 1
+
         entry = {
-            "timestamp":    datetime.now(timezone.utc).isoformat(),
-            "action":       "CLOSE",
-            "strategy":     self.name,
-            "reason":       reason,
-            "side":         side,
-            "entry_price":  entry_price,
-            "exit_price":   exit_price,
-            "size":         size,
-            "pnl":          round(pnl, 4),
-            "fee":          round(fee, 4),
-            "balance":      round(self.balance, 2),
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
+            "action":      "CLOSE",
+            "strategy":    self.name,
+            "reason":      reason,
+            "side":        side,
+            "entry_price": entry_price,
+            "exit_price":  exit_price,
+            "size":        size,
+            "pnl":         round(pnl, 4),
+            "fee":         round(fee, 4),
+            "balance":     round(self.balance, 2),
             "condition_id": market.condition_id,
         }
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
+
         total = self.wins + self.losses
         wr    = (self.wins / total * 100) if total else 0
         log.info(f"[{self.name}] CLOSE {side} ({reason}) | PnL={pnl:+.3f} | "
@@ -164,16 +171,16 @@ class StrategyTracker:
 
 # --------------------------------------------------------- SHARED DATA -------
 
-_price_cache:    dict  = {"btc": 0.0, "eth": 0.0, "fetched_at": 0.0}
-_funding_cache:  dict  = {"rate": 0.0, "fetched_at": 0.0}
-_basis_cache:    dict  = {"spot": 0.0, "futures": 0.0, "fetched_at": 0.0}
-_liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
+_price_cache:   dict  = {"btc": 0.0, "eth": 0.0, "fetched_at": 0.0}
+_funding_cache: dict  = {"rate": 0.0, "fetched_at": 0.0}
+_basis_cache:   dict  = {"spot": 0.0, "futures": 0.0, "fetched_at": 0.0}
+_oi_cache:      dict  = {"oi": 0.0, "prev_oi": 0.0, "fetched_at": 0.0}
+_liq_cache:     dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
 
 
 def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
-    """Coinbase primary, Kraken fallback."""
     coin_map   = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
     kraken_map = {"BTCUSDT": "XBTUSD",  "ETHUSDT": "ETHUSD"}
     try:
@@ -196,7 +203,7 @@ def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
 
 
 def refresh_shared_data():
-    """Refresh all shared data using geo-unblocked sources."""
+    """Refresh all shared data caches."""
     now = time.time()
 
     # Spot prices
@@ -207,111 +214,82 @@ def refresh_shared_data():
         if eth: _price_cache["eth"] = eth
         _price_cache["fetched_at"] = now
 
-    # Funding rate via OKX public API
+    # Funding rate
     if now - _funding_cache["fetched_at"] >= 60:
         try:
-            r = requests.get(
-                f"{OKX_BASE}/api/v5/public/funding-rate",
-                params={"instId": OKX_BTC},
-                timeout=5)
+            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex",
+                             params={"symbol": BTC_SYMBOL}, timeout=5)
             r.raise_for_status()
-            data = r.json().get("data", [{}])[0]
-            rate = float(data.get("fundingRate", 0))
-            _funding_cache["rate"]       = rate
+            _funding_cache["rate"]       = float(r.json()["lastFundingRate"])
+            print(f"FUNDING RATE: {_funding_cache['rate']}", flush=True)
             _funding_cache["fetched_at"] = now
-            log.info(f"Funding rate (OKX): {rate:+.6f}")
-        except Exception as e:
-            log.warning(f"Funding fetch failed: {e}")
+        except Exception:
+            pass
 
-    # Basis via OKX mark price vs spot
+    # Basis (spot vs futures)
     if now - _basis_cache["fetched_at"] >= 10:
         try:
-            r = requests.get(
-                f"{OKX_BASE}/api/v5/public/mark-price",
-                params={"instType": "SWAP", "instId": OKX_BTC},
-                timeout=5)
+            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/ticker/price",
+                             params={"symbol": BTC_SYMBOL}, timeout=5)
             r.raise_for_status()
-            data = r.json().get("data", [{}])[0]
-            _basis_cache["futures"]    = float(data.get("markPx", 0))
+            _basis_cache["futures"]    = float(r.json()["price"])
             _basis_cache["spot"]       = _price_cache["btc"]
             _basis_cache["fetched_at"] = now
-        except Exception as e:
-            log.warning(f"Basis fetch failed: {e}")
+        except Exception:
+            pass
 
-    # Liquidations via OKX
+    # Open interest
+    if now - _oi_cache["fetched_at"] >= 30:
+        try:
+            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/openInterest",
+                             params={"symbol": BTC_SYMBOL}, timeout=5)
+            r.raise_for_status()
+            _oi_cache["prev_oi"]    = _oi_cache["oi"]
+            _oi_cache["oi"]         = float(r.json()["openInterest"])
+            _oi_cache["fetched_at"] = now
+        except Exception:
+            pass
+
+    # Liquidations
     if now - _liq_cache["fetched_at"] >= 60:
         try:
-            r = requests.get(
-                f"{OKX_BASE}/api/v5/public/liquidation-orders",
-                params={"instType": "SWAP", "instId": OKX_BTC,
-                        "state": "filled", "limit": 100},
-                timeout=5)
+            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/allForceOrders",
+                             params={"symbol": BTC_SYMBOL, "limit": 100}, timeout=5)
             r.raise_for_status()
-            orders    = r.json().get("data", [{}])[0].get("details", [])
+            orders    = r.json()
             cutoff_ms = (now - 300) * 1000
             long_liqs = short_liqs = 0.0
             for o in orders:
-                if float(o.get("ts", 0)) < cutoff_ms:
+                if float(o.get("time", 0)) < cutoff_ms:
                     continue
-                usd = float(o.get("sz", 0)) * float(o.get("bkPx", 0))
-                if o.get("side") == "buy":  short_liqs += usd  # short being liquidated
-                else:                       long_liqs  += usd  # long being liquidated
+                usd = float(o.get("origQty", 0)) * float(o.get("price", 0))
+                if o.get("side") == "SELL": long_liqs  += usd
+                else:                       short_liqs += usd
             _liq_cache["long"]       = long_liqs
             _liq_cache["short"]      = short_liqs
             _liq_cache["fetched_at"] = now
-        except Exception as e:
-            log.warning(f"Liquidation fetch failed: {e}")
+        except Exception:
+            pass
 
-    # Volume via OKX klines
+    # Volume
     global _volume_fetched
     if now - _volume_fetched >= 60:
         try:
-            r = requests.get(
-                f"{OKX_BASE}/api/v5/market/candles",
-                params={"instId": OKX_BTC, "bar": "1m", "limit": "22"},
-                timeout=8)
+            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/klines",
+                             params={"symbol": BTC_SYMBOL, "interval": "1m", "limit": 22},
+                             timeout=8)
             r.raise_for_status()
-            candles = r.json().get("data", [])
             _volume_history.clear()
-            for c in candles:
-                # OKX format: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
-                close = float(c[4])
-                open_ = float(c[1])
-                vol   = float(c[5])
+            for c in r.json():
                 _volume_history.append({
-                    "volume":  vol,
-                    "close":   close,
-                    "open":    open_,
-                    "buy_vol": vol if close >= open_ else 0.0,
+                    "volume":    float(c[5]),
+                    "buy_vol":   float(c[9]),
+                    "close":     float(c[4]),
+                    "open":      float(c[1]),
                 })
             _volume_fetched = now
-        except Exception as e:
-            log.warning(f"Volume fetch failed: {e}")
-
-
-def fetch_chainlink_price() -> tuple:
-    """Returns (price, age_seconds)."""
-    try:
-        r = requests.get("https://min-api.cryptocompare.com/data/price",
-                         params={"fsym": "BTC", "tsyms": "USD"}, timeout=5)
-        r.raise_for_status()
-        price   = float(r.json()["USD"])
-        age_sec = 30.0
-        try:
-            cl = requests.get("https://data.chain.link/api/proxy/btc-usd/latest",
-                              timeout=5)
-            if cl.status_code == 200:
-                d       = cl.json()
-                updated = d.get("updatedAt") or d.get("timestamp")
-                if updated:
-                    dt      = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
-                    age_sec = (datetime.now(timezone.utc) - dt).total_seconds()
-                    price   = float(d.get("answer") or d.get("price") or price)
         except Exception:
             pass
-        return price, age_sec
-    except Exception:
-        return None, None
 
 
 # --------------------------------------------------------- MARKET DISCOVERY --
@@ -321,6 +299,7 @@ def fetch_current_market() -> Optional[Market]:
         now        = datetime.now(timezone.utc)
         ts         = int(now.timestamp())
         current_5m = (ts // 300) * 300
+
         for window_ts in [current_5m + 300, current_5m + 600, current_5m + 900]:
             slug = f"btc-updown-5m-{window_ts}"
             try:
@@ -373,13 +352,11 @@ def fetch_poly_prices(market: Market) -> dict:
 
 # --------------------------------------------------------- STRATEGIES --------
 
-def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
-    """
-    Strategy 1: Chainlink lag arbitrage.
-    Coinbase price = real-time truth.
-    Chainlink price = lagging oracle Polymarket uses to resolve.
-    When they diverge 0.15%+, bet in Chainlink's catch-up direction.
-    """
+def strategy_chainlink_arb(market: Market, secs_left: float,
+                            tracker: StrategyTracker,
+                            position: Optional[StrategyTrade],
+                            cl_history: deque) -> Optional[StrategyTrade]:
+    """Strategy 1: Chainlink lag arbitrage."""
     try:
         cl_price, cl_age = fetch_chainlink_price()
         btc_price        = _price_cache["btc"]
@@ -390,6 +367,7 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
         direction  = "UP" if divergence > 0 else "DOWN"
         cl_history.append({"div": divergence, "dir": direction})
 
+        # Require 3 sustained snapshots
         if len(cl_history) < 3:
             return position
         recent = list(cl_history)[-3:]
@@ -397,7 +375,10 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
             return position
         if not all(s["dir"] == direction for s in recent):
             return position
-        if cl_age < 15 or secs_left < 90 or position:
+        if cl_age < 15 or secs_left < 90:
+            return position
+
+        if position:
             return position
 
         prices = fetch_poly_prices(market)
@@ -412,22 +393,52 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
             tracker.open(direction, price, size,
                         {"divergence": round(divergence, 4), "cl_age": round(cl_age, 1)},
                         market)
-            return StrategyTrade("chainlink_arb", direction, size, price, market)
+            return StrategyTrade("chainlink_arb", direction, size, price, market,
+                               {"divergence": divergence})
     except Exception as e:
         log.warning(f"[Chainlink arb] error: {e}")
     return position
 
 
-def strategy_funding_reversion(market, secs_left, tracker, position):
+def fetch_chainlink_price() -> tuple:
+    try:
+        r = requests.get("https://min-api.cryptocompare.com/data/price",
+                        params={"fsym": "BTC", "tsyms": "USD"}, timeout=5)
+        r.raise_for_status()
+        price   = float(r.json()["USD"])
+        age_sec = 30.0
+        try:
+            cl = requests.get("https://data.chain.link/api/proxy/btc-usd/latest", timeout=5)
+            if cl.status_code == 200:
+                d       = cl.json()
+                updated = d.get("updatedAt") or d.get("timestamp")
+                if updated:
+                    dt      = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+                    age_sec = (datetime.now(timezone.utc) - dt).total_seconds()
+                    price   = float(d.get("answer") or d.get("price") or price)
+        except Exception:
+            pass
+        return price, age_sec
+    except Exception:
+        return None, None
+
+
+def strategy_funding_reversion(market: Market, secs_left: float,
+                                tracker: StrategyTracker,
+                                position: Optional[StrategyTrade]) -> Optional[StrategyTrade]:
     """
     Strategy 2: Funding rate reversion.
-    Extreme positive funding = longs overextended = bet DOWN.
-    Extreme negative funding = shorts overextended = bet UP.
-    Data from OKX public API.
+    Extreme positive funding = overextended longs = bet DOWN
+    Extreme negative funding = overextended shorts = bet UP
+    Threshold: >0.05% or <-0.05% (10x normal)
     """
     try:
         rate = _funding_cache["rate"]
-        if abs(rate) < 0.0005 or secs_left < 60 or position:
+        if abs(rate) < 0.0005:   # not extreme enough
+            return position
+        if secs_left < 60:
+            return position
+        if position:
             return position
 
         direction = "DOWN" if rate > 0.0005 else "UP"
@@ -436,6 +447,7 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
             return position
 
         price     = prices["up_mid"] if direction == "UP" else prices["down_mid"]
+        # Size proportional to how extreme the funding is
         intensity = min(abs(rate) / 0.001, 1.0)
         size      = min(MAX_BET * intensity, tracker.balance * 0.3)
         size      = max(size, MIN_BET)
@@ -444,29 +456,36 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
             tracker.open(direction, price, size,
                         {"funding_rate": round(rate, 6), "intensity": round(intensity, 3)},
                         market)
-            return StrategyTrade("funding_reversion", direction, size, price, market)
+            return StrategyTrade("funding_reversion", direction, size, price, market,
+                               {"funding_rate": rate})
     except Exception as e:
         log.warning(f"[Funding reversion] error: {e}")
     return position
 
 
-def strategy_liquidation_cascade(market, secs_left, tracker, position):
+def strategy_liquidation_cascade(market: Market, secs_left: float,
+                                  tracker: StrategyTracker,
+                                  position: Optional[StrategyTrade]) -> Optional[StrategyTrade]:
     """
     Strategy 3: Liquidation cascade.
-    Large long liquidations = forced selling = bet DOWN.
-    Large short liquidations = short squeeze = bet UP.
-    Data from OKX public API.
+    Large liquidations predict continuation in cascade direction.
+    Long liquidations (SELL side) = bearish cascade = bet DOWN
+    Short liquidations (BUY side) = bullish cascade = bet UP
     """
     try:
         long_liqs  = _liq_cache["long"]
         short_liqs = _liq_cache["short"]
         total      = long_liqs + short_liqs
 
-        if total < 300_000 or secs_left < 60 or position:
+        if total < 300_000:   # need at least $300k in liquidations
+            return position
+        if secs_left < 60:
+            return position
+        if position:
             return position
 
         direction = "DOWN" if long_liqs > short_liqs else "UP"
-        intensity = min(total / 2_000_000, 1.0)
+        intensity = min(total / 2_000_000, 1.0)   # scale up to $2M
         prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             return position
@@ -477,31 +496,43 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
 
         if tracker.balance >= MIN_BET:
             tracker.open(direction, price, size,
-                        {"long_liqs": round(long_liqs), "short_liqs": round(short_liqs)},
+                        {"long_liqs": round(long_liqs), "short_liqs": round(short_liqs),
+                         "total_usd": round(total)},
                         market)
-            return StrategyTrade("liquidation_cascade", direction, size, price, market)
+            return StrategyTrade("liquidation_cascade", direction, size, price, market,
+                               {"total_liqs": total})
     except Exception as e:
         log.warning(f"[Liquidation cascade] error: {e}")
     return position
 
 
-def strategy_basis_arb(market, secs_left, tracker, position):
+def strategy_basis_arb(market: Market, secs_left: float,
+                        tracker: StrategyTracker,
+                        position: Optional[StrategyTrade]) -> Optional[StrategyTrade]:
     """
     Strategy 4: Basis arbitrage.
-    OKX mark price vs Coinbase spot.
-    Futures at premium = convergence expected = bet DOWN.
-    Futures at discount = convergence expected = bet UP.
+    Futures trading at large premium to spot = bet DOWN (futures will revert)
+    Futures trading at large discount to spot = bet UP (futures will revert)
+    Threshold: >0.1% premium/discount
     """
     try:
         spot    = _basis_cache["spot"]
         futures = _basis_cache["futures"]
-        if spot == 0 or futures == 0 or secs_left < 60 or position:
+
+        if spot == 0 or futures == 0:
             return position
 
         basis_pct = (futures - spot) / spot * 100
-        if abs(basis_pct) < 0.10:
+
+        if abs(basis_pct) < 0.10:   # not enough basis
+            return position
+        if secs_left < 60:
+            return position
+        if position:
             return position
 
+        # Futures at premium = spot will catch up UP or futures revert DOWN
+        # For 5m window: bet that price reverts toward spot
         direction = "DOWN" if basis_pct > 0 else "UP"
         intensity = min(abs(basis_pct) / 0.3, 1.0)
         prices    = fetch_poly_prices(market)
@@ -514,32 +545,45 @@ def strategy_basis_arb(market, secs_left, tracker, position):
 
         if tracker.balance >= MIN_BET:
             tracker.open(direction, price, size,
-                        {"basis_pct": round(basis_pct, 4),
-                         "spot": round(spot, 2), "futures": round(futures, 2)},
+                        {"basis_pct": round(basis_pct, 4), "spot": round(spot, 2),
+                         "futures": round(futures, 2)},
                         market)
-            return StrategyTrade("basis_arb", direction, size, price, market)
+            return StrategyTrade("basis_arb", direction, size, price, market,
+                               {"basis_pct": basis_pct})
     except Exception as e:
         log.warning(f"[Basis arb] error: {e}")
     return position
 
 
-def strategy_odds_mispricing(market, secs_left, tracker, position):
+def strategy_odds_mispricing(market: Market, secs_left: float,
+                              tracker: StrategyTracker,
+                              position: Optional[StrategyTrade]) -> Optional[StrategyTrade]:
     """
     Strategy 5: Polymarket odds mispricing.
-    In first 2 minutes of market, if UP odds deviate 8%+ from 0.50,
-    bet on reversion back toward 0.50.
+    When UP odds deviate significantly from 0.50 early in the market,
+    they tend to revert toward 0.50 — bet against the extreme.
+    Only enter in first 2 minutes of market (180-300 seconds left)
     """
     try:
-        if secs_left < 120 or secs_left > 270 or position:
+        # Only trade early in the market window
+        if secs_left < 120 or secs_left > 270:
+            return position
+        if position:
             return position
 
-        prices    = fetch_poly_prices(market)
-        up_mid    = prices["up_mid"]
+        prices  = fetch_poly_prices(market)
+        up_mid  = prices["up_mid"]
+        spread  = prices["spread"]
+
+        if spread > 0.04:
+            return position
+
         deviation = up_mid - 0.50
 
-        if prices["spread"] > 0.04 or abs(deviation) < 0.08:
+        if abs(deviation) < 0.08:   # need at least 8% deviation
             return position
 
+        # Bet against the extreme — if UP is at 0.62, bet DOWN (reversion to 0.50)
         direction = "DOWN" if deviation > 0 else "UP"
         intensity = min(abs(deviation) / 0.15, 1.0)
         price     = prices["up_mid"] if direction == "UP" else prices["down_mid"]
@@ -551,26 +595,32 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
                         {"up_mid": round(up_mid, 4), "deviation": round(deviation, 4),
                          "secs_left": round(secs_left)},
                         market)
-            return StrategyTrade("odds_mispricing", direction, size, price, market)
+            return StrategyTrade("odds_mispricing", direction, size, price, market,
+                               {"deviation": deviation})
     except Exception as e:
         log.warning(f"[Odds mispricing] error: {e}")
     return position
 
 
-def strategy_volume_clock(market, secs_left, tracker, position):
+def strategy_volume_clock(market: Market, secs_left: float,
+                           tracker: StrategyTracker,
+                           position: Optional[StrategyTrade]) -> Optional[StrategyTrade]:
     """
     Strategy 6: Volume clock.
-    In last 90 seconds before resolution, strong buy/sell imbalance
-    from OKX klines predicts direction.
+    In the last 90 seconds before market closes, aggressive order flow
+    on Binance futures predicts the resolution direction.
+    Only enter 60-90 seconds before resolution.
     """
     try:
-        if secs_left > 90 or secs_left < 20 or position:
+        if secs_left > 90 or secs_left < 20:
+            return position
+        if position:
             return position
         if len(_volume_history) < 5:
             return position
 
         candles   = list(_volume_history)
-        recent    = candles[-3:]
+        recent    = candles[-3:]   # last 3 minutes
         total_vol = sum(c["volume"] for c in recent)
         buy_vol   = sum(c["buy_vol"] for c in recent)
 
@@ -578,17 +628,18 @@ def strategy_volume_clock(market, secs_left, tracker, position):
             return position
 
         buy_ratio = buy_vol / total_vol
-
+        # Strong buying = UP, strong selling = DOWN
         if buy_ratio > 0.60:
             direction = "UP"
-            intensity = min((buy_ratio - 0.60) / 0.20, 1.0)
+            intensity = (buy_ratio - 0.60) / 0.20
         elif buy_ratio < 0.40:
             direction = "DOWN"
-            intensity = min((0.40 - buy_ratio) / 0.20, 1.0)
+            intensity = (0.40 - buy_ratio) / 0.20
         else:
-            return position
+            return position   # no clear signal
 
-        prices = fetch_poly_prices(market)
+        intensity = min(intensity, 1.0)
+        prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             return position
 
@@ -598,9 +649,12 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 
         if tracker.balance >= MIN_BET:
             tracker.open(direction, price, size,
-                        {"buy_ratio": round(buy_ratio, 4), "secs_left": round(secs_left)},
+                        {"buy_ratio": round(buy_ratio, 4),
+                         "secs_left": round(secs_left),
+                         "intensity": round(intensity, 3)},
                         market)
-            return StrategyTrade("volume_clock", direction, size, price, market)
+            return StrategyTrade("volume_clock", direction, size, price, market,
+                               {"buy_ratio": buy_ratio})
     except Exception as e:
         log.warning(f"[Volume clock] error: {e}")
     return position
@@ -609,21 +663,26 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v2")
-    log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
-    log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
+    log.info("Multi-Strategy Mechanical Edge Simulator")
+    log.info("Strategies: Chainlink arb | Funding reversion | Liquidation cascade")
+    log.info("            Basis arb | Odds mispricing | Volume clock")
 
+    # Initialize trackers
     trackers = {
-        "chainlink":   StrategyTracker("Chainlink Arb"),
-        "funding":     StrategyTracker("Funding Reversion"),
-        "liquidation": StrategyTracker("Liquidation Cascade"),
-        "basis":       StrategyTracker("Basis Arb"),
-        "odds":        StrategyTracker("Odds Mispricing"),
-        "volume":      StrategyTracker("Volume Clock"),
+        "chainlink":    StrategyTracker("Chainlink Arb"),
+        "funding":      StrategyTracker("Funding Reversion"),
+        "liquidation":  StrategyTracker("Liquidation Cascade"),
+        "basis":        StrategyTracker("Basis Arb"),
+        "odds":         StrategyTracker("Odds Mispricing"),
+        "volume":       StrategyTracker("Volume Clock"),
     }
 
-    positions         = {k: None for k in trackers}
-    cl_history        = deque(maxlen=6)
+    # Current positions per strategy
+    positions = {k: None for k in trackers}
+
+    # Chainlink history for arb strategy
+    cl_history = deque(maxlen=6)
+
     current_market    = None
     last_market_fetch = 0
     last_summary      = 0
@@ -633,14 +692,16 @@ def run():
             now  = datetime.now(timezone.utc)
             hour = now.hour
 
+            # Skip low quality hours
             if hour in SKIP_HOURS_UTC:
                 log.info(f"Skipping hour {hour:02d}:00 UTC")
                 time.sleep(30)
                 continue
 
+            # Refresh shared data
             refresh_shared_data()
 
-            # Refresh market every 60s
+            # Refresh market
             if time.time() - last_market_fetch > 60:
                 market = fetch_current_market()
                 if market and (not current_market or
@@ -652,7 +713,7 @@ def run():
                 last_market_fetch = time.time()
 
             if not current_market:
-                log.warning("No market — retrying in 15s")
+                log.warning("No market found — retrying in 15s")
                 time.sleep(15)
                 continue
 
@@ -665,21 +726,18 @@ def run():
                     if pos:
                         exit_px = prices["up_mid"] if pos.side == "UP" else prices["down_mid"]
                         trackers[key].close(pos.side, pos.entry_price, exit_px,
-                                            pos.size, current_market, "MARKET_CLOSE")
-                positions         = {k: None for k in trackers}
-                current_market    = None
+                                           pos.size, current_market, "MARKET_CLOSE")
+                positions      = {k: None for k in trackers}
+                current_market = None
                 last_market_fetch = 0
                 time.sleep(5)
                 continue
 
-            spot    = _price_cache["btc"]
-            futures = _basis_cache["futures"]
-            basis   = (futures - spot) / spot * 100 if spot > 0 and futures > 0 else 0.0
+            log.info(f"BTC=${_price_cache['btc']:.2f} | {secs_left:.0f}s left | "
+                     f"funding={_funding_cache['rate']:+.5f} | "
+                     f"basis={(_basis_cache['futures']-_basis_cache['spot'])/_max(_basis_cache['spot'],1)*100:+.3f}%")
 
-            log.info(f"BTC=${spot:.2f} | {secs_left:.0f}s left | "
-                     f"funding={_funding_cache['rate']:+.6f} | basis={basis:+.3f}%")
-
-            # Run all 6 strategies
+            # Run all strategies
             positions["chainlink"]   = strategy_chainlink_arb(
                 current_market, secs_left, trackers["chainlink"],
                 positions["chainlink"], cl_history)
@@ -724,6 +782,10 @@ def run():
         except Exception as e:
             log.error(f"Error: {e}", exc_info=True)
             time.sleep(10)
+
+
+def _max(a, b):
+    return a if a > b else b
 
 
 if __name__ == "__main__":
