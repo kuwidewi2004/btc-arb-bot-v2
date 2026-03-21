@@ -217,13 +217,10 @@ def refresh_shared_data():
     # Funding rate
     if now - _funding_cache["fetched_at"] >= 60:
         try:
-            r = requests.get("https://api.coinglass.com/public/v2/funding?symbol=BTC",timeout=5)
+            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex",
+                             params={"symbol": BTC_SYMBOL}, timeout=5)
             r.raise_for_status()
-            data = r.json().get("data", {})
-            binance_data = next((x for x in data if x.get("exchangeName") == "Binance"), None)
-            if binance_data:
-                _funding_cache["rate"] = float(binance_data.get("rate", 0))
-                print(f"FUNDING RATE: {_funding_cache['rate']}", flush=True)
+            _funding_cache["rate"]       = float(r.json()["lastFundingRate"])
             print(f"FUNDING RATE: {_funding_cache['rate']}", flush=True)
             _funding_cache["fetched_at"] = now
         except Exception:
@@ -232,15 +229,8 @@ def refresh_shared_data():
     # Basis (spot vs futures)
     if now - _basis_cache["fetched_at"] >= 10:
         try:
-            r = requests.get(
-                "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
-                timeout=5)
-            r.raise_for_status()
-            result = r.json()["result"]
-            key = list(result.keys())[0]
-            _basis_cache["futures"] = float(result[key]["c"][0])
-            _basis_cache["spot"]    = _price_cache["btc"]
-            _basis_cache["fetched_at"] = now
+            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/ticker/price",
+                             params={"symbol": BTC_SYMBOL}, timeout=5)
             r.raise_for_status()
             _basis_cache["futures"]    = float(r.json()["price"])
             _basis_cache["spot"]       = _price_cache["btc"]
