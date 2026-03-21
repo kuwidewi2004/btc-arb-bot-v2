@@ -53,13 +53,8 @@ def fetch_open_trades() -> list:
     """Fetch all OPEN trades from Supabase that haven't been resolved yet."""
     try:
         resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/trades",
+            f"{SUPABASE_URL}/rest/v1/trades?action=eq.OPEN&resolved_outcome=is.null&select=id,strategy,side,price,size,condition_id,question,created_at",
             headers={**sb_headers(), "Range": "0-999"},
-            params={
-                "action":            "eq.OPEN",
-                "resolved_outcome":  "is.null",
-                "select":            "id,strategy,side,price,size,condition_id,question,created_at",
-            },
             timeout=10,
         )
         resp.raise_for_status()
