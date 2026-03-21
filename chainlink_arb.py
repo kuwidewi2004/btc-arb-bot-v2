@@ -830,4 +830,10 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    print("CALLING RUN", flush=True)
+    try:
+        run()
+    except Exception as e:
+        print(f"CRASH: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
