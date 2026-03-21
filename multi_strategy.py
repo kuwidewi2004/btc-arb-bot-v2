@@ -217,8 +217,8 @@ def refresh_shared_data():
     # Funding rate
     if now - _funding_cache["fetched_at"] >= 60:
         try:
-            r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex",
-                             params={"symbol": BTC_SYMBOL}, timeout=5)
+            r = requests.get("https://www.okx.com/api/v5/public/funding-rate",
+                             params={"instId": "BTC-USDT-SWAP"}, timeout=5)
             r.raise_for_status()
             _funding_cache["rate"]       = float(r.json()["lastFundingRate"])
             print(f"FUNDING RATE: {_funding_cache['rate']}", flush=True)
@@ -230,7 +230,7 @@ def refresh_shared_data():
     if now - _basis_cache["fetched_at"] >= 10:
         try:
             r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/ticker/price",
-                             params={"symbol": BTC_SYMBOL}, timeout=5)
+                             params={"instId": "BTC-USDT-SWAP"}, timeout=5)
             r.raise_for_status()
             _basis_cache["futures"]    = float(r.json()["price"])
             _basis_cache["spot"]       = _price_cache["btc"]
@@ -242,7 +242,7 @@ def refresh_shared_data():
     if now - _oi_cache["fetched_at"] >= 30:
         try:
             r = requests.get(f"{BINANCE_FUTURES}/fapi/v1/openInterest",
-                             params={"symbol": BTC_SYMBOL}, timeout=5)
+                             params={"instId": "BTC-USDT-SWAP"}, timeout=5)
             r.raise_for_status()
             _oi_cache["prev_oi"]    = _oi_cache["oi"]
             _oi_cache["oi"]         = float(r.json()["openInterest"])
@@ -791,3 +791,4 @@ def _max(a, b):
 if __name__ == "__main__":
     print("MULTI-STRATEGY BOT STARTING", flush=True)
     run()
+
