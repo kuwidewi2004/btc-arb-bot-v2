@@ -58,7 +58,7 @@ def fetch_open_trades() -> list:
             params={
                 "action":            "eq.OPEN",
                 "resolved_outcome":  "is.null",
-                "select":            "id,strategy,side,price,size,condition_id,question,timestamp",
+                "select":            "id,strategy,side,price,size,condition_id,question,created_at",
             },
             timeout=10,
         )
