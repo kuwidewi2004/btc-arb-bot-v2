@@ -187,6 +187,7 @@ def resolve_open_trades():
             continue
 
         result = fetch_market_outcome(condition_id)
+        log.info(f"Outcome for {condition_id[:16]}: {result}")
         if not result["resolved"]:
             continue
 
