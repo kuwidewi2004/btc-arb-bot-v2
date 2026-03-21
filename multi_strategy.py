@@ -33,29 +33,6 @@ from collections import deque
 import requests
 import numpy as np
 
-# Supabase client (simple REST calls, no extra package needed)
-SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
-
-def supabase_insert(table: str, data: dict):
-    """Insert a row into Supabase via REST API."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-    try:
-        requests.post(
-            f'{SUPABASE_URL}/rest/v1/{table}',
-            headers={
-                'apikey': SUPABASE_KEY,
-                'Authorization': f'Bearer {SUPABASE_KEY}',
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal',
-            },
-            json=data,
-            timeout=5,
-        )
-    except Exception as e:
-        pass  # never let DB errors crash the bot
-
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
@@ -566,7 +543,7 @@ def strategy_basis_arb(market, secs_left, tracker, position):
             return position
 
         basis_pct = (futures - spot) / spot * 100
-        if abs(basis_pct) < 0.10:
+        if abs(basis_pct) < 0.05:
             return position
 
         direction = "DOWN" if basis_pct > 0 else "UP"
@@ -604,7 +581,7 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         up_mid    = prices["up_mid"]
         deviation = up_mid - 0.50
 
-        if prices["spread"] > 0.04 or abs(deviation) < 0.08:
+        if prices["spread"] > 0.04 or abs(deviation) < 0.04:
             return position
 
         direction = "DOWN" if deviation > 0 else "UP"
@@ -646,10 +623,10 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 
         buy_ratio = buy_vol / total_vol
 
-        if buy_ratio > 0.60:
+        if buy_ratio > 0.58:
             direction = "UP"
             intensity = min((buy_ratio - 0.60) / 0.20, 1.0)
-        elif buy_ratio < 0.40:
+        elif buy_ratio < 0.42:
             direction = "DOWN"
             intensity = min((0.40 - buy_ratio) / 0.20, 1.0)
         else:
@@ -679,21 +656,6 @@ def run():
     log.info("Multi-Strategy Mechanical Edge Simulator v2")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
-
-    supabase_insert({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "strategy": "SYSTEM",
-        "action": "STARTUP",
-        "side": "N/A",
-        "price": 0.0,
-        "size": 0.0,
-        "fee": 0.0,
-        "balance": 0.0,
-        "condition_id": "test",
-        "question": "Bot started",
-        "signal_data": {"version": "v2"},
-    })
-    log.info("Supabase connection test sent")
 
     trackers = {
         "chainlink":   StrategyTracker("Chainlink Arb"),
