@@ -1,1 +1,1 @@
-worker: python chainlink_arb.py
+worker: python multi_strategy.py
