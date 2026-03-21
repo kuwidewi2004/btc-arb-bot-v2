@@ -565,14 +565,14 @@ def fetch_current_btc_market() -> Optional[Market]:
             # Fallback: search markets directly by question text
             resp2 = requests.get(
                 f"{GAMMA_API}/markets",
-                params={"active": "true", "closed": "false", "limit": 50},
+                params={"active": "true", "closed": "false", "limit": 100, "tag": "crypto"},
                 timeout=10,
             )
             resp2.raise_for_status()
             all_markets = resp2.json()
             markets = [
                 m for m in all_markets
-                if "bitcoin up or down" in m.get("question", "").lower()
+                if "btc" in m.get("slug", "").lower() and "updown" in m.get("slug", "").lower()
             ]
         else:
             markets = events[0].get("markets", [])
