@@ -37,6 +37,8 @@ from collections import deque
 import requests
 import numpy as np
 
+print("BOT STARTING UP", flush=True)
+
 # Fix Windows terminal Unicode
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
