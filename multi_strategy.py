@@ -87,8 +87,8 @@ def supabase_insert(record: dict):
             json=record,
             timeout=5,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Supabase insert failed: {e}")
 
 
 # --------------------------------------------------------------- DATACLASSES --
