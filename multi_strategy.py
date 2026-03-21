@@ -603,8 +603,8 @@ def strategy_basis_arb(market, secs_left, tracker, position):
             return position
 
         basis_pct = (futures - spot) / spot * 100
-        if abs(basis_pct) < 0.05:
-            log.info(f"[Basis] too small: {basis_pct:+.4f}% (need ±0.05%)")
+        if abs(basis_pct) < 0.10:
+            log.info(f"[Basis] too small: {basis_pct:+.4f}% (need ±0.10%)")
             return position
 
         direction = "DOWN" if basis_pct > 0 else "UP"
@@ -645,8 +645,8 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         if prices["spread"] > 0.04:
             log.info(f"[Odds] spread too wide: {prices['spread']:.4f}")
             return position
-        if abs(deviation) < 0.04:
-            log.info(f"[Odds] deviation too small: {deviation:+.4f} (need ±0.04)")
+        if abs(deviation) < 0.08:
+            log.info(f"[Odds] deviation too small: {deviation:+.4f} (need ±0.08)")
             return position
 
         direction = "DOWN" if deviation > 0 else "UP"
@@ -688,12 +688,12 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 
         buy_ratio = buy_vol / total_vol
 
-        if buy_ratio > 0.58:
+        if buy_ratio > 0.60:
             direction = "UP"
-            intensity = min((buy_ratio - 0.58) / 0.20, 1.0)
-        elif buy_ratio < 0.42:
+            intensity = min((buy_ratio - 0.60) / 0.20, 1.0)
+        elif buy_ratio < 0.40:
             direction = "DOWN"
-            intensity = min((0.42 - buy_ratio) / 0.20, 1.0)
+            intensity = min((0.40 - buy_ratio) / 0.20, 1.0)
         else:
             return position
 
