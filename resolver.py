@@ -143,18 +143,21 @@ def fetch_market_outcome(condition_id: str) -> dict:
 
         m      = data[0] if isinstance(data, list) else data
         closed = m.get("closed", False)
+        log.info(f"closed={closed} outcomePrices={m.get('outcomePrices')} umaStatus={m.get('umaResolutionStatus')}")
         if not closed:
             return {"resolved": False}
 
         outcome_prices = json.loads(m.get("outcomePrices", "[0,0]"))
         up_price   = float(outcome_prices[0])
         down_price = float(outcome_prices[1])
+        log.info(f"up_price={up_price} down_price={down_price}")
 
         if up_price > 0.9:
             outcome = "UP"
         elif down_price > 0.9:
             outcome = "DOWN"
         else:
+            log.info(f"Neither price > 0.9 — not fully resolved yet")
             return {"resolved": False}
 
         return {
