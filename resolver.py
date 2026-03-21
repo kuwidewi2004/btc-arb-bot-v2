@@ -106,7 +106,7 @@ def resolve_snapshots(outcome: str, condition_id: str):
         return
     try:
         resp = requests.patch(
-            f"{SUPABASE_URL}/rest/v1/snapshots",
+            f"{SUPABASE_URL}/rest/v1/signal_snapshots",
             headers={
                 "apikey":        SUPABASE_KEY,
                 "Authorization": f"Bearer {SUPABASE_KEY}",
