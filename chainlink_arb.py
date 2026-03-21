@@ -626,6 +626,8 @@ def fetch_current_btc_market() -> Optional[Market]:
             timeout=10,
         )
         resp.raise_for_status()
+        raw = resp.text[:500]
+        print(f"RAW RESPONSE: {raw}", flush=True)
         markets = resp.json()
         markets = [m for m in markets if "btc" in m.get("question", "").lower() and "up or down" in m.get("question", "").lower()]
         print(f"BTC 5m markets found: {len(markets)}", flush=True)
