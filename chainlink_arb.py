@@ -620,8 +620,7 @@ def fetch_current_btc_market() -> Optional[Market]:
     try:
         resp = requests.get(
             f"{GAMMA_API}/markets",
-            params={"series_ticker": "btc-up-or-down-5m",
-                    "closed": "false", "active": "true", "limit": 3},
+            params={"slug": "btc-updown-5m", "closed": "false", "active": "true", "limit": 10},
             timeout=10,
         )
         resp.raise_for_status()
