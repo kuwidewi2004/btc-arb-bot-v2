@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 
 POLYMARKET_HOST  = "https://clob.polymarket.com"
 GAMMA_API        = "https://gamma-api.polymarket.com"
-BINANCE_FUTURES  = "https://fapi.binance.com"
+OKX_BASE         = "https://www.okx.com"
 BTC_SYMBOL       = "BTCUSDT"
 ETH_SYMBOL       = "ETHUSDT"
 
