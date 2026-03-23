@@ -15,7 +15,8 @@ Data sources (all work on Railway US servers):
   - Spot prices:    Coinbase + Kraken fallback
   - Funding/Basis:  OKX public API (no geo-blocking)
   - Volume:         OKX klines (no geo-blocking)
-  - Liquidations:   OKX liquidation feed (no geo-blocking)
+  - Liquidations:   OKX REST (poll) + Binance WebSocket (real-time)
+                    — combined covers ~80-90% of BTC perp liq volume
   - Chainlink:      Polymarket RTDS WebSocket (crypto_prices_chainlink)
                     — exact same feed Polymarket uses for resolution
 
@@ -447,6 +448,18 @@ def refresh_shared_data():
         except Exception as e:
             log.warning(f"Liquidation fetch failed: {e}")
 
+        # Merge Binance liquidations (WebSocket feed) into cache
+        # Binance handles 3-5x more BTC liq volume than OKX
+        try:
+            bnb = get_binance_liq_5min()
+            _liq_cache["long"]  += bnb["long"]
+            _liq_cache["short"] += bnb["short"]
+            if bnb["long"] + bnb["short"] > 0:
+                log.info(f"Liquidations — OKX+Binance combined | "
+                         f"long=${_liq_cache['long']:,.0f} short=${_liq_cache['short']:,.0f}")
+        except Exception as e:
+            log.warning(f"Binance liq merge failed: {e}")
+
     # Volume via OKX klines
     global _volume_fetched
     if now - _volume_fetched >= 60:
@@ -499,6 +512,8 @@ _SUBSCRIBE_MSG = json.dumps({
 
 def _on_ws_message(ws, message):
     global _chainlink_cache
+    if not message:
+        return
     try:
         data = json.loads(message)
         if data.get("topic") != "crypto_prices_chainlink":
@@ -578,6 +593,98 @@ def fetch_chainlink_price() -> tuple:
         return None, None
 
     return price, age_sec
+
+
+# ------------------------------------------------ BINANCE LIQUIDATION CACHE --
+# Binance processes 3-5x more BTC liquidation volume than OKX.
+# We subscribe to the Binance USDM futures forced liquidation stream
+# in a background thread and accumulate liq USD over a rolling 5-minute
+# window. The OKX REST poll and this WebSocket feed are combined in
+# _liq_cache so the liquidation cascade strategy sees the full market picture.
+
+_binance_liq_buffer: list = []   # raw events: {"side": "BUY"|"SELL", "usd": float, "ts": ms}
+_binance_liq_lock = threading.Lock()
+_BINANCE_LIQ_WS   = "wss://fstream.binance.com/ws/!forceOrder@arr"
+
+
+def _on_binance_liq_message(ws, message):
+    try:
+        data  = json.loads(message)
+        order = data.get("o", {})
+        # Only care about BTCUSDT perpetual
+        if order.get("s", "") != "BTCUSDT":
+            return
+        side   = order.get("S", "")   # "BUY" = short liq, "SELL" = long liq
+        qty    = float(order.get("q", 0))
+        price  = float(order.get("ap", 0)) or float(order.get("p", 0))
+        usd    = qty * price
+        ts_ms  = int(order.get("T", time.time() * 1000))
+        with _binance_liq_lock:
+            _binance_liq_buffer.append({"side": side, "usd": usd, "ts": ts_ms})
+            # Keep only last 10 minutes of events to bound memory
+            cutoff = (time.time() - 600) * 1000
+            while _binance_liq_buffer and _binance_liq_buffer[0]["ts"] < cutoff:
+                _binance_liq_buffer.pop(0)
+        log.debug(f"[Binance Liq] {side} ${usd:,.0f} BTCUSDT")
+    except Exception as e:
+        log.warning(f"[Binance Liq] message parse error: {e}")
+
+
+def _on_binance_liq_open(ws):
+    log.info("[Binance Liq] Connected to Binance USDM liquidation stream")
+
+
+def _on_binance_liq_error(ws, error):
+    log.warning(f"[Binance Liq] error: {error}")
+
+
+def _on_binance_liq_close(ws, close_status_code, close_msg):
+    log.warning(f"[Binance Liq] closed ({close_status_code}) — will reconnect")
+
+
+def _binance_liq_ws_thread():
+    """Background thread: maintains persistent WebSocket to Binance liquidation feed."""
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                _BINANCE_LIQ_WS,
+                on_open    = _on_binance_liq_open,
+                on_message = _on_binance_liq_message,
+                on_error   = _on_binance_liq_error,
+                on_close   = _on_binance_liq_close,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            log.warning(f"[Binance Liq] thread exception: {e}")
+        log.info("[Binance Liq] Reconnecting in 5s...")
+        time.sleep(5)
+
+
+def start_binance_liq_ws():
+    """Start the Binance liquidation WebSocket listener in a daemon background thread."""
+    t = threading.Thread(target=_binance_liq_ws_thread, daemon=True)
+    t.start()
+    log.info("[Binance Liq] Background thread started")
+
+
+def get_binance_liq_5min() -> dict:
+    """
+    Returns combined long/short liquidation USD over the last 5 minutes
+    from the Binance feed.
+      BUY  side = short squeeze (shorts liquidated) → bullish
+      SELL side = long liquidation (longs liquidated) → bearish
+    """
+    cutoff = (time.time() - 300) * 1000
+    long_liqs = short_liqs = 0.0
+    with _binance_liq_lock:
+        for e in _binance_liq_buffer:
+            if e["ts"] < cutoff:
+                continue
+            if e["side"] == "SELL":   # long liquidated
+                long_liqs  += e["usd"]
+            else:                     # short liquidated (BUY)
+                short_liqs += e["usd"]
+    return {"long": long_liqs, "short": short_liqs}
 
 
 # --------------------------------------------------------- MARKET DISCOVERY --
@@ -873,11 +980,14 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
     Strategy 3: Liquidation cascade.
     Large long liquidations = forced selling = bet DOWN.
     Large short liquidations = short squeeze = bet UP.
-    Data from OKX public API.
+    Data from OKX (REST poll) + Binance (WebSocket) — combined for full market picture.
+    Binance alone processes 3-5x more BTC liq volume than OKX.
     """
     try:
-        long_liqs  = _liq_cache["long"]
-        short_liqs = _liq_cache["short"]
+        # Combine OKX REST + Binance WebSocket liquidation data
+        binance = get_binance_liq_5min()
+        long_liqs  = _liq_cache["long"]  + binance["long"]
+        short_liqs = _liq_cache["short"] + binance["short"]
         total      = long_liqs + short_liqs
 
         if total < 300_000:
@@ -910,7 +1020,8 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
-                        {"long_liqs": round(long_liqs), "short_liqs": round(short_liqs)},
+                        {"long_liqs": round(long_liqs), "short_liqs": round(short_liqs),
+                         "source": "OKX+Binance"},
                         market)
             t = StrategyTrade("liquidation_cascade", direction, size, price, market)
             t.trade_id = trade_id
@@ -1117,7 +1228,8 @@ def run():
 
     # Start Chainlink WebSocket before anything else
     start_chainlink_ws()
-    log.info("Waiting 3s for Chainlink WebSocket to connect...")
+    start_binance_liq_ws()
+    log.info("Waiting 3s for WebSocket connections to establish...")
     time.sleep(3)
 
     trackers = {
@@ -1191,7 +1303,9 @@ def run():
                 total_vol  = sum(c["volume"] for c in recent_vol)
                 buy_vol    = sum(c["buy_vol"] for c in recent_vol)
                 buy_ratio  = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
-                liq_total  = _liq_cache["long"] + _liq_cache["short"]
+                liq_okx     = _liq_cache["long"] + _liq_cache["short"]
+                liq_binance = get_binance_liq_5min()
+                liq_total   = liq_okx + liq_binance["long"] + liq_binance["short"]
                 prices     = fetch_poly_prices(current_market) if current_market else {}
                 supabase_snapshot({
                     "btc_price":        round(spot, 2),
