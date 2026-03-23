@@ -1,1 +1,1 @@
-worker: python multi_strategy.py & python resolver.py
+web: python multi_strategy.py & python resolver.py & wait
