@@ -16,7 +16,8 @@ Data sources (all work on Railway US servers):
   - Funding/Basis:  OKX public API (no geo-blocking)
   - Volume:         OKX klines (no geo-blocking)
   - Liquidations:   OKX liquidation feed (no geo-blocking)
-  - Chainlink:      CryptoCompare + Chainlink API
+  - Chainlink:      Polymarket RTDS WebSocket (crypto_prices_chainlink)
+                    — exact same feed Polymarket uses for resolution
 
 CHANGES (v3):
   - Each trade gets a UUID (trade_id) written to Supabase on OPEN
@@ -24,6 +25,15 @@ CHANGES (v3):
   - supabase_insert on CLOSE removed — resolver.py owns all outcome writes
   - Local in-memory balance/wins/losses tracking unchanged (used for live log only)
   - market_end_time written to OPEN row so resolver can filter intelligently
+
+CHANGES (v3.1):
+  - Chainlink price now sourced from Polymarket RTDS WebSocket
+    (wss://ws-subscriptions-clob.polymarket.com/ws/) using the
+    crypto_prices_chainlink topic — this is the exact feed Polymarket
+    uses to resolve BTC up/down markets, replacing the delayed
+    data.chain.link proxy which showed stale display-only data
+  - Background thread maintains WebSocket connection with auto-reconnect
+  - fetch_chainlink_price() now reads from shared in-memory cache
 """
 
 import os
@@ -33,6 +43,7 @@ import json
 import sys
 import io
 import uuid
+import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
@@ -40,6 +51,7 @@ from collections import deque
 
 import requests
 import numpy as np
+import websocket
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -461,29 +473,111 @@ def refresh_shared_data():
             log.warning(f"Volume fetch failed: {e}")
 
 
-def fetch_chainlink_price() -> tuple:
-    """Returns (price, age_seconds)."""
+# ------------------------------------------------- CHAINLINK WEBSOCKET CACHE --
+# Polymarket broadcasts the exact Chainlink price it uses for resolution
+# via wss://ws-subscriptions-clob.polymarket.com/ws/ on topic
+# crypto_prices_chainlink. We subscribe in a background thread and keep
+# the latest price + timestamp in a shared dict.
+# fetch_chainlink_price() reads from this cache instead of making HTTP calls.
+
+_chainlink_cache: dict = {
+    "price":      None,   # latest BTC/USD from Chainlink via Polymarket RTDS
+    "updated_at": None,   # datetime when last updated
+}
+_POLYMARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+_SUBSCRIBE_MSG = json.dumps({
+    "action": "subscribe",
+    "subscriptions": [
+        {
+            "topic":   "crypto_prices_chainlink",
+            "type":    "*",
+            "filters": "{\"symbol\":\"btc/usd\"}"
+        }
+    ]
+})
+
+
+def _on_ws_message(ws, message):
+    global _chainlink_cache
     try:
-        r = requests.get("https://min-api.cryptocompare.com/data/price",
-                         params={"fsym": "BTC", "tsyms": "USD"}, timeout=5)
-        r.raise_for_status()
-        price   = float(r.json()["USD"])
-        age_sec = 30.0
+        data = json.loads(message)
+        if data.get("topic") != "crypto_prices_chainlink":
+            return
+        payload = data.get("payload", {})
+        if payload.get("symbol", "").lower() != "btc/usd":
+            return
+        price = float(payload["value"])
+        ts_ms = payload.get("timestamp")
+        if ts_ms:
+            updated = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        else:
+            updated = datetime.now(timezone.utc)
+        _chainlink_cache["price"]      = price
+        _chainlink_cache["updated_at"] = updated
+        log.debug(f"[Chainlink WS] BTC/USD={price} updated_at={updated.isoformat()}")
+    except Exception as e:
+        log.warning(f"[Chainlink WS] message parse error: {e}")
+
+
+def _on_ws_open(ws):
+    log.info("[Chainlink WS] Connected to Polymarket RTDS — subscribing to btc/usd")
+    ws.send(_SUBSCRIBE_MSG)
+
+
+def _on_ws_error(ws, error):
+    log.warning(f"[Chainlink WS] error: {error}")
+
+
+def _on_ws_close(ws, close_status_code, close_msg):
+    log.warning(f"[Chainlink WS] closed ({close_status_code}) — will reconnect")
+
+
+def _chainlink_ws_thread():
+    """Background thread: maintains persistent WebSocket to Polymarket RTDS."""
+    while True:
         try:
-            cl = requests.get("https://data.chain.link/api/proxy/btc-usd/latest",
-                              timeout=5)
-            if cl.status_code == 200:
-                d       = cl.json()
-                updated = d.get("updatedAt") or d.get("timestamp")
-                if updated:
-                    dt      = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
-                    age_sec = (datetime.now(timezone.utc) - dt).total_seconds()
-                    price   = float(d.get("answer") or d.get("price") or price)
-        except Exception:
-            pass
-        return price, age_sec
-    except Exception:
+            ws = websocket.WebSocketApp(
+                _POLYMARKET_WS,
+                on_open    = _on_ws_open,
+                on_message = _on_ws_message,
+                on_error   = _on_ws_error,
+                on_close   = _on_ws_close,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            log.warning(f"[Chainlink WS] thread exception: {e}")
+        log.info("[Chainlink WS] Reconnecting in 5s...")
+        time.sleep(5)
+
+
+def start_chainlink_ws():
+    """Start the Chainlink WebSocket listener in a daemon background thread."""
+    t = threading.Thread(target=_chainlink_ws_thread, daemon=True)
+    t.start()
+    log.info("[Chainlink WS] Background thread started")
+
+
+def fetch_chainlink_price() -> tuple:
+    """
+    Returns (price, age_seconds) from the Polymarket RTDS Chainlink cache.
+    This is the exact same BTC/USD feed Polymarket uses to resolve markets.
+    Falls back to (None, None) if the WebSocket hasn't received a price yet
+    or the last update is stale (> 60s).
+    """
+    price      = _chainlink_cache.get("price")
+    updated_at = _chainlink_cache.get("updated_at")
+
+    if price is None or updated_at is None:
+        log.debug("[Chainlink WS] No price yet — WebSocket still connecting")
         return None, None
+
+    age_sec = (datetime.now(timezone.utc) - updated_at).total_seconds()
+
+    if age_sec > 60:
+        log.warning(f"[Chainlink WS] Price stale ({age_sec:.0f}s) — possible disconnect")
+        return None, None
+
+    return price, age_sec
 
 
 # --------------------------------------------------------- MARKET DISCOVERY --
@@ -1016,10 +1110,15 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v3")
+    log.info("Multi-Strategy Mechanical Edge Simulator v3.1")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
+
+    # Start Chainlink WebSocket before anything else
+    start_chainlink_ws()
+    log.info("Waiting 3s for Chainlink WebSocket to connect...")
+    time.sleep(3)
 
     trackers = {
         "chainlink":   StrategyTracker("Chainlink Arb"),
