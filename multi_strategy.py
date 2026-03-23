@@ -1,5 +1,5 @@
 """
-Multi-Strategy Mechanical Edge Simulator v2
+Multi-Strategy Mechanical Edge Simulator v3
 =============================================
 Runs 6 independent mechanical edge strategies simultaneously in dry run.
 
@@ -18,12 +18,12 @@ Data sources (all work on Railway US servers):
   - Liquidations:   OKX liquidation feed (no geo-blocking)
   - Chainlink:      CryptoCompare + Chainlink API
 
-FIXES (v2.2):
-  - Resolution: fetch_market_winner retries up to 10x with 8s delay (80s total window)
-  - resolve_positions: removed redundant outer retry loop
-  - Voided markets (outcomePrices stays ["0","0"]): positions skipped, balance refunded
-  - flat_pnl: uses actual position size instead of hardcoded $10
-  - Signal logging: every non-firing signal evaluation logged to Supabase signal_log
+CHANGES (v3):
+  - Each trade gets a UUID (trade_id) written to Supabase on OPEN
+  - StrategyTrade dataclass carries trade_id for reference
+  - supabase_insert on CLOSE removed — resolver.py owns all outcome writes
+  - Local in-memory balance/wins/losses tracking unchanged (used for live log only)
+  - market_end_time written to OPEN row so resolver can filter intelligently
 """
 
 import os
@@ -32,6 +32,7 @@ import logging
 import json
 import sys
 import io
+import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
@@ -192,6 +193,7 @@ class StrategyTrade:
     size:        float
     entry_price: float
     market:      Market
+    trade_id:    str = field(default_factory=lambda: str(uuid.uuid4()))
     signal_data: dict = field(default_factory=dict)
     entry_time:  datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -209,9 +211,16 @@ class StrategyTracker:
         self.logfile   = f"strategy_{name.lower().replace(' ', '_')}.jsonl"
 
     def open(self, side: str, price: float, size: float,
-             signal_data: dict, market: Market):
+             signal_data: dict, market: Market) -> str:
+        """
+        Records an open position locally and writes ONE row to Supabase.
+        Returns the trade_id so the caller can store it on StrategyTrade.
+        The resolver will later patch this row with the real outcome.
+        """
         fee = size * TAKER_FEE
         self.balance -= (size + fee)
+        trade_id = str(uuid.uuid4())
+
         entry = {
             "timestamp":    datetime.now(timezone.utc).isoformat(),
             "action":       "OPEN",
@@ -228,22 +237,34 @@ class StrategyTracker:
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
+
+        # Write to Supabase — this is the ONLY row we write per trade.
+        # Outcome fields (actual_win, resolved_outcome, pnl, etc.) will be
+        # patched later by resolver.py using trade_id as the key.
         supabase_insert({
-            "strategy":     self.name,
-            "action":       "OPEN",
-            "side":         side,
-            "price":        price,
-            "size":         size,
-            "fee":          round(size * TAKER_FEE, 4),
-            "condition_id": market.condition_id,
-            "question":     market.question,
-            "signal_data":  signal_data,
+            "trade_id":       trade_id,
+            "strategy":       self.name,
+            "action":         "OPEN",
+            "side":           side,
+            "price":          price,
+            "size":           size,
+            "fee":            round(size * TAKER_FEE, 4),
+            "condition_id":   market.condition_id,
+            "question":       market.question,
+            "market_end_time": market.end_time.isoformat(),
+            "signal_data":    signal_data,
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
-                 f"balance=${self.balance:.2f} | {json.dumps(signal_data)}")
+                 f"balance=${self.balance:.2f} | trade_id={trade_id[:8]}... | "
+                 f"{json.dumps(signal_data)}")
+        return trade_id
 
     def close(self, side: str, entry_price: float, exit_price: float,
               size: float, market: Market, reason: str = "RESOLVED"):
+        """
+        Updates local balance and win/loss counters only.
+        Does NOT write to Supabase — resolver.py owns all outcome writes.
+        """
         if side == "UP":
             pnl = (exit_price - entry_price) * size / entry_price
         else:
@@ -257,58 +278,40 @@ class StrategyTracker:
             self.losses += 1
 
         entry = {
-            "timestamp":    datetime.now(timezone.utc).isoformat(),
-            "action":       "CLOSE",
-            "strategy":     self.name,
-            "reason":       reason,
-            "side":         side,
-            "entry_price":  entry_price,
-            "exit_price":   exit_price,
-            "size":         size,
-            "pnl":          round(pnl, 4),
-            "fee":          round(fee, 4),
-            "balance":      round(self.balance, 2),
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
+            "action":      "CLOSE_LOCAL",
+            "strategy":    self.name,
+            "reason":      reason,
+            "side":        side,
+            "entry_price": entry_price,
+            "exit_price":  exit_price,
+            "size":        size,
+            "pnl":         round(pnl, 4),
+            "fee":         round(fee, 4),
+            "balance":     round(self.balance, 2),
             "condition_id": market.condition_id,
         }
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
-        # flat_pnl uses actual size (not hardcoded $10)
-        if pnl > 0:
-            flat_pnl = (size * (1 / entry_price - 1)) - (size * TAKER_FEE * 2)
-        else:
-            flat_pnl = -size - (size * TAKER_FEE * 2)
-        edge = (1 / entry_price - 1) if pnl > 0 else -1.0
-
-        supabase_insert({
-            "strategy":     self.name,
-            "action":       "CLOSE",
-            "side":         side,
-            "price":        exit_price,
-            "size":         size,
-            "pnl":          round(pnl, 4),
-            "flat_pnl":     round(flat_pnl, 4),
-            "edge":         round(edge, 4),
-            "fee":          round(fee, 4),
-            "condition_id": market.condition_id,
-            "signal_data":  {"reason": reason, "entry_price": entry_price},
-        })
+        # No supabase_insert here — resolver writes the real outcome to the OPEN row.
         total = self.wins + self.losses
         wr    = (self.wins / total * 100) if total else 0
-        log.info(f"[{self.name}] CLOSE {side} ({reason}) | exit={exit_price:.2f} | "
+        log.info(f"[{self.name}] CLOSE_LOCAL {side} ({reason}) | exit={exit_price:.2f} | "
                  f"PnL={pnl:+.3f} | balance=${self.balance:.2f} | "
                  f"WR={wr:.0f}% ({self.wins}W/{self.losses}L)")
 
     def void(self, pos: "StrategyTrade", market: Market):
         """
         Market was voided — refund the position size (minus fees already paid).
-        Does not count as win or loss.
+        Does not count as win or loss. Does not write to Supabase —
+        resolver.py will mark the row VOID when it confirms the market outcome.
         """
         self.balance += pos.size  # refund stake, fees are lost
         entry = {
             "timestamp":    datetime.now(timezone.utc).isoformat(),
-            "action":       "VOID",
+            "action":       "VOID_LOCAL",
             "strategy":     self.name,
             "side":         pos.side,
             "entry_price":  pos.entry_price,
@@ -320,17 +323,7 @@ class StrategyTracker:
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
-        supabase_insert({
-            "strategy":     self.name,
-            "action":       "VOID",
-            "side":         pos.side,
-            "price":        pos.entry_price,
-            "size":         pos.size,
-            "pnl":          0.0,
-            "condition_id": market.condition_id,
-            "signal_data":  {"reason": "MARKET_VOIDED"},
-        })
-        log.info(f"[{self.name}] VOID {pos.side} | size refunded={pos.size:.2f} | "
+        log.info(f"[{self.name}] VOID_LOCAL {pos.side} | size refunded={pos.size:.2f} | "
                  f"balance=${self.balance:.2f}")
 
     def summary(self) -> str:
@@ -338,7 +331,8 @@ class StrategyTracker:
         wr    = (self.wins / total * 100) if total else 0
         pnl   = self.balance - self.start_bal
         return (f"{self.name}: ${self.balance:.2f} | PnL={pnl:+.2f} | "
-                f"WR={wr:.0f}% | {total} trades")
+                f"WR={wr:.0f}% | {total} trades (local estimate — "
+                f"ground truth in Supabase via resolver)")
 
 
 # --------------------------------------------------------- SHARED DATA -------
@@ -551,27 +545,17 @@ def fetch_poly_prices(market: Market) -> dict:
 
 # --------------------------------------------------------- RESOLUTION --------
 
-# Return values from fetch_market_winner:
-#   "UP"    — up token won
-#   "DOWN"  — down token won
-#   "VOID"  — market closed but outcomePrices stayed ["0","0"] — treat as voided
-#   None    — couldn't determine (shouldn't happen after retries)
-
 def fetch_market_winner(condition_id: str) -> Optional[str]:
     """
     Polls Gamma API every 5 seconds until a winner is found.
     Gives up after 10 minutes and returns "VOID".
-
-    - Returns immediately as soon as outcomePrices shows a clear winner
-    - If closed=True and prices stay ["0","0"] for 2+ minutes, declares VOID
-    - Logs elapsed time on each attempt so you can see how long resolution takes
     """
-    POLL_INTERVAL   = 5    # seconds between each check
-    MAX_WAIT        = 600  # 10 minutes total
-    VOID_THRESHOLD  = 120  # if closed + zero prices for this long, declare void
+    POLL_INTERVAL    = 5
+    MAX_WAIT         = 600
+    VOID_THRESHOLD   = 120
 
-    start_time      = time.time()
-    zero_price_since = None  # tracks when we first saw closed=True + prices=[0,0]
+    start_time       = time.time()
+    zero_price_since = None
 
     attempt = 0
     while True:
@@ -606,7 +590,6 @@ def fetch_market_winner(condition_id: str) -> Optional[str]:
             log.info(f"[{condition_id}] attempt={attempt} elapsed={elapsed:.0f}s | "
                      f"closed={m.get('closed')} up={up_price} down={down_price}")
 
-            # Winner found — return immediately
             if up_price > 0.9:
                 log.info(f"[{condition_id}] Resolved UP after {elapsed:.0f}s")
                 return "UP"
@@ -614,7 +597,6 @@ def fetch_market_winner(condition_id: str) -> Optional[str]:
                 log.info(f"[{condition_id}] Resolved DOWN after {elapsed:.0f}s")
                 return "DOWN"
 
-            # Closed but both prices zero — track how long this has been the case
             if m.get("closed") and up_price == 0.0 and down_price == 0.0:
                 if zero_price_since is None:
                     zero_price_since = time.time()
@@ -625,7 +607,6 @@ def fetch_market_winner(condition_id: str) -> Optional[str]:
                                 f"— declaring VOID")
                     return "VOID"
             else:
-                # Prices changed away from zero — reset void tracker
                 zero_price_since = None
 
         except Exception as e:
@@ -638,16 +619,14 @@ def fetch_market_winner(condition_id: str) -> Optional[str]:
 def resolve_positions(positions: dict, trackers: dict, market: Market) -> dict:
     """
     Resolves all open positions for an expired market.
-
-    - "UP" / "DOWN" winner: closes at 1.0 (win) or 0.0 (loss)
-    - "VOID": refunds position size, no win/loss recorded
-    - No outer retry loop — fetch_market_winner handles all retries internally
+    Updates local balance/win-loss counters only.
+    Supabase outcome writes happen in resolver.py using trade_id.
     """
     any_open = any(p is not None for p in positions.values())
     if not any_open:
         return {k: None for k in positions}
 
-    log.info(f"Resolving market: {market.question}")
+    log.info(f"Resolving market locally: {market.question}")
     outcome = fetch_market_winner(market.condition_id)
 
     for key, pos in positions.items():
@@ -655,7 +634,7 @@ def resolve_positions(positions: dict, trackers: dict, market: Market) -> dict:
             continue
 
         if outcome == "VOID":
-            log.warning(f"[{trackers[key].name}] Market voided — refunding position")
+            log.warning(f"[{trackers[key].name}] Market voided locally — refunding position")
             trackers[key].void(pos, market)
 
         elif outcome in ("UP", "DOWN"):
@@ -664,9 +643,7 @@ def resolve_positions(positions: dict, trackers: dict, market: Market) -> dict:
             trackers[key].close(
                 pos.side, pos.entry_price, exit_price, pos.size, market, reason
             )
-
         else:
-            # Shouldn't reach here but handle gracefully
             log.error(f"Unexpected outcome value: {outcome} — skipping close for {key}")
 
     return {k: None for k in positions}
@@ -736,10 +713,12 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
         size  = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
-            tracker.open(direction, price, size,
+            trade_id = tracker.open(direction, price, size,
                         {"divergence": round(divergence, 4), "cl_age": round(cl_age, 1)},
                         market)
-            return StrategyTrade("chainlink_arb", direction, size, price, market)
+            t = StrategyTrade("chainlink_arb", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Chainlink arb] error: {e}")
     return position
@@ -784,10 +763,12 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
         size      = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
-            tracker.open(direction, price, size,
+            trade_id = tracker.open(direction, price, size,
                         {"funding_rate": round(rate, 6), "intensity": round(intensity, 3)},
                         market)
-            return StrategyTrade("funding_reversion", direction, size, price, market)
+            t = StrategyTrade("funding_reversion", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Funding reversion] error: {e}")
     return position
@@ -834,10 +815,12 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         size  = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
-            tracker.open(direction, price, size,
+            trade_id = tracker.open(direction, price, size,
                         {"long_liqs": round(long_liqs), "short_liqs": round(short_liqs)},
                         market)
-            return StrategyTrade("liquidation_cascade", direction, size, price, market)
+            t = StrategyTrade("liquidation_cascade", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Liquidation cascade] error: {e}")
     return position
@@ -888,11 +871,13 @@ def strategy_basis_arb(market, secs_left, tracker, position):
         size  = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
-            tracker.open(direction, price, size,
+            trade_id = tracker.open(direction, price, size,
                         {"basis_pct": round(basis_pct, 4),
                          "spot": round(spot, 2), "futures": round(futures, 2)},
                         market)
-            return StrategyTrade("basis_arb", direction, size, price, market)
+            t = StrategyTrade("basis_arb", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Basis arb] error: {e}")
     return position
@@ -943,11 +928,13 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         size      = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
-            tracker.open(direction, price, size,
+            trade_id = tracker.open(direction, price, size,
                         {"up_mid": round(up_mid, 4), "deviation": round(deviation, 4),
                          "secs_left": round(secs_left)},
                         market)
-            return StrategyTrade("odds_mispricing", direction, size, price, market)
+            t = StrategyTrade("odds_mispricing", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Odds mispricing] error: {e}")
     return position
@@ -1015,10 +1002,12 @@ def strategy_volume_clock(market, secs_left, tracker, position):
         size  = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
-            tracker.open(direction, price, size,
+            trade_id = tracker.open(direction, price, size,
                         {"buy_ratio": round(buy_ratio, 4), "secs_left": round(secs_left)},
                         market)
-            return StrategyTrade("volume_clock", direction, size, price, market)
+            t = StrategyTrade("volume_clock", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Volume clock] error: {e}")
     return position
@@ -1027,9 +1016,10 @@ def strategy_volume_clock(market, secs_left, tracker, position):
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v2.2")
+    log.info("Multi-Strategy Mechanical Edge Simulator v3")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
+    log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
 
     trackers = {
         "chainlink":   StrategyTracker("Chainlink Arb"),
@@ -1077,9 +1067,9 @@ def run():
 
             secs_left = (current_market.end_time - now).total_seconds()
 
-            # Market expired — resolve all open positions at actual outcome
+            # Market expired — resolve all open positions locally
             if secs_left <= 0:
-                log.info(f"Market expired: {current_market.question} — resolving positions")
+                log.info(f"Market expired: {current_market.question} — resolving positions locally")
                 positions         = resolve_positions(positions, trackers, current_market)
                 current_market    = None
                 last_market_fetch = 0
@@ -1148,7 +1138,8 @@ def run():
             # Print summary every 30 minutes
             if time.time() - last_summary > 1800:
                 log.info("=" * 60)
-                log.info("STRATEGY PERFORMANCE SUMMARY")
+                log.info("STRATEGY PERFORMANCE SUMMARY (local estimates)")
+                log.info("Ground truth win rates available via resolver.py")
                 for t in trackers.values():
                     log.info(t.summary())
                 log.info("=" * 60)
@@ -1158,7 +1149,7 @@ def run():
 
         except KeyboardInterrupt:
             log.info("Stopped.")
-            log.info("FINAL SUMMARY:")
+            log.info("FINAL LOCAL SUMMARY:")
             for t in trackers.values():
                 log.info(t.summary())
             break
@@ -1168,5 +1159,5 @@ def run():
 
 
 if __name__ == "__main__":
-    print("MULTI-STRATEGY BOT STARTING v2.2", flush=True)
+    print("MULTI-STRATEGY BOT STARTING v3", flush=True)
     run()
