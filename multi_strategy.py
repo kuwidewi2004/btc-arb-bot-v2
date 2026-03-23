@@ -410,21 +410,19 @@ def refresh_shared_data():
 
         try:
             r = requests.get(
-                "https://api.bybit.com/v5/market/tickers",
-                params={"category": "linear", "symbol": "BTCUSDT"},
+                "https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT",
                 timeout=5)
             r.raise_for_status()
-            tickers = r.json().get("result", {}).get("list", [])
-            bybit_rate = float(tickers[0].get("fundingRate", 0)) if tickers else 0.0
-            _funding_cache["binance"] = bybit_rate  # reusing binance key for compatibility
+            gate_rate = float(r.json().get("funding_rate", 0))
+            _funding_cache["binance"] = gate_rate  # reusing key for compatibility
         except Exception as e:
-            log.warning(f"Bybit funding fetch failed: {e}")
+            log.warning(f"Gate.io funding fetch failed: {e}")
 
-        # Combined rate = average of OKX + Bybit
+        # Combined rate = average of OKX + Gate.io
         _funding_cache["rate"]       = (_funding_cache["okx"] + _funding_cache["binance"]) / 2
         _funding_cache["fetched_at"] = now
         log.info(f"Funding — OKX: {_funding_cache['okx']:+.6f} "
-                 f"Bybit: {_funding_cache['binance']:+.6f} "
+                 f"Gate.io: {_funding_cache['binance']:+.6f} "
                  f"avg: {_funding_cache['rate']:+.6f}")
 
     # Basis via OKX mark price vs spot
@@ -1411,7 +1409,7 @@ def run():
                     "eth_price":        round(_price_cache["eth"], 2),
                     "funding_rate":     round(_funding_cache["rate"], 6),
                     "okx_funding":      round(_funding_cache["okx"], 6),
-                    "bybit_funding":    round(_funding_cache["binance"], 6),
+                    "gateio_funding":   round(_funding_cache["binance"], 6),
                     "basis_pct":        round(basis, 4),
                     "chainlink_div":    cl_div,
                     "chainlink_age":    round(cl_age, 1) if cl_age else 30.0,
