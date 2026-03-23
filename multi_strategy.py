@@ -351,9 +351,10 @@ class StrategyTracker:
 # --------------------------------------------------------- SHARED DATA -------
 
 _price_cache:    dict  = {"btc": 0.0, "eth": 0.0, "fetched_at": 0.0}
-_funding_cache:  dict  = {"rate": 0.0, "fetched_at": 0.0}
+_funding_cache:  dict  = {"okx": 0.0, "binance": 0.0, "rate": 0.0, "fetched_at": 0.0}
 _basis_cache:    dict  = {"spot": 0.0, "futures": 0.0, "fetched_at": 0.0}
 _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
+_vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}  # 5min BTC price range
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
 
@@ -393,7 +394,7 @@ def refresh_shared_data():
         if eth: _price_cache["eth"] = eth
         _price_cache["fetched_at"] = now
 
-    # Funding rate via OKX public API
+    # Funding rate — OKX + Binance, both required for signal agreement
     if now - _funding_cache["fetched_at"] >= 60:
         try:
             r = requests.get(
@@ -402,12 +403,28 @@ def refresh_shared_data():
                 timeout=5)
             r.raise_for_status()
             data = r.json().get("data", [{}])[0]
-            rate = float(data.get("fundingRate", 0))
-            _funding_cache["rate"]       = rate
-            _funding_cache["fetched_at"] = now
-            log.info(f"Funding rate (OKX): {rate:+.6f}")
+            okx_rate = float(data.get("fundingRate", 0))
+            _funding_cache["okx"] = okx_rate
         except Exception as e:
-            log.warning(f"Funding fetch failed: {e}")
+            log.warning(f"OKX funding fetch failed: {e}")
+
+        try:
+            r = requests.get(
+                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                params={"symbol": "BTCUSDT"},
+                timeout=5)
+            r.raise_for_status()
+            bnb_rate = float(r.json().get("lastFundingRate", 0))
+            _funding_cache["binance"] = bnb_rate
+        except Exception as e:
+            log.warning(f"Binance funding fetch failed: {e}")
+
+        # Combined rate = average of both exchanges
+        _funding_cache["rate"]       = (_funding_cache["okx"] + _funding_cache["binance"]) / 2
+        _funding_cache["fetched_at"] = now
+        log.info(f"Funding — OKX: {_funding_cache['okx']:+.6f} "
+                 f"Binance: {_funding_cache['binance']:+.6f} "
+                 f"avg: {_funding_cache['rate']:+.6f}")
 
     # Basis via OKX mark price vs spot
     if now - _basis_cache["fetched_at"] >= 10:
@@ -459,6 +476,28 @@ def refresh_shared_data():
                          f"long=${_liq_cache['long']:,.0f} short=${_liq_cache['short']:,.0f}")
         except Exception as e:
             log.warning(f"Binance liq merge failed: {e}")
+
+    # 5-minute BTC price range for volatility-adjusted liquidation signal
+    # Uses OKX 1m klines — high/low over last 5 candles
+    global _vol_cache
+    if now - _vol_cache["fetched_at"] >= 60:
+        try:
+            r = requests.get(
+                f"{OKX_BASE}/api/v5/market/candles",
+                params={"instId": OKX_BTC, "bar": "1m", "limit": "5"},
+                timeout=5)
+            r.raise_for_status()
+            candles = r.json().get("data", [])
+            if candles:
+                highs = [float(c[2]) for c in candles]
+                lows  = [float(c[3]) for c in candles]
+                price_range = max(highs) - min(lows)
+                mid         = (max(highs) + min(lows)) / 2
+                _vol_cache["range_pct"]  = (price_range / mid * 100) if mid > 0 else 0.0
+                _vol_cache["fetched_at"] = now
+                log.debug(f"5min BTC range: {_vol_cache['range_pct']:.3f}%")
+        except Exception as e:
+            log.warning(f"Volatility range fetch failed: {e}")
 
     # Volume via OKX klines
     global _volume_fetched
@@ -683,6 +722,25 @@ def get_binance_liq_5min() -> dict:
             if e["side"] == "SELL":   # long liquidated
                 long_liqs  += e["usd"]
             else:                     # short liquidated (BUY)
+                short_liqs += e["usd"]
+    return {"long": long_liqs, "short": short_liqs}
+
+
+def get_binance_liq_2min() -> dict:
+    """
+    Returns combined long/short liquidation USD over the last 2 minutes.
+    Shorter lookback = more recent signal, price has had less time to react.
+    Used by Liquidation Cascade strategy for tighter timing.
+    """
+    cutoff = (time.time() - 120) * 1000
+    long_liqs = short_liqs = 0.0
+    with _binance_liq_lock:
+        for e in _binance_liq_buffer:
+            if e["ts"] < cutoff:
+                continue
+            if e["side"] == "SELL":
+                long_liqs  += e["usd"]
+            else:
                 short_liqs += e["usd"]
     return {"long": long_liqs, "short": short_liqs}
 
@@ -930,15 +988,25 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
     Strategy 2: Funding rate reversion.
     Extreme positive funding = longs overextended = bet DOWN.
     Extreme negative funding = shorts overextended = bet UP.
-    Data from OKX public API.
+    Requires BOTH OKX and Binance to agree on direction — filters false signals.
+    Threshold lowered to 0.0003 (was 0.0005) for more frequent firing.
     """
     try:
-        rate = _funding_cache["rate"]
+        okx_rate = _funding_cache["okx"]
+        bnb_rate = _funding_cache["binance"]
+        avg_rate = _funding_cache["rate"]
 
-        if abs(rate) < 0.0005:
+        THRESHOLD = 0.0003
+
+        # Both exchanges must exceed threshold in the same direction
+        okx_extreme = abs(okx_rate) >= THRESHOLD
+        bnb_extreme = abs(bnb_rate) >= THRESHOLD
+        same_sign   = (okx_rate > 0) == (bnb_rate > 0)
+
+        if not (okx_extreme and bnb_extreme and same_sign):
             _log_signal("Funding Reversion", market, secs_left,
-                        signal_value=abs(rate), threshold=0.0005,
-                        reason="funding_rate_not_extreme")
+                        signal_value=abs(avg_rate), threshold=THRESHOLD,
+                        reason="exchanges_disagree_or_not_extreme")
             return position
 
         if secs_left < 60:
@@ -950,7 +1018,7 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
         if position:
             return position
 
-        direction = "DOWN" if rate > 0.0005 else "UP"
+        direction = "DOWN" if avg_rate > 0 else "UP"
         prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Funding Reversion", market, secs_left,
@@ -959,13 +1027,16 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
             return position
 
         price     = prices["up_mid"] if direction == "UP" else prices["down_mid"]
-        intensity = min(abs(rate) / 0.001, 1.0)
+        intensity = min(abs(avg_rate) / 0.001, 1.0)
         size      = min(MAX_BET * intensity, tracker.balance * 0.3)
         size      = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
-                        {"funding_rate": round(rate, 6), "intensity": round(intensity, 3)},
+                        {"okx_rate":  round(okx_rate, 6),
+                         "bnb_rate":  round(bnb_rate, 6),
+                         "avg_rate":  round(avg_rate, 6),
+                         "intensity": round(intensity, 3)},
                         market)
             t = StrategyTrade("funding_reversion", direction, size, price, market)
             t.trade_id = trade_id
@@ -981,13 +1052,18 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
     Large long liquidations = forced selling = bet DOWN.
     Large short liquidations = short squeeze = bet UP.
     Data from OKX (REST poll) + Binance (WebSocket) — combined for full market picture.
-    Binance alone processes 3-5x more BTC liq volume than OKX.
+
+    Improvements:
+    - 2-minute lookback (was 5min) — more recent signal, price hasn't already moved
+    - Volatility-adjusted intensity — $50M in calm market != $50M in volatile market
+    - Minimum imbalance ratio required — filters balanced liquidation events
     """
     try:
-        # Combine OKX REST + Binance WebSocket liquidation data
-        binance = get_binance_liq_5min()
-        long_liqs  = _liq_cache["long"]  + binance["long"]
-        short_liqs = _liq_cache["short"] + binance["short"]
+        binance    = get_binance_liq_2min()
+        okx_long   = _liq_cache["long"]
+        okx_short  = _liq_cache["short"]
+        long_liqs  = okx_long  + binance["long"]
+        short_liqs = okx_short + binance["short"]
         total      = long_liqs + short_liqs
 
         if total < 300_000:
@@ -995,6 +1071,15 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
                         signal_value=total, threshold=300_000,
                         reason="liquidation_volume_too_low")
             return position
+
+        # Require meaningful imbalance — at least 65/35 split
+        if total > 0:
+            dominant_ratio = max(long_liqs, short_liqs) / total
+            if dominant_ratio < 0.65:
+                _log_signal("Liquidation Cascade", market, secs_left,
+                            signal_value=dominant_ratio, threshold=0.65,
+                            reason="liquidation_imbalance_too_low")
+                return position
 
         if secs_left < 60:
             _log_signal("Liquidation Cascade", market, secs_left,
@@ -1006,8 +1091,18 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
             return position
 
         direction = "DOWN" if long_liqs > short_liqs else "UP"
-        intensity = min(total / 2_000_000, 1.0)
-        prices    = fetch_poly_prices(market)
+
+        # Volatility-adjusted intensity:
+        # Normalize liquidation size by current 5-min BTC price range
+        # High volatility = liquidations are expected = weaker signal
+        # Low volatility = liquidations are surprising = stronger signal
+        vol_range = _vol_cache.get("range_pct", 0.1)
+        vol_range = max(vol_range, 0.05)  # floor to avoid division by zero
+        raw_intensity    = min(total / 2_000_000, 1.0)
+        vol_scalar       = max(0.3, min(1.0, 0.15 / vol_range))  # inverse vol
+        adjusted_intensity = min(raw_intensity * vol_scalar, 1.0)
+
+        prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Liquidation Cascade", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -1015,13 +1110,16 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
             return position
 
         price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
-        size  = min(MAX_BET * intensity, tracker.balance * 0.3)
+        size  = min(MAX_BET * adjusted_intensity, tracker.balance * 0.3)
         size  = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
-                        {"long_liqs": round(long_liqs), "short_liqs": round(short_liqs),
-                         "source": "OKX+Binance"},
+                        {"long_liqs":   round(long_liqs),
+                         "short_liqs":  round(short_liqs),
+                         "vol_range":   round(vol_range, 4),
+                         "intensity":   round(adjusted_intensity, 3),
+                         "source":      "OKX+Binance"},
                         market)
             t = StrategyTrade("liquidation_cascade", direction, size, price, market)
             t.trade_id = trade_id
@@ -1297,26 +1395,32 @@ def run():
             # Save signal snapshot every 5 minutes
             if time.time() - last_snapshot > 300:
                 cl_price, cl_age = fetch_chainlink_price()
-                cl_div     = round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0.0
-                candles    = list(_volume_history)
-                recent_vol = candles[-3:] if len(candles) >= 3 else []
-                total_vol  = sum(c["volume"] for c in recent_vol)
-                buy_vol    = sum(c["buy_vol"] for c in recent_vol)
-                buy_ratio  = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
-                liq_okx     = _liq_cache["long"] + _liq_cache["short"]
-                liq_binance = get_binance_liq_5min()
-                liq_total   = liq_okx + liq_binance["long"] + liq_binance["short"]
-                prices     = fetch_poly_prices(current_market) if current_market else {}
+                cl_div      = round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0.0
+                candles     = list(_volume_history)
+                recent_vol  = candles[-3:] if len(candles) >= 3 else []
+                total_vol   = sum(c["volume"] for c in recent_vol)
+                buy_vol     = sum(c["buy_vol"] for c in recent_vol)
+                buy_ratio   = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
+                liq_2min    = get_binance_liq_2min()
+                long_liq    = round(_liq_cache["long"]  + liq_2min["long"], 2)
+                short_liq   = round(_liq_cache["short"] + liq_2min["short"], 2)
+                prices      = fetch_poly_prices(current_market) if current_market else {}
                 supabase_snapshot({
                     "btc_price":        round(spot, 2),
+                    "eth_price":        round(_price_cache["eth"], 2),
                     "funding_rate":     round(_funding_cache["rate"], 6),
+                    "okx_funding":      round(_funding_cache["okx"], 6),
+                    "binance_funding":  round(_funding_cache["binance"], 6),
                     "basis_pct":        round(basis, 4),
                     "chainlink_div":    cl_div,
                     "chainlink_age":    round(cl_age, 1) if cl_age else 30.0,
                     "up_mid":           round(prices.get("up_mid", 0.5), 4),
                     "spread":           round(prices.get("spread", 0.1), 4),
                     "volume_buy_ratio": buy_ratio,
-                    "liq_total_usd":    round(liq_total, 2),
+                    "long_liq_usd":     long_liq,
+                    "short_liq_usd":    short_liq,
+                    "liq_total_usd":    round(long_liq + short_liq, 2),
+                    "vol_range_pct":    round(_vol_cache.get("range_pct", 0.0), 4),
                     "secs_left":        round(secs_left),
                     "market_question":  current_market.question if current_market else "",
                     "condition_id":     current_market.condition_id if current_market else "",
