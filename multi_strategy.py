@@ -354,7 +354,8 @@ _price_cache:    dict  = {"btc": 0.0, "eth": 0.0, "fetched_at": 0.0}
 _funding_cache:  dict  = {"okx": 0.0, "binance": 0.0, "rate": 0.0, "fetched_at": 0.0}
 _basis_cache:    dict  = {"spot": 0.0, "futures": 0.0, "fetched_at": 0.0}
 _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
-_vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}  # 5min BTC price range
+_vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
+_btc_history:    deque = deque(maxlen=12)  # last 60s of BTC prices (5s poll = 12 readings)
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
 
@@ -390,7 +391,9 @@ def refresh_shared_data():
     if now - _price_cache["fetched_at"] >= POLL_SEC:
         btc = fetch_spot(BTC_SYMBOL)
         eth = fetch_spot(ETH_SYMBOL)
-        if btc: _price_cache["btc"] = btc
+        if btc:
+            _price_cache["btc"] = btc
+            _btc_history.append({"price": btc, "ts": now})
         if eth: _price_cache["eth"] = eth
         _price_cache["fetched_at"] = now
 
@@ -744,7 +747,21 @@ def get_binance_liq_2min() -> dict:
     return {"long": long_liqs, "short": short_liqs}
 
 
-# --------------------------------------------------------- MARKET DISCOVERY --
+def btc_momentum_pct(lookback_secs: float = 30.0) -> Optional[float]:
+    """
+    Returns BTC price change % over the last `lookback_secs` seconds.
+    Uses the rolling _btc_history deque (sampled every POLL_SEC).
+    Returns None if not enough history.
+    Positive = BTC moved up, Negative = BTC moved down.
+    """
+    now = time.time()
+    cutoff = now - lookback_secs
+    history = list(_btc_history)
+    old = next((h for h in history if h["ts"] >= cutoff), None)
+    current = history[-1] if history else None
+    if not old or not current or old["price"] == 0:
+        return None
+    return (current["price"] - old["price"]) / old["price"] * 100
 
 def fetch_current_market() -> Optional[Market]:
     try:
@@ -911,10 +928,22 @@ def resolve_positions(positions: dict, trackers: dict, market: Market) -> dict:
 
 def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
     """
-    Strategy 1: Chainlink lag arbitrage.
-    Coinbase price = real-time truth.
-    Chainlink price = lagging oracle Polymarket uses to resolve.
-    When they diverge 0.15%+, bet in Chainlink's catch-up direction.
+    Strategy 1: Chainlink volatility-spike arbitrage.
+
+    The real Polymarket RTDS Chainlink feed is fast — average divergence
+    from spot is only 0.022%. So a fixed 0.15% threshold almost never fires.
+
+    Instead we target volatility spikes: moments when BTC moves sharply
+    and Chainlink briefly lags behind before catching up. These spikes
+    reach 0.3-0.5% divergence and are confirmed by BTC momentum.
+
+    Conditions to fire:
+      1. Divergence > 0.08% (top 5% of observed divergence events)
+      2. BTC moved > 0.08% in the last 30 seconds (confirms real move)
+      3. Momentum direction matches divergence direction
+      4. 3 consecutive readings all above threshold (filters noise)
+      5. Chainlink age > 5s (it's lagging, not just updating)
+      6. At least 90s left in market
     """
     try:
         cl_price, cl_age = fetch_chainlink_price()
@@ -932,21 +961,46 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
 
         recent = list(cl_history)[-3:]
 
-        if not all(abs(s["div"]) >= 0.15 for s in recent):
+        # All 3 recent readings must exceed 0.08% threshold
+        THRESHOLD = 0.08
+        if not all(abs(s["div"]) >= THRESHOLD for s in recent):
             _log_signal("Chainlink Arb", market, secs_left,
-                        signal_value=abs(divergence), threshold=0.15,
+                        signal_value=abs(divergence), threshold=THRESHOLD,
                         reason="divergence_below_threshold")
             return position
 
+        # All 3 readings must be in the same direction
         if not all(s["dir"] == direction for s in recent):
             _log_signal("Chainlink Arb", market, secs_left,
-                        signal_value=abs(divergence), threshold=0.15,
+                        signal_value=abs(divergence), threshold=THRESHOLD,
                         reason="direction_inconsistent")
             return position
 
-        if cl_age < 15:
+        # BTC must have moved meaningfully in the last 30s (confirms real spike)
+        momentum = btc_momentum_pct(lookback_secs=30)
+        if momentum is None:
+            return position
+
+        MOMENTUM_THRESHOLD = 0.08
+        if abs(momentum) < MOMENTUM_THRESHOLD:
             _log_signal("Chainlink Arb", market, secs_left,
-                        signal_value=cl_age, threshold=15,
+                        signal_value=abs(momentum), threshold=MOMENTUM_THRESHOLD,
+                        reason="btc_momentum_too_weak")
+            return position
+
+        # Momentum direction must match divergence direction
+        # If BTC went UP, spot > chainlink (divergence > 0), direction = UP
+        momentum_dir = "UP" if momentum > 0 else "DOWN"
+        if momentum_dir != direction:
+            _log_signal("Chainlink Arb", market, secs_left,
+                        signal_value=abs(momentum), threshold=MOMENTUM_THRESHOLD,
+                        reason="momentum_direction_mismatch")
+            return position
+
+        # Chainlink must be at least 5s old (lagging, not just slow to update)
+        if cl_age < 5:
+            _log_signal("Chainlink Arb", market, secs_left,
+                        signal_value=cl_age, threshold=5,
                         reason="chainlink_too_fresh")
             return position
 
@@ -967,12 +1021,16 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
             return position
 
         price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
-        size  = min(MAX_BET * min(abs(divergence) / 0.45, 1.0), tracker.balance * 0.4)
-        size  = max(size, MIN_BET)
+        # Size scales with divergence strength — stronger divergence = bigger bet
+        intensity = min(abs(divergence) / 0.30, 1.0)
+        size      = min(MAX_BET * intensity, tracker.balance * 0.4)
+        size      = max(size, MIN_BET)
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
-                        {"divergence": round(divergence, 4), "cl_age": round(cl_age, 1)},
+                        {"divergence":  round(divergence, 4),
+                         "cl_age":      round(cl_age, 1),
+                         "momentum":    round(momentum, 4)},
                         market)
             t = StrategyTrade("chainlink_arb", direction, size, price, market)
             t.trade_id = trade_id
