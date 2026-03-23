@@ -7,17 +7,19 @@ Every 60 seconds it:
   1. Fetches all OPEN trades from Supabase where:
        - resolved_outcome IS NULL  (not yet resolved)
        - market_end_time IS NOT NULL (bot wrote it)
-       - market_end_time is between 1 minute and 15 minutes ago
-         (market has had time to settle, but we haven't given up yet)
-  2. Checks Polymarket CLOB API for the actual market outcome
+  2. Checks Polymarket Gamma events API for the actual market outcome.
+     Uses outcomePrices from the nested markets array — the only field
+     that reliably flips to ["1","0"] or ["0","1"] after resolution.
+     NOTE: These 5-minute BTC markets can take 30-60+ minutes to resolve
+     after their end time — MAX_AGE_SECS is set to 3600 (1 hour) accordingly.
   3. If resolved: patches the exact row (by trade_id) with:
        - resolved_outcome (UP / DOWN / VOID)
        - actual_win (True / False / None for VOID)
        - polymarket_final_price
        - resolved_at timestamp
        - pnl / flat_pnl / edge based on real outcome
-  4. If not yet resolved and market_end_time < 15 min ago: skips — will retry
-  5. If market_end_time > 15 min ago and still unresolved: marks VOID + gave_up_at
+  4. If not yet resolved: skips — will retry next cycle
+  5. If market_end_time > 1 hour ago and still unresolved: marks VOID + gave_up_at
 
 Patching is done by trade_id (UUID), not by condition_id, so each row is
 updated independently with no risk of cross-contamination between strategies.
@@ -45,7 +47,7 @@ import time
 import logging
 import json
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import defaultdict
 
 logging.basicConfig(
@@ -55,13 +57,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-CLOB_API       = "https://clob.polymarket.com"
+GAMMA_API      = "https://gamma-api.polymarket.com"
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
-CHECK_INTERVAL = 60    # seconds between resolver loops
+CHECK_INTERVAL = 60     # seconds between resolver loops
 TAKER_FEE      = 0.0025
-MIN_AGE_SECS   = 60    # don't check a market until at least 1 min after end_time
-MAX_AGE_SECS   = 900   # give up after 15 minutes, mark VOID
+MIN_AGE_SECS   = 60     # don't check until at least 1 min after market end
+MAX_AGE_SECS   = 3600   # give up after 1 hour — these markets can take a long time
 
 
 # ---------------------------------------------------------------- SUPABASE ---
@@ -76,13 +78,8 @@ def sb_headers() -> dict:
 
 def fetch_pending_trades() -> list:
     """
-    Fetch OPEN trades that:
-      - have no resolved_outcome yet
-      - have a market_end_time we can reason about
-      - market ended at least MIN_AGE_SECS ago (give Polymarket time to settle)
-
-    We fetch all unresolved trades and let the caller decide whether to skip
-    (too young) or give up (too old), so the logic is in one place.
+    Fetch all OPEN trades with no resolved_outcome and a known market_end_time.
+    Age filtering (too young / too old) is done in the main loop.
     """
     try:
         resp = requests.get(
@@ -92,7 +89,7 @@ def fetch_pending_trades() -> list:
                 "action":           "eq.OPEN",
                 "resolved_outcome": "is.null",
                 "market_end_time":  "not.is.null",
-                "select":           "id,trade_id,strategy,side,price,size,"
+                "select":           "id,trade_id,strategy,side,price,size,fee,"
                                     "condition_id,question,market_end_time,created_at",
             },
             timeout=10,
@@ -150,7 +147,7 @@ def resolve_snapshots(outcome: str, condition_id: str):
 def fetch_strategy_summary() -> list:
     """
     Fetch resolved trades for win-rate summary.
-    Queries OPEN rows where resolved_outcome IS NOT NULL —
+    Only queries OPEN rows where resolved_outcome IS NOT NULL —
     these are the only rows with real Polymarket outcome data.
     """
     try:
@@ -175,47 +172,66 @@ def fetch_strategy_summary() -> list:
 
 def fetch_market_outcome(condition_id: str) -> dict:
     """
-    Fetch the actual resolved outcome from Polymarket CLOB API.
-    Uses https://clob.polymarket.com/markets/{condition_id} which correctly
-    filters by condition ID — the Gamma API conditionId filter is broken.
+    Fetch the resolved outcome from Polymarket using the Gamma events endpoint.
+
+    Why this endpoint:
+    - Gamma API ?conditionId= filter is broken (returns wrong markets)
+    - CLOB API /markets/{id} never sets closed=true or winner=true for these markets
+    - Gamma events endpoint returns the correct market when filtered by
+      markets.conditionId, and the nested markets[].outcomePrices correctly
+      flips to ["1","0"] or ["0","1"] after Chainlink resolves the price
 
     Returns:
       {"resolved": True,  "outcome": "UP"|"DOWN", "up_price": float, "down_price": float}
-      {"resolved": False}      — market not settled yet, try again later
-      {"resolved": "ZERO_PRICES"} — closed but no winner set yet
+      {"resolved": False}          — not settled yet, retry next cycle
+      {"resolved": "ZERO_PRICES"}  — found but prices not posted yet
     """
     try:
         resp = requests.get(
-            f"{CLOB_API}/markets/{condition_id}",
+            f"{GAMMA_API}/events",
+            params={"markets.conditionId": condition_id},
             timeout=10,
         )
         resp.raise_for_status()
-        m = resp.json()
+        data = resp.json()
 
-        if not m:
+        if not data:
+            log.debug(f"Gamma events returned empty for {condition_id[:12]}...")
             return {"resolved": False}
 
-        closed = m.get("closed", False)
-        log.debug(f"CLOB closed={closed} tokens={m.get('tokens')}")
+        # Find the specific market inside the event by matching condition_id exactly
+        market = None
+        for event in data:
+            for m in event.get("markets", []):
+                if m.get("conditionId") == condition_id:
+                    market = m
+                    break
+            if market:
+                break
 
-        if not closed:
+        if not market:
+            log.debug(f"condition_id {condition_id[:12]}... not found in event markets")
             return {"resolved": False}
 
-        tokens     = m.get("tokens", [])
-        up_token   = next((t for t in tokens if t.get("outcome", "").lower() == "up"),   None)
-        down_token = next((t for t in tokens if t.get("outcome", "").lower() == "down"), None)
+        raw_prices     = market.get("outcomePrices", '["0","0"]')
+        outcome_prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+        up_price       = float(outcome_prices[0])
+        down_price     = float(outcome_prices[1])
 
-        if not up_token or not down_token:
-            log.warning(f"Unexpected token structure for {condition_id}: {tokens}")
+        log.debug(f"outcomePrices up={up_price} down={down_price} for {condition_id[:12]}...")
+
+        if up_price > 0.9:
+            return {"resolved": True, "outcome": "UP",
+                    "up_price": up_price, "down_price": down_price}
+        elif down_price > 0.9:
+            return {"resolved": True, "outcome": "DOWN",
+                    "up_price": up_price, "down_price": down_price}
+        elif up_price == 0.0 and down_price == 0.0:
             return {"resolved": "ZERO_PRICES"}
-
-        if up_token.get("winner"):
-            return {"resolved": True, "outcome": "UP",   "up_price": 1.0, "down_price": 0.0}
-        elif down_token.get("winner"):
-            return {"resolved": True, "outcome": "DOWN", "up_price": 0.0, "down_price": 1.0}
         else:
-            # Closed but neither token marked as winner yet
-            return {"resolved": "ZERO_PRICES"}
+            # Prices exist but neither dominant yet — still settling
+            log.debug(f"Partial prices up={up_price} down={down_price} — still settling")
+            return {"resolved": False}
 
     except Exception as e:
         log.warning(f"Outcome fetch failed for {condition_id}: {e}")
@@ -242,9 +258,9 @@ def resolve_pending_trades():
     resolved_count = 0
     skipped_young  = 0
     gave_up_count  = 0
+    waiting_count  = 0
 
-    # Cache outcomes per condition_id to avoid hammering the API
-    # when multiple strategies traded the same market.
+    # Cache outcomes per condition_id — multiple strategies trade the same market
     outcome_cache: dict = {}
 
     for trade in trades:
@@ -252,15 +268,13 @@ def resolve_pending_trades():
         condition_id = trade.get("condition_id", "")
 
         if not trade_id:
-            log.warning(f"Trade row id={trade.get('id')} has no trade_id UUID — skipping. "
-                        f"Run the backfill migration to add trade_id to old rows.")
+            log.warning(f"Trade row id={trade.get('id')} has no trade_id UUID — skipping.")
             continue
 
         if not condition_id:
             log.warning(f"Trade {trade_id} has no condition_id — skipping.")
             continue
 
-        # Parse market_end_time
         end_time_str = trade.get("market_end_time")
         if not end_time_str:
             log.warning(f"Trade {trade_id} has no market_end_time — skipping.")
@@ -269,21 +283,20 @@ def resolve_pending_trades():
         try:
             market_end = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
         except ValueError:
-            log.warning(f"Trade {trade_id} has unparseable market_end_time: {end_time_str}")
+            log.warning(f"Trade {trade_id} unparseable market_end_time: {end_time_str}")
             continue
 
         age_secs = (now - market_end).total_seconds()
 
-        # Too young — Polymarket likely hasn't settled yet, come back next cycle.
+        # Too young — come back next cycle
         if age_secs < MIN_AGE_SECS:
             skipped_young += 1
             log.debug(f"Trade {trade_id[:8]}... market only {age_secs:.0f}s old — waiting")
             continue
 
-        # Too old — we've been trying long enough. Mark VOID and move on.
+        # Too old — give up and mark VOID
         if age_secs > MAX_AGE_SECS:
-            log.warning(f"Trade {trade_id[:8]}... market {age_secs:.0f}s old with no resolution "
-                        f"— marking VOID (gave_up)")
+            log.warning(f"Trade {trade_id[:8]}... market {age_secs:.0f}s old — giving up, marking VOID")
             patch_trade(trade_id, {
                 "resolved_outcome": "VOID",
                 "actual_win":       None,
@@ -297,24 +310,23 @@ def resolve_pending_trades():
             time.sleep(0.1)
             continue
 
-        # Check outcome (cached per condition_id to save API calls)
+        # Fetch outcome (cached per condition_id)
         if condition_id not in outcome_cache:
             outcome_cache[condition_id] = fetch_market_outcome(condition_id)
-            time.sleep(0.2)  # light rate limiting
+            time.sleep(0.3)  # light rate limiting
 
         result = outcome_cache[condition_id]
 
-        # Not resolved yet — try again next cycle.
+        # Not resolved yet
         if result["resolved"] is False:
-            log.info(f"Trade {trade_id[:8]}... ({condition_id[:12]}...) not resolved yet "
-                     f"(age={age_secs:.0f}s) — will retry")
+            waiting_count += 1
+            log.debug(f"Trade {trade_id[:8]}... not resolved yet (age={age_secs:.0f}s)")
             continue
 
-        # Zero prices — closed but winner not set yet.
-        # Wait until MAX_AGE_SECS then give up.
+        # Closed but prices not posted yet — keep waiting until MAX_AGE_SECS
         if result["resolved"] == "ZERO_PRICES":
             if age_secs > MAX_AGE_SECS:
-                log.warning(f"Trade {trade_id[:8]}... zero prices for {age_secs:.0f}s — marking VOID")
+                log.warning(f"Trade {trade_id[:8]}... zero prices after {age_secs:.0f}s — marking VOID")
                 patch_trade(trade_id, {
                     "resolved_outcome": "VOID",
                     "actual_win":       None,
@@ -326,14 +338,14 @@ def resolve_pending_trades():
                 })
                 gave_up_count += 1
             else:
-                log.info(f"Trade {trade_id[:8]}... closed, winner not set yet (age={age_secs:.0f}s) — waiting")
+                waiting_count += 1
+                log.debug(f"Trade {trade_id[:8]}... zero prices (age={age_secs:.0f}s) — waiting")
             continue
 
-        # We have a real outcome — write it.
-        outcome    = result["outcome"]   # "UP" or "DOWN"
+        # Real outcome — write it
+        outcome    = result["outcome"]
         up_price   = result["up_price"]
         down_price = result["down_price"]
-
         side       = trade.get("side", "")
         won        = (side == outcome)
         size       = float(trade.get("size", 0))
@@ -349,8 +361,7 @@ def resolve_pending_trades():
             flat_pnl   = -size - (size * TAKER_FEE * 2)
             edge       = -1.0
 
-        final_price = up_price if side == "UP" else down_price
-
+        final_price  = up_price if side == "UP" else down_price
         outcome_data = {
             "resolved_outcome":       outcome,
             "actual_win":             won,
@@ -371,7 +382,9 @@ def resolve_pending_trades():
             resolved_count += 1
 
     if skipped_young:
-        log.info(f"Skipped {skipped_young} trade(s) — markets too recent, will check next cycle")
+        log.info(f"Skipped {skipped_young} trade(s) — markets too recent")
+    if waiting_count:
+        log.info(f"Waiting on {waiting_count} trade(s) — Polymarket not resolved yet")
     if gave_up_count:
         log.info(f"Gave up on {gave_up_count} trade(s) — marked VOID after >{MAX_AGE_SECS}s")
 
@@ -421,7 +434,7 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3 — using CLOB API for outcomes")
+    log.info("Resolution Tracker v3 — using Gamma events API for outcomes")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Patching by trade_id (UUID) — one row per trade, resolver owns all outcomes")
     log.info(f"Checking every {CHECK_INTERVAL}s")
