@@ -9,7 +9,7 @@ Every 60 seconds it:
        - market_end_time IS NOT NULL (bot wrote it)
        - market_end_time is between 1 minute and 15 minutes ago
          (market has had time to settle, but we haven't given up yet)
-  2. Checks Polymarket Gamma API for the actual market outcome
+  2. Checks Polymarket CLOB API for the actual market outcome
   3. If resolved: patches the exact row (by trade_id) with:
        - resolved_outcome (UP / DOWN / VOID)
        - actual_win (True / False / None for VOID)
@@ -55,7 +55,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-GAMMA_API      = "https://gamma-api.polymarket.com"
+CLOB_API       = "https://clob.polymarket.com"
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
 CHECK_INTERVAL = 60    # seconds between resolver loops
@@ -175,51 +175,47 @@ def fetch_strategy_summary() -> list:
 
 def fetch_market_outcome(condition_id: str) -> dict:
     """
-    Fetch the actual resolved outcome from Polymarket Gamma API.
+    Fetch the actual resolved outcome from Polymarket CLOB API.
+    Uses https://clob.polymarket.com/markets/{condition_id} which correctly
+    filters by condition ID — the Gamma API conditionId filter is broken.
+
     Returns:
       {"resolved": True,  "outcome": "UP"|"DOWN", "up_price": float, "down_price": float}
-      {"resolved": False}   — market not settled yet, try again later
-      {"resolved": "VOID"}  — market closed but prices stayed at 0 (unusual)
+      {"resolved": False}      — market not settled yet, try again later
+      {"resolved": "ZERO_PRICES"} — closed but no winner set yet
     """
     try:
         resp = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"conditionId": condition_id},
+            f"{CLOB_API}/markets/{condition_id}",
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
-        if not data:
+        m = resp.json()
+
+        if not m:
             return {"resolved": False}
 
-        m      = data[0] if isinstance(data, list) else data
         closed = m.get("closed", False)
-
-        log.debug(f"closed={closed} outcomePrices={m.get('outcomePrices')} "
-                  f"umaStatus={m.get('umaResolutionStatus')}")
+        log.debug(f"CLOB closed={closed} tokens={m.get('tokens')}")
 
         if not closed:
             return {"resolved": False}
 
-        raw_prices     = m.get("outcomePrices", '["0","0"]')
-        outcome_prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-        up_price       = float(outcome_prices[0])
-        down_price     = float(outcome_prices[1])
+        tokens     = m.get("tokens", [])
+        up_token   = next((t for t in tokens if t.get("outcome", "").lower() == "up"),   None)
+        down_token = next((t for t in tokens if t.get("outcome", "").lower() == "down"), None)
 
-        log.debug(f"up_price={up_price} down_price={down_price}")
-
-        if up_price > 0.9:
-            return {"resolved": True, "outcome": "UP",   "up_price": up_price, "down_price": down_price}
-        elif down_price > 0.9:
-            return {"resolved": True, "outcome": "DOWN", "up_price": up_price, "down_price": down_price}
-        elif up_price == 0.0 and down_price == 0.0:
-            # Closed but prices still zero — return a special sentinel so caller
-            # can decide whether to wait longer or give up.
+        if not up_token or not down_token:
+            log.warning(f"Unexpected token structure for {condition_id}: {tokens}")
             return {"resolved": "ZERO_PRICES"}
+
+        if up_token.get("winner"):
+            return {"resolved": True, "outcome": "UP",   "up_price": 1.0, "down_price": 0.0}
+        elif down_token.get("winner"):
+            return {"resolved": True, "outcome": "DOWN", "up_price": 0.0, "down_price": 1.0}
         else:
-            # Partially resolved (prices between 0.1–0.9) — wait for full resolution.
-            log.info(f"Partial prices up={up_price} down={down_price} — not fully resolved yet")
-            return {"resolved": False}
+            # Closed but neither token marked as winner yet
+            return {"resolved": "ZERO_PRICES"}
 
     except Exception as e:
         log.warning(f"Outcome fetch failed for {condition_id}: {e}")
@@ -314,9 +310,8 @@ def resolve_pending_trades():
                      f"(age={age_secs:.0f}s) — will retry")
             continue
 
-        # Zero prices — market closed but Polymarket hasn't posted prices.
-        # Only give up if we're past MAX_AGE_SECS (handled above already),
-        # otherwise wait — prices usually appear within a few minutes.
+        # Zero prices — closed but winner not set yet.
+        # Wait until MAX_AGE_SECS then give up.
         if result["resolved"] == "ZERO_PRICES":
             if age_secs > MAX_AGE_SECS:
                 log.warning(f"Trade {trade_id[:8]}... zero prices for {age_secs:.0f}s — marking VOID")
@@ -329,8 +324,9 @@ def resolve_pending_trades():
                     "flat_pnl":         -(float(trade.get("size", 0)) * (1 + TAKER_FEE * 2)),
                     "edge":             -1.0,
                 })
+                gave_up_count += 1
             else:
-                log.info(f"Trade {trade_id[:8]}... closed with zero prices (age={age_secs:.0f}s) — waiting")
+                log.info(f"Trade {trade_id[:8]}... closed, winner not set yet (age={age_secs:.0f}s) — waiting")
             continue
 
         # We have a real outcome — write it.
@@ -425,7 +421,7 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3")
+    log.info("Resolution Tracker v3 — using CLOB API for outcomes")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Patching by trade_id (UUID) — one row per trade, resolver owns all outcomes")
     log.info(f"Checking every {CHECK_INTERVAL}s")
