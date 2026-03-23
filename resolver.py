@@ -7,9 +7,9 @@ Every 60 seconds it:
   1. Fetches all OPEN trades from Supabase where:
        - resolved_outcome IS NULL  (not yet resolved)
        - market_end_time IS NOT NULL (bot wrote it)
-  2. Checks Polymarket Gamma events API for the actual market outcome.
-     Uses outcomePrices from the nested markets array — the only field
-     that reliably flips to ["1","0"] or ["0","1"] after resolution.
+  2. Checks Polymarket CLOB API for the actual market outcome.
+     Uses https://clob.polymarket.com/markets/{condition_id} and reads
+     winner=true from the tokens array.
      NOTE: These 5-minute BTC markets can take 30-60+ minutes to resolve
      after their end time — MAX_AGE_SECS is set to 3600 (1 hour) accordingly.
   3. If resolved: patches the exact row (by trade_id) with:
@@ -38,8 +38,7 @@ Supabase schema additions required (run once):
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS edge             float;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS gave_up_at       timestamptz;
 
-Usage on Railway: add to Procfile as second worker
-Or run locally: python resolver.py
+Usage on Railway: web: python multi_strategy.py & python resolver.py & wait
 """
 
 import os
@@ -57,13 +56,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-GAMMA_API      = "https://gamma-api.polymarket.com"
+CLOB_API       = "https://clob.polymarket.com"
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
 CHECK_INTERVAL = 60     # seconds between resolver loops
 TAKER_FEE      = 0.0025
 MIN_AGE_SECS   = 60     # don't check until at least 1 min after market end
-MAX_AGE_SECS   = 3600   # give up after 1 hour — these markets can take a long time
+MAX_AGE_SECS   = 3600   # give up after 1 hour
 
 
 # ---------------------------------------------------------------- SUPABASE ---
@@ -109,12 +108,16 @@ def patch_trade(trade_id: str, outcome_data: dict) -> bool:
     try:
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/trades",
-            headers={**sb_headers(), "Prefer": "return=minimal"},
+            headers={**sb_headers(), "Prefer": "return=representation"},
             params={"trade_id": f"eq.{trade_id}"},
             json=outcome_data,
             timeout=10,
         )
         resp.raise_for_status()
+        updated = resp.json()
+        if not updated:
+            log.warning(f"patch_trade: no rows matched trade_id={trade_id}")
+            return False
         return True
     except Exception as e:
         log.warning(f"Failed to patch trade {trade_id}: {e}")
@@ -172,66 +175,46 @@ def fetch_strategy_summary() -> list:
 
 def fetch_market_outcome(condition_id: str) -> dict:
     """
-    Fetch the resolved outcome from Polymarket using the Gamma events endpoint.
+    Fetch the resolved outcome from the Polymarket CLOB API.
+    https://clob.polymarket.com/markets/{condition_id}
 
-    Why this endpoint:
-    - Gamma API ?conditionId= filter is broken (returns wrong markets)
-    - CLOB API /markets/{id} never sets closed=true or winner=true for these markets
-    - Gamma events endpoint returns the correct market when filtered by
-      markets.conditionId, and the nested markets[].outcomePrices correctly
-      flips to ["1","0"] or ["0","1"] after Chainlink resolves the price
+    Checks tokens[].winner — when the market resolves, one token
+    will have winner=true.
 
     Returns:
       {"resolved": True,  "outcome": "UP"|"DOWN", "up_price": float, "down_price": float}
       {"resolved": False}          — not settled yet, retry next cycle
-      {"resolved": "ZERO_PRICES"}  — found but prices not posted yet
+      {"resolved": "ZERO_PRICES"}  — closed but no winner set yet
     """
     try:
         resp = requests.get(
-            f"{GAMMA_API}/events",
-            params={"markets.conditionId": condition_id},
+            f"{CLOB_API}/markets/{condition_id}",
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
+        m = resp.json()
 
-        if not data:
-            log.debug(f"Gamma events returned empty for {condition_id[:12]}...")
+        if not m:
             return {"resolved": False}
 
-        # Find the specific market inside the event by matching condition_id exactly
-        market = None
-        for event in data:
-            for m in event.get("markets", []):
-                if m.get("conditionId") == condition_id:
-                    market = m
-                    break
-            if market:
-                break
+        tokens     = m.get("tokens", [])
+        up_token   = next((t for t in tokens if t.get("outcome", "").lower() == "up"),   None)
+        down_token = next((t for t in tokens if t.get("outcome", "").lower() == "down"), None)
 
-        if not market:
-            log.debug(f"condition_id {condition_id[:12]}... not found in event markets")
+        if not up_token or not down_token:
+            log.warning(f"Unexpected token structure for {condition_id[:12]}...: {tokens}")
             return {"resolved": False}
 
-        raw_prices     = market.get("outcomePrices", '["0","0"]')
-        outcome_prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-        up_price       = float(outcome_prices[0])
-        down_price     = float(outcome_prices[1])
+        log.debug(f"CLOB tokens up=winner:{up_token.get('winner')} "
+                  f"down=winner:{down_token.get('winner')} for {condition_id[:12]}...")
 
-        log.debug(f"outcomePrices up={up_price} down={down_price} for {condition_id[:12]}...")
-
-        if up_price > 0.9:
-            return {"resolved": True, "outcome": "UP",
-                    "up_price": up_price, "down_price": down_price}
-        elif down_price > 0.9:
-            return {"resolved": True, "outcome": "DOWN",
-                    "up_price": up_price, "down_price": down_price}
-        elif up_price == 0.0 and down_price == 0.0:
-            return {"resolved": "ZERO_PRICES"}
+        if up_token.get("winner"):
+            return {"resolved": True, "outcome": "UP",   "up_price": 1.0, "down_price": 0.0}
+        elif down_token.get("winner"):
+            return {"resolved": True, "outcome": "DOWN", "up_price": 0.0, "down_price": 1.0}
         else:
-            # Prices exist but neither dominant yet — still settling
-            log.debug(f"Partial prices up={up_price} down={down_price} — still settling")
-            return {"resolved": False}
+            # Neither winner yet — market still settling
+            return {"resolved": "ZERO_PRICES"}
 
     except Exception as e:
         log.warning(f"Outcome fetch failed for {condition_id}: {e}")
@@ -323,10 +306,10 @@ def resolve_pending_trades():
             log.debug(f"Trade {trade_id[:8]}... not resolved yet (age={age_secs:.0f}s)")
             continue
 
-        # Closed but prices not posted yet — keep waiting until MAX_AGE_SECS
+        # No winner set yet — keep waiting until MAX_AGE_SECS
         if result["resolved"] == "ZERO_PRICES":
             if age_secs > MAX_AGE_SECS:
-                log.warning(f"Trade {trade_id[:8]}... zero prices after {age_secs:.0f}s — marking VOID")
+                log.warning(f"Trade {trade_id[:8]}... no winner after {age_secs:.0f}s — marking VOID")
                 patch_trade(trade_id, {
                     "resolved_outcome": "VOID",
                     "actual_win":       None,
@@ -339,7 +322,7 @@ def resolve_pending_trades():
                 gave_up_count += 1
             else:
                 waiting_count += 1
-                log.debug(f"Trade {trade_id[:8]}... zero prices (age={age_secs:.0f}s) — waiting")
+                log.info(f"Trade {trade_id[:8]}... closed, no winner yet (age={age_secs:.0f}s) — waiting")
             continue
 
         # Real outcome — write it
@@ -434,7 +417,7 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3 — using Gamma events API for outcomes")
+    log.info("Resolution Tracker v3 — using CLOB API for outcomes")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Patching by trade_id (UUID) — one row per trade, resolver owns all outcomes")
     log.info(f"Checking every {CHECK_INTERVAL}s")
