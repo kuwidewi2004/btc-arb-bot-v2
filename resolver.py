@@ -10,9 +10,7 @@ Every 60 seconds it:
   2. Checks Polymarket CLOB API for the actual market outcome.
      Uses https://clob.polymarket.com/markets/{condition_id} and reads
      winner=true from the tokens array.
-     NOTE: These 5-minute BTC markets can take 30-60+ minutes to resolve
-     after their end time — MAX_AGE_SECS is set to 3600 (1 hour) accordingly.
-  3. If resolved: patches the exact row (by trade_id) with:
+  3. If resolved: patches the exact row by integer id (primary key) with:
        - resolved_outcome (UP / DOWN / VOID)
        - actual_win (True / False / None for VOID)
        - polymarket_final_price
@@ -21,24 +19,12 @@ Every 60 seconds it:
   4. If not yet resolved: skips — will retry next cycle
   5. If market_end_time > 1 hour ago and still unresolved: marks VOID + gave_up_at
 
-Patching is done by trade_id (UUID), not by condition_id, so each row is
-updated independently with no risk of cross-contamination between strategies.
+NOTE: Patching is done by integer id (primary key) not trade_id UUID,
+because Supabase REST API uuid column filtering is unreliable.
+trade_id is still stored on every row for reference and traceability.
 
 Summary queries only OPEN rows where resolved_outcome IS NOT NULL,
 so all win-rate stats are 100% ground truth from Polymarket.
-
-Supabase schema additions required (run once):
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id         uuid;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS market_end_time  timestamptz;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS resolved_outcome text;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS actual_win       boolean;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS polymarket_final_price float;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS resolved_at      timestamptz;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS flat_pnl         float;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS edge             float;
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS gave_up_at       timestamptz;
-
-Usage on Railway: web: python multi_strategy.py & python resolver.py & wait
 """
 
 import os
@@ -59,10 +45,10 @@ log = logging.getLogger(__name__)
 CLOB_API       = "https://clob.polymarket.com"
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
-CHECK_INTERVAL = 60     # seconds between resolver loops
+CHECK_INTERVAL = 60
 TAKER_FEE      = 0.0025
-MIN_AGE_SECS   = 60     # don't check until at least 1 min after market end
-MAX_AGE_SECS   = 3600   # give up after 1 hour
+MIN_AGE_SECS   = 60
+MAX_AGE_SECS   = 3600
 
 
 # ---------------------------------------------------------------- SUPABASE ---
@@ -76,10 +62,6 @@ def sb_headers() -> dict:
 
 
 def fetch_pending_trades() -> list:
-    """
-    Fetch all OPEN trades with no resolved_outcome and a known market_end_time.
-    Age filtering (too young / too old) is done in the main loop.
-    """
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/trades",
@@ -100,32 +82,32 @@ def fetch_pending_trades() -> list:
         return []
 
 
-def patch_trade(trade_id: str, outcome_data: dict) -> bool:
+def patch_trade(row_id: int, trade_id: str, outcome_data: dict) -> bool:
     """
-    Patch a single trade row by trade_id (UUID).
-    This is the only write path for outcome fields — multi_strategy.py never writes these.
+    Patch a single trade row by integer primary key id.
+    Using id instead of trade_id UUID because Supabase REST API
+    uuid column filtering is unreliable — integer pk always works.
     """
     try:
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/trades",
             headers={**sb_headers(), "Prefer": "return=representation"},
-            params={"trade_id": f"eq.{trade_id}"},
+            params={"id": f"eq.{row_id}"},
             json=outcome_data,
             timeout=10,
         )
         resp.raise_for_status()
         updated = resp.json()
         if not updated:
-            log.warning(f"patch_trade: no rows matched trade_id={trade_id}")
+            log.warning(f"patch_trade: no rows matched id={row_id} (trade_id={trade_id[:8]}...)")
             return False
         return True
     except Exception as e:
-        log.warning(f"Failed to patch trade {trade_id}: {e}")
+        log.warning(f"Failed to patch trade id={row_id}: {e}")
         return False
 
 
 def resolve_snapshots(outcome: str, condition_id: str):
-    """Update all snapshot rows for this market with the resolved outcome."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
@@ -148,11 +130,6 @@ def resolve_snapshots(outcome: str, condition_id: str):
 
 
 def fetch_strategy_summary() -> list:
-    """
-    Fetch resolved trades for win-rate summary.
-    Only queries OPEN rows where resolved_outcome IS NOT NULL —
-    these are the only rows with real Polymarket outcome data.
-    """
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/trades",
@@ -175,16 +152,8 @@ def fetch_strategy_summary() -> list:
 
 def fetch_market_outcome(condition_id: str) -> dict:
     """
-    Fetch the resolved outcome from the Polymarket CLOB API.
-    https://clob.polymarket.com/markets/{condition_id}
-
-    Checks tokens[].winner — when the market resolves, one token
-    will have winner=true.
-
-    Returns:
-      {"resolved": True,  "outcome": "UP"|"DOWN", "up_price": float, "down_price": float}
-      {"resolved": False}          — not settled yet, retry next cycle
-      {"resolved": "ZERO_PRICES"}  — closed but no winner set yet
+    Fetch resolved outcome from Polymarket CLOB API.
+    Checks tokens[].winner — when resolved, one token has winner=true.
     """
     try:
         resp = requests.get(
@@ -205,15 +174,15 @@ def fetch_market_outcome(condition_id: str) -> dict:
             log.warning(f"Unexpected token structure for {condition_id[:12]}...: {tokens}")
             return {"resolved": False}
 
-        log.debug(f"CLOB tokens up=winner:{up_token.get('winner')} "
-                  f"down=winner:{down_token.get('winner')} for {condition_id[:12]}...")
+        log.debug(f"CLOB up=winner:{up_token.get('winner')} "
+                  f"down=winner:{down_token.get('winner')} "
+                  f"for {condition_id[:12]}...")
 
         if up_token.get("winner"):
             return {"resolved": True, "outcome": "UP",   "up_price": 1.0, "down_price": 0.0}
         elif down_token.get("winner"):
             return {"resolved": True, "outcome": "DOWN", "up_price": 0.0, "down_price": 1.0}
         else:
-            # Neither winner yet — market still settling
             return {"resolved": "ZERO_PRICES"}
 
     except Exception as e:
@@ -224,11 +193,6 @@ def fetch_market_outcome(condition_id: str) -> dict:
 # --------------------------------------------------------- MAIN LOOP ---------
 
 def resolve_pending_trades():
-    """
-    Check all pending trades and write real outcomes where available.
-    Skips trades whose markets ended too recently (< MIN_AGE_SECS).
-    Gives up on trades whose markets ended too long ago (> MAX_AGE_SECS).
-    """
     trades = fetch_pending_trades()
 
     if not trades:
@@ -243,44 +207,41 @@ def resolve_pending_trades():
     gave_up_count  = 0
     waiting_count  = 0
 
-    # Cache outcomes per condition_id — multiple strategies trade the same market
     outcome_cache: dict = {}
 
     for trade in trades:
-        trade_id     = trade.get("trade_id")
+        row_id       = trade.get("id")
+        trade_id     = trade.get("trade_id", "unknown")
         condition_id = trade.get("condition_id", "")
 
-        if not trade_id:
-            log.warning(f"Trade row id={trade.get('id')} has no trade_id UUID — skipping.")
+        if not row_id:
+            log.warning(f"Trade has no integer id — skipping.")
             continue
 
         if not condition_id:
-            log.warning(f"Trade {trade_id} has no condition_id — skipping.")
+            log.warning(f"Trade id={row_id} has no condition_id — skipping.")
             continue
 
         end_time_str = trade.get("market_end_time")
         if not end_time_str:
-            log.warning(f"Trade {trade_id} has no market_end_time — skipping.")
+            log.warning(f"Trade id={row_id} has no market_end_time — skipping.")
             continue
 
         try:
             market_end = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
         except ValueError:
-            log.warning(f"Trade {trade_id} unparseable market_end_time: {end_time_str}")
+            log.warning(f"Trade id={row_id} unparseable market_end_time: {end_time_str}")
             continue
 
         age_secs = (now - market_end).total_seconds()
 
-        # Too young — come back next cycle
         if age_secs < MIN_AGE_SECS:
             skipped_young += 1
-            log.debug(f"Trade {trade_id[:8]}... market only {age_secs:.0f}s old — waiting")
             continue
 
-        # Too old — give up and mark VOID
         if age_secs > MAX_AGE_SECS:
-            log.warning(f"Trade {trade_id[:8]}... market {age_secs:.0f}s old — giving up, marking VOID")
-            patch_trade(trade_id, {
+            log.warning(f"Trade id={row_id} ({trade_id[:8]}...) market {age_secs:.0f}s old — marking VOID")
+            patch_trade(row_id, trade_id, {
                 "resolved_outcome": "VOID",
                 "actual_win":       None,
                 "resolved_at":      now.isoformat(),
@@ -293,24 +254,21 @@ def resolve_pending_trades():
             time.sleep(0.1)
             continue
 
-        # Fetch outcome (cached per condition_id)
         if condition_id not in outcome_cache:
             outcome_cache[condition_id] = fetch_market_outcome(condition_id)
-            time.sleep(0.3)  # light rate limiting
+            time.sleep(0.3)
 
         result = outcome_cache[condition_id]
 
-        # Not resolved yet
         if result["resolved"] is False:
             waiting_count += 1
-            log.debug(f"Trade {trade_id[:8]}... not resolved yet (age={age_secs:.0f}s)")
+            log.debug(f"Trade id={row_id} not resolved yet (age={age_secs:.0f}s)")
             continue
 
-        # No winner set yet — keep waiting until MAX_AGE_SECS
         if result["resolved"] == "ZERO_PRICES":
             if age_secs > MAX_AGE_SECS:
-                log.warning(f"Trade {trade_id[:8]}... no winner after {age_secs:.0f}s — marking VOID")
-                patch_trade(trade_id, {
+                log.warning(f"Trade id={row_id} no winner after {age_secs:.0f}s — marking VOID")
+                patch_trade(row_id, trade_id, {
                     "resolved_outcome": "VOID",
                     "actual_win":       None,
                     "resolved_at":      now.isoformat(),
@@ -322,10 +280,10 @@ def resolve_pending_trades():
                 gave_up_count += 1
             else:
                 waiting_count += 1
-                log.info(f"Trade {trade_id[:8]}... closed, no winner yet (age={age_secs:.0f}s) — waiting")
+                log.info(f"Trade id={row_id} ({trade_id[:8]}...) closed, no winner yet "
+                         f"(age={age_secs:.0f}s) — waiting")
             continue
 
-        # Real outcome — write it
         outcome    = result["outcome"]
         up_price   = result["up_price"]
         down_price = result["down_price"]
@@ -333,7 +291,7 @@ def resolve_pending_trades():
         won        = (side == outcome)
         size       = float(trade.get("size", 0))
         entry_px   = float(trade.get("price", 0.5))
-        fee        = size * TAKER_FEE * 2  # round-trip fee
+        fee        = size * TAKER_FEE * 2
 
         if won:
             actual_pnl = size * (1 / entry_px - 1) - fee
@@ -355,9 +313,9 @@ def resolve_pending_trades():
             "edge":                   edge,
         }
 
-        if patch_trade(trade_id, outcome_data):
+        if patch_trade(row_id, trade_id, outcome_data):
             status = "WIN " if won else "LOSS"
-            log.info(f"Resolved: {status} | trade_id={trade_id[:8]}... | "
+            log.info(f"Resolved: {status} | id={row_id} trade_id={trade_id[:8]}... | "
                      f"{side} vs {outcome} | PnL={actual_pnl:+.3f} | "
                      f"age={age_secs:.0f}s | {trade.get('strategy','')} | "
                      f"{trade.get('question','')[:50]}")
@@ -375,7 +333,6 @@ def resolve_pending_trades():
 
 
 def print_summary():
-    """Print win-rate summary per strategy using real Polymarket outcomes."""
     trades = fetch_strategy_summary()
     if not trades:
         log.info("No resolved trades to summarise yet.")
@@ -417,9 +374,8 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3 — using CLOB API for outcomes")
+    log.info("Resolution Tracker v3 — CLOB API, patching by integer id")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
-    log.info(f"Patching by trade_id (UUID) — one row per trade, resolver owns all outcomes")
     log.info(f"Checking every {CHECK_INTERVAL}s")
 
     last_summary = 0
