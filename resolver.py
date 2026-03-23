@@ -244,14 +244,15 @@ def resolve_pending_trades():
 
         if age_secs > MAX_AGE_SECS:
             log.warning(f"Trade id={row_id} ({trade_id[:8]}...) market {age_secs:.0f}s old — marking VOID")
+            void_fee = float(trade.get("size", 0)) * TAKER_FEE
             patch_trade(row_id, trade_id, {
                 "resolved_outcome": "VOID",
                 "actual_win":       None,
                 "resolved_at":      now.isoformat(),
                 "gave_up_at":       now.isoformat(),
-                "pnl":              -(float(trade.get("size", 0)) + float(trade.get("fee", 0))),
-                "flat_pnl":         -(float(trade.get("size", 0)) * (1 + TAKER_FEE * 2)),
-                "edge":             -1.0,
+                "pnl":              round(-void_fee, 4),
+                "flat_pnl":         round(-void_fee, 4),
+                "edge":             0.0,
             })
             gave_up_count += 1
             time.sleep(0.1)
@@ -271,14 +272,15 @@ def resolve_pending_trades():
         if result["resolved"] == "ZERO_PRICES":
             if age_secs > MAX_AGE_SECS:
                 log.warning(f"Trade id={row_id} no winner after {age_secs:.0f}s — marking VOID")
+                void_fee = float(trade.get("size", 0)) * TAKER_FEE
                 patch_trade(row_id, trade_id, {
                     "resolved_outcome": "VOID",
                     "actual_win":       None,
                     "resolved_at":      now.isoformat(),
                     "gave_up_at":       now.isoformat(),
-                    "pnl":              -(float(trade.get("size", 0)) + float(trade.get("fee", 0))),
-                    "flat_pnl":         -(float(trade.get("size", 0)) * (1 + TAKER_FEE * 2)),
-                    "edge":             -1.0,
+                    "pnl":              round(-void_fee, 4),
+                    "flat_pnl":         round(-void_fee, 4),
+                    "edge":             0.0,
                 })
                 gave_up_count += 1
             else:
@@ -296,14 +298,18 @@ def resolve_pending_trades():
         entry_px   = float(trade.get("price", 0.5))
         fee        = size * TAKER_FEE * 2
 
+        # Edge = implied return at entry price, same formula win or loss.
+        # Positive edge means you were buying at a discount to fair value (0.5).
+        # Negative edge means you were buying at a premium.
+        # This is meaningful for analysis regardless of outcome.
+        edge = round(1 / entry_px - 1, 4)
+
         if won:
             actual_pnl = size * (1 / entry_px - 1) - fee
             flat_pnl   = (size * (1 / entry_px - 1)) - (size * TAKER_FEE * 2)
-            edge       = round(1 / entry_px - 1, 4)
         else:
             actual_pnl = -size - fee
             flat_pnl   = -size - (size * TAKER_FEE * 2)
-            edge       = -1.0
 
         final_price  = up_price if side == "UP" else down_price
         outcome_data = {
