@@ -484,7 +484,7 @@ _chainlink_cache: dict = {
     "price":      None,   # latest BTC/USD from Chainlink via Polymarket RTDS
     "updated_at": None,   # datetime when last updated
 }
-_POLYMARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+_POLYMARKET_WS = "wss://ws-live-data.polymarket.com"
 _SUBSCRIBE_MSG = json.dumps({
     "action": "subscribe",
     "subscriptions": [
