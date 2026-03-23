@@ -117,14 +117,17 @@ def resolve_snapshots(outcome: str, condition_id: str):
                 "apikey":        SUPABASE_KEY,
                 "Authorization": f"Bearer {SUPABASE_KEY}",
                 "Content-Type":  "application/json",
-                "Prefer":        "return=minimal",
+                "Prefer":        "return=representation",
             },
             params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
             json={"resolved_outcome": outcome},
             timeout=10,
         )
-        if resp.status_code in (200, 204):
-            log.info(f"Updated snapshots for {condition_id[:12]}... → {outcome}")
+        updated = resp.json() if resp.content else []
+        if updated:
+            log.info(f"Updated {len(updated)} snapshot(s) for {condition_id[:12]}... → {outcome}")
+        else:
+            log.warning(f"resolve_snapshots: no rows matched condition_id={condition_id[:12]}...")
     except Exception as e:
         log.warning(f"Snapshot resolution failed: {e}")
 
