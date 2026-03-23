@@ -318,8 +318,19 @@ def resolve_pending_trades():
         # Only give up if we're past MAX_AGE_SECS (handled above already),
         # otherwise wait — prices usually appear within a few minutes.
         if result["resolved"] == "ZERO_PRICES":
-            log.info(f"Trade {trade_id[:8]}... closed with zero prices (age={age_secs:.0f}s) "
-                     f"— waiting for prices")
+            if age_secs > MAX_AGE_SECS:
+                log.warning(f"Trade {trade_id[:8]}... zero prices for {age_secs:.0f}s — marking VOID")
+                patch_trade(trade_id, {
+                    "resolved_outcome": "VOID",
+                    "actual_win":       None,
+                    "resolved_at":      now.isoformat(),
+                    "gave_up_at":       now.isoformat(),
+                    "pnl":              -(float(trade.get("size", 0)) + float(trade.get("fee", 0))),
+                    "flat_pnl":         -(float(trade.get("size", 0)) * (1 + TAKER_FEE * 2)),
+                    "edge":             -1.0,
+                })
+            else:
+                log.info(f"Trade {trade_id[:8]}... closed with zero prices (age={age_secs:.0f}s) — waiting")
             continue
 
         # We have a real outcome — write it.
