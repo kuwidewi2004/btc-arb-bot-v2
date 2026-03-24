@@ -1894,6 +1894,130 @@ def strategy_ob_pressure(market, secs_left, tracker, position):
     return position
 
 
+def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
+    """
+    On startup, query Supabase for any OPEN trades that are not yet resolved.
+    Re-populate the portfolio's exposure tracking and deduct committed capital
+    so the exposure cap is correct from the first poll cycle.
+
+    Also reconstructs positions dict keyed by strategy name so the main loop
+    knows which strategies already have an open position on the current market.
+
+    Returns: {condition_id: {strategy_name: StrategyTrade}} for open positions.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.warning("No Supabase credentials — skipping state restore")
+        return {}
+
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/trades",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Range":         "0-999",
+            },
+            params={
+                "action":           "eq.OPEN",
+                "resolved_outcome": "is.null",
+                "select":           "id,trade_id,strategy,side,price,size,fee,"
+                                    "condition_id,question,market_end_time",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        open_trades = resp.json()
+    except Exception as e:
+        log.warning(f"State restore failed — could not fetch open trades: {e}")
+        return {}
+
+    if not open_trades:
+        log.info("State restore: no open trades found — starting fresh")
+        return {}
+
+    log.info(f"State restore: found {len(open_trades)} open trade(s) — restoring exposure")
+
+    restored: dict = {}   # condition_id → {strategy_key: StrategyTrade}
+
+    strategy_key_map = {
+        "Chainlink Arb":       "chainlink",
+        "Funding Reversion":   "funding",
+        "Liquidation Cascade": "liquidation",
+        "Basis Arb":           "basis",
+        "Odds Mispricing":     "odds",
+        "Volume Clock":        "volume",
+        "OB Pressure":         "ob_pressure",
+    }
+
+    now = datetime.now(timezone.utc)
+
+    for t in open_trades:
+        condition_id  = t.get("condition_id", "")
+        strategy_name = t.get("strategy", "")
+        side          = t.get("side", "")
+        size          = float(t.get("size", 0))
+        price         = float(t.get("price", 0.5))
+        fee           = float(t.get("fee", 0))
+        trade_id      = t.get("trade_id", "")
+        question      = t.get("question", "")
+        end_time_str  = t.get("market_end_time")
+
+        if not condition_id or not strategy_name or not side or size <= 0:
+            continue
+
+        # Parse market end time
+        try:
+            end_time = datetime.fromisoformat(
+                end_time_str.replace("Z", "+00:00")) if end_time_str else now
+        except Exception:
+            end_time = now
+
+        # Skip if market already expired — resolver will handle it
+        if end_time <= now:
+            log.info(f"State restore: skipping expired trade {trade_id[:8]}... "
+                     f"({strategy_name} on {condition_id[:12]}...)")
+            continue
+
+        # Re-register exposure in portfolio — deduct size+fee from balance
+        # Use _lock-safe debit to restore the pre-restart state
+        portfolio.debit(size, fee, condition_id, side)
+
+        # Reconstruct a minimal StrategyTrade so the main loop knows
+        # this strategy already has a position on this market
+        market = Market(
+            condition_id  = condition_id,
+            up_token_id   = "",   # not needed for position tracking
+            down_token_id = "",
+            question      = question,
+            end_time      = end_time,
+        )
+        st = StrategyTrade(
+            strategy    = strategy_name,
+            side        = side,
+            size        = size,
+            entry_price = price,
+            market      = market,
+        )
+        st.trade_id = trade_id
+
+        strategy_key = strategy_key_map.get(strategy_name)
+        if not strategy_key:
+            log.warning(f"State restore: unknown strategy name '{strategy_name}' — skipping")
+            continue
+
+        if condition_id not in restored:
+            restored[condition_id] = {}
+        restored[condition_id][strategy_key] = st
+
+        log.info(f"State restore: {strategy_name} {side} size={size:.2f} @ {price:.4f} "
+                 f"on {condition_id[:12]}... | portfolio=${portfolio.available():.2f}")
+
+    log.info(f"State restore complete | portfolio=${portfolio.available():.2f} | "
+             f"markets with open positions: {len(restored)}")
+    return restored
+
+
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
@@ -1919,9 +2043,12 @@ def run():
         "ob_pressure": StrategyTracker("OB Pressure",         portfolio),
     }
 
-    positions         = {k: None for k in trackers}
-    cl_history        = deque(maxlen=6)
-    current_market    = None
+    # Restore open positions and exposure from Supabase before first poll cycle.
+    # This ensures the exposure cap is correct even after a redeploy mid-market.
+    restored_state   = restore_state_from_supabase(portfolio)
+    positions        = {k: None for k in trackers}
+    cl_history       = deque(maxlen=6)
+    current_market   = None
     last_market_fetch = 0
     last_summary      = 0
 
@@ -1949,6 +2076,12 @@ def run():
                     current_market = market
                     positions      = {k: None for k in trackers}
                     cl_history.clear()
+                    # Restore any open positions from pre-restart state
+                    if market.condition_id in restored_state:
+                        for strategy_key, st in restored_state[market.condition_id].items():
+                            positions[strategy_key] = st
+                            log.info(f"Restored position: {strategy_key} {st.side} "
+                                     f"size={st.size:.2f} on current market")
                 last_market_fetch = time.time()
 
             if not current_market:
