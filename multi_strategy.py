@@ -2483,7 +2483,7 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v3.4")
+    log.info("Multi-Strategy Mechanical Edge Simulator v3.5")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume | OB Pressure | Price Anchor")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
@@ -2649,8 +2649,17 @@ def run():
                 market_open_price, _anchor_progress)
 
             # ── ML TRAINING SNAPSHOT ──────────────────────────────────────────
-            # Write one row per poll cycle with ALL signal values simultaneously.
+            # One row per poll cycle, all signals observed simultaneously.
             # resolved_outcome patched later by resolver.py.
+            #
+            # ML design notes:
+            #   - p_market (poly_up_mid) is stored explicitly as the market price
+            #     so edge = model_prediction - p_market can be computed at inference
+            #   - edge_realized = outcome_binary - p_market is stored as a label
+            #     enabling profitability regression, not just accuracy classification
+            #   - Raw signals are stored alongside derived scores; prefer raw for ML
+            #   - Time phase flags encode non-linear time effects
+            #   - No condition_id-level features to prevent market ID memorisation
             try:
                 cl_price, cl_age = fetch_chainlink_price()
                 cl_div = round((spot - cl_price) / cl_price * 100, 6) if cl_price else 0.0
@@ -2667,11 +2676,11 @@ def run():
                 buy_vol   = sum(c["buy_vol"] for c in recent)
                 buy_ratio = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
 
-                # Chainlink opening price — still captured in snapshot block
+                # Chainlink opening price
                 if cl_open_price == 0.0 and cl_price:
                     cl_open_price = cl_price
 
-                # Price vs opening — core resolution feature
+                # Price vs opening
                 price_vs_open_pct   = round((spot - market_open_price) / market_open_price * 100, 6) \
                                       if market_open_price > 0 else 0.0
                 price_vs_open_score = round(math.tanh(price_vs_open_pct / 0.10), 4)
@@ -2680,15 +2689,24 @@ def run():
                 cl_vs_open_pct = round((cl_price - cl_open_price) / cl_open_price * 100, 6) \
                                  if cl_price and cl_open_price > 0 else 0.0
 
-                # market_progress — max_secs_left already updated before strategies
+                # Market progress
                 effective_duration = max_secs_left if max_secs_left > 0 else 300.0
                 market_progress = round(max(0.0, min(1.0, 1.0 - secs_left / effective_duration)), 4)
 
-                # Multi-timeframe momentum
+                # Multi-timeframe momentum (raw — preferred for ML over derived score)
                 momentum_10s  = round(btc_momentum_pct(lookback_secs=10)  or 0.0, 6)
                 momentum_30s  = round(btc_momentum_pct(lookback_secs=30)  or 0.0, 6)
                 momentum_60s  = round(btc_momentum_pct(lookback_secs=60)  or 0.0, 6)
                 momentum_120s = round(btc_momentum_pct(lookback_secs=120) or 0.0, 6)
+
+                # FIX 6: non-linear time phase flags
+                # Signals behave qualitatively differently across these windows —
+                # a linear secs_left cannot capture this; binary flags let the
+                # model learn separate weights per phase without assuming linearity.
+                phase_early = 1 if secs_left > 200 else 0   # >200s: market just opened
+                phase_mid   = 1 if 100 < secs_left <= 200 else 0
+                phase_late  = 1 if 30 < secs_left <= 100 else 0
+                phase_final = 1 if secs_left <= 30 else 0   # <30s: almost resolved
 
                 # Liquidation delta and acceleration
                 liq_total_history.append(liq_total)
@@ -2712,32 +2730,46 @@ def run():
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
 
+                # FIX 5: explicit interaction features
+                # Tree models learn these automatically but storing them explicitly
+                # ensures they survive any feature selection step and are available
+                # to linear/logistic baselines too.
+                interact_momentum_x_vol    = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
+                interact_ob_x_spread       = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
+                interact_liq_x_price_pos   = round(liq_imbalance * price_vs_open_pct, 6)
+                interact_momentum_x_progress = round(momentum_30s * market_progress, 6)
+
                 supabase_market_snapshot({
                     "condition_id":        current_market.condition_id,
                     "market_question":     current_market.question,
                     "market_end_time":     current_market.end_time.isoformat(),
                     "secs_left":           round(secs_left, 1),
                     "market_progress":     market_progress,
-                    # Price and macro
+                    # FIX 6: time phase flags (non-linear time encoding)
+                    "phase_early":         phase_early,
+                    "phase_mid":           phase_mid,
+                    "phase_late":          phase_late,
+                    "phase_final":         phase_final,
+                    # Price and macro (raw)
                     "btc_price":           round(spot, 2),
                     "market_open_price":   round(market_open_price, 2),
                     "price_vs_open_pct":   price_vs_open_pct,
-                    "price_vs_open_score": price_vs_open_score,
+                    "price_vs_open_score": price_vs_open_score,   # derived — keep for reference
                     "basis_pct":           round(basis, 6),
                     "funding_rate":        round(_funding_cache["rate"], 6),
                     "okx_funding":         round(_funding_cache["okx"], 6),
                     "gate_funding":        round(_funding_cache["binance"], 6),
-                    # Multi-timeframe momentum
+                    # Multi-timeframe momentum (raw signals — FIX 3)
                     "momentum_10s":        momentum_10s,
                     "momentum_30s":        momentum_30s,
                     "momentum_60s":        momentum_60s,
                     "momentum_120s":       momentum_120s,
-                    # Chainlink signal
+                    # Chainlink signal (raw)
                     "cl_divergence":       round(cl_div, 6),
                     "cl_age":              round(cl_age, 1) if cl_age else 0.0,
                     "cl_open_price":       round(cl_open_price, 2),
                     "cl_vs_open_pct":      cl_vs_open_pct,
-                    # Liquidation signal
+                    # Liquidation signal (raw)
                     "liq_total":           round(liq_total, 2),
                     "liq_long":            round(liq_long, 2),
                     "liq_short":           round(liq_short, 2),
@@ -2745,22 +2777,29 @@ def run():
                     "liq_delta":           liq_delta,
                     "liq_accel":           liq_accel,
                     "vol_range_pct":       round(_vol_cache.get("range_pct", 0.0), 6),
-                    # Order book signal
+                    # Order book signal (raw)
                     "ob_imbalance":        round(_ob_cache.get("imbalance", 0.0), 4),
                     "ob_spread_pct":       round(_ob_cache.get("spread_pct", 0.0), 6),
                     "ob_bid_depth":        round(cur_bid_depth, 2),
                     "ob_ask_depth":        round(cur_ask_depth, 2),
                     "ob_bid_delta":        ob_bid_delta,
                     "ob_ask_delta":        ob_ask_delta,
-                    # Volume signal
+                    # Volume signal (raw)
                     "volume_buy_ratio":    buy_ratio,
-                    # Polymarket book
-                    "poly_up_mid":         poly_up_mid,
+                    # FIX 1: market price stored explicitly as p_market
+                    # edge at inference = model_predicted_prob - p_market
+                    "p_market":            poly_up_mid,   # canonical name for ML
+                    "poly_up_mid":         poly_up_mid,   # kept for backwards compat
                     "poly_spread":         poly_spread,
                     "poly_fill_up":        poly_fill_up,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
-                    # Regime labels (categorical)
+                    # FIX 5: interaction features
+                    "interact_momentum_x_vol":      interact_momentum_x_vol,
+                    "interact_ob_x_spread":         interact_ob_x_spread,
+                    "interact_liq_x_price_pos":     interact_liq_x_price_pos,
+                    "interact_momentum_x_progress": interact_momentum_x_progress,
+                    # Regime labels (categorical — FIX 4: keep but treat as supplementary)
                     "regime":              _regime["composite"],
                     "momentum_label":      _regime["momentum_label"],
                     "volatility_label":    _regime["volatility_label"],
@@ -2768,7 +2807,7 @@ def run():
                     "session":             _regime["session"],
                     "activity":            _regime["activity"],
                     "day_type":            _regime["day_type"],
-                    # Continuous regime scores
+                    # Continuous regime scores (derived — FIX 3: use raw signals as primary)
                     "momentum_score":      _regime["momentum_score"],
                     "volatility_pct":      _regime["volatility_pct"],
                     "flow_score":          _regime["flow_score"],
@@ -2778,13 +2817,22 @@ def run():
                     "hour_cos":            _regime["hour_cos"],
                     "dow_sin":             _regime["dow_sin"],
                     "dow_cos":             _regime["dow_cos"],
-                    # Price anchor signal — same values used by strategy_price_anchor
+                    # Price anchor signal
                     "anchor_open_price":   round(market_open_price, 2),
                     "anchor_pct":          price_vs_open_pct,
                     "anchor_score":        price_vs_open_score,
                     "anchor_progress":     market_progress,
-                    # Label — patched by resolver when market settles
-                    "resolved_outcome":    None,
+                    # FIX 2: profitability labels
+                    # edge_realized = outcome_binary - p_market, patched by resolver.
+                    # Enables regression target: predict edge, not just direction.
+                    # outcome_binary: 1.0 if UP wins, 0.0 if DOWN wins (patched by resolver)
+                    # edge_realized:  outcome_binary - p_market  (patched by resolver)
+                    "outcome_binary":      None,   # patched: 1.0=UP won, 0.0=DOWN won
+                    "edge_realized":       None,   # patched: outcome_binary - p_market
+                    # FIX 7: market_id for train/test split boundary (never use as feature)
+                    # Use condition_id to group rows by market when splitting:
+                    #   train on markets[:N], test on markets[N:]  — never shuffle across markets
+                    "resolved_outcome":    None,   # patched by resolver
                 })
             except Exception as e:
                 log.debug(f"market_snapshot write failed: {e}")

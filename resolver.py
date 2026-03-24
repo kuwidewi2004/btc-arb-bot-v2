@@ -32,10 +32,13 @@ trade_id is still stored on every row for reference and traceability.
 Summary queries only OPEN rows where resolved_outcome IS NOT NULL,
 so all win-rate stats are 100% ground truth from Polymarket.
 
-Fixes applied (v3.3):
-  - Supabase pagination: checks Content-Range header and fetches all pages (issue #8)
-  - CLOB requests use Session with retry + backoff (issue #7)
-  - ZERO_PRICES double-VOID race condition resolved (issue #6)
+Fixes applied (v3.4):
+  - resolve_market_snapshots() now patches outcome_binary and edge_realized
+    per row at resolution time (FIX 1+2 from ML review):
+      outcome_binary = 1.0 if UP, 0.0 if DOWN
+      edge_realized  = outcome_binary - p_market (profit label for regression)
+    Each row is patched individually so edge_realized reflects the p_market
+    observed at that specific snapshot moment, not a single market-level value.
 """
 
 import os
@@ -216,21 +219,66 @@ def resolve_signal_logs(outcome: str, condition_id: str):
 def resolve_market_snapshots(outcome: str, condition_id: str):
     """
     Patch all market_snapshots rows for this condition_id with the resolved outcome.
-    This is the primary ML training label — without it the snapshot rows are unlabelled.
+    This is the primary ML training table — without it the snapshot rows are unlabelled.
+
+    Patches three fields per row:
+      resolved_outcome  — "UP" or "DOWN" (classification label)
+      outcome_binary    — 1.0 if UP won, 0.0 if DOWN won (numeric classification label)
+      edge_realized     — outcome_binary - p_market (profitability regression label)
+                          p_market is the poly_up_mid stored at snapshot time.
+                          Positive = we had positive edge from UP perspective.
+                          ML should regress on this, not just classify direction.
+
+    edge_realized is computed per-row because p_market varies across the market lifetime
+    (odds move as the market progresses). Patching in bulk with a single value would
+    be wrong — each snapshot observed a different market price.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        resp = _session.patch(
-            f"{SUPABASE_URL}/rest/v1/market_snapshots",
-            headers={**sb_headers(), "Prefer": "return=representation"},
-            params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
-            json={"resolved_outcome": outcome},
-            timeout=10,
-        )
-        updated = resp.json() if resp.content else []
-        if updated:
-            log.info(f"Updated {len(updated)} market_snapshot(s) for {condition_id[:12]}... → {outcome}")
+        outcome_binary = 1.0 if outcome == "UP" else 0.0
+
+        # Fetch all unresolved snapshot rows for this condition_id to compute
+        # per-row edge_realized = outcome_binary - p_market
+        rows = _sb_fetch_all("market_snapshots", {
+            "condition_id":     f"eq.{condition_id}",
+            "resolved_outcome": "is.null",
+            "select":           "id,p_market",
+        })
+
+        if not rows:
+            return
+
+        # Patch each row individually so edge_realized reflects the p_market
+        # that was observed at that specific moment in time
+        updated_count = 0
+        for row in rows:
+            row_id   = row.get("id")
+            p_market = row.get("p_market")
+            if not row_id:
+                continue
+            edge_realized = round(outcome_binary - p_market, 6) if p_market is not None else None
+            try:
+                resp = _session.patch(
+                    f"{SUPABASE_URL}/rest/v1/market_snapshots",
+                    headers={**sb_headers(), "Prefer": "return=minimal"},
+                    params={"id": f"eq.{row_id}"},
+                    json={
+                        "resolved_outcome": outcome,
+                        "outcome_binary":   outcome_binary,
+                        "edge_realized":    edge_realized,
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                updated_count += 1
+            except Exception as e:
+                log.warning(f"market_snapshot patch failed for id={row_id}: {e}")
+
+        if updated_count:
+            log.info(f"Updated {updated_count} market_snapshot(s) for "
+                     f"{condition_id[:12]}... → {outcome} "
+                     f"(outcome_binary={outcome_binary})")
     except Exception as e:
         log.warning(f"Market snapshot resolution failed: {e}")
 
@@ -496,7 +544,7 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3.3 — CLOB API, patching by integer id")
+    log.info("Resolution Tracker v3.4 — CLOB API, patching by integer id")
     log.info("Resolves: trades + signal_snapshots + signal_log (independent of trades)")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Checking every {CHECK_INTERVAL}s")
