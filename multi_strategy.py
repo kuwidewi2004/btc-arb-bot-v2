@@ -78,11 +78,150 @@ OKX_BTC          = "BTC-USDT-SWAP"
 
 TAKER_FEE        = 0.0025
 STARTING_BALANCE = 100.0
-MAX_BET          = 50.0
-MIN_BET          = 5.0
+MIN_BET          = 3.0
 POLL_SEC         = 5
 
+# Kelly criterion sizing config
+KELLY_FRACTION   = 0.25   # fractional Kelly — 25% of full Kelly to reduce variance
+MAX_BET_PCT      = 0.15   # hard cap: never more than 15% of portfolio per trade
+# Assumed win probabilities by signal intensity (prior — replaced by real data over time)
+KELLY_P_WEAK     = 0.54   # intensity < 0.3
+KELLY_P_MED      = 0.57   # intensity 0.3–0.7
+KELLY_P_STRONG   = 0.60   # intensity > 0.7
+
 SKIP_HOURS_UTC   = {}
+
+
+# Per-strategy win rates fetched from Supabase at startup and refreshed every 30min.
+# Falls back to conservative priors when sample size is below MIN_KELLY_SAMPLES.
+_win_rates: dict = {}   # {"Strategy Name": float}  e.g. {"Liquidation Cascade": 0.62}
+MIN_KELLY_SAMPLES = 30  # minimum resolved trades before using real win rate
+
+
+def fetch_win_rates() -> dict:
+    """
+    Query Supabase for per-strategy win rates from resolved trades.
+    Only uses strategies with >= MIN_KELLY_SAMPLES resolved trades.
+    Returns dict of {strategy_name: win_rate_float}.
+    Logs which strategies have enough data and which are still on priors.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return {}
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/trades",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Range":         "0-9999",
+            },
+            params={
+                "action":           "eq.OPEN",
+                "resolved_outcome": "not.is.null",
+                "select":           "strategy,actual_win",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception as e:
+        log.warning(f"fetch_win_rates: Supabase query failed — {e}")
+        return {}
+
+    from collections import defaultdict
+    counts  = defaultdict(lambda: {"wins": 0, "total": 0})
+    for row in rows:
+        name = row.get("strategy", "")
+        won  = row.get("actual_win")
+        if not name or won is None:
+            continue
+        counts[name]["total"] += 1
+        if won:
+            counts[name]["wins"] += 1
+
+    rates = {}
+    for name, c in counts.items():
+        if c["total"] >= MIN_KELLY_SAMPLES:
+            wr = c["wins"] / c["total"]
+            rates[name] = round(wr, 4)
+            log.info(f"Kelly win rate [{name}]: {wr:.1%} "
+                     f"({c['wins']}W/{c['total'] - c['wins']}L) — using real rate")
+        else:
+            log.info(f"Kelly win rate [{name}]: only {c['total']} samples "
+                     f"(need {MIN_KELLY_SAMPLES}) — using prior")
+
+    return rates
+
+
+def kelly_size(intensity: float, entry_price: float, bankroll: float,
+               strategy_name: str = "", win_prob: float = 0.0) -> float:
+    """
+    Fractional Kelly criterion bet sizing.
+
+    Args:
+        intensity:     Signal strength 0–1 (scales the Kelly allocation).
+        entry_price:   Taker fill price (e.g. 0.45). Determines net odds b = 1/p - 1.
+        bankroll:      Current available portfolio balance.
+        strategy_name: Used to look up real win rate from _win_rates if available.
+        win_prob:      Hard override win probability (0 = use _win_rates or prior).
+
+    Win probability resolution order:
+        1. win_prob argument if > 0 (hard override)
+        2. _win_rates[strategy_name] if >= MIN_KELLY_SAMPLES resolved trades
+        3. Conservative prior based on intensity tier (KELLY_P_WEAK/MED/STRONG)
+
+    Kelly formula: f* = (p*b - q) / b
+        p = estimated win probability
+        q = 1 - p
+        b = net odds = (1 / entry_price) - 1
+
+    Returns fractional Kelly * bankroll, capped at MAX_BET_PCT of bankroll.
+    Returns 0.0 if Kelly is zero or negative (no edge at this price).
+    """
+    if entry_price <= 0 or entry_price >= 1:
+        return MIN_BET
+
+    # Net odds on a Polymarket binary
+    b = (1.0 / entry_price) - 1.0
+
+    # Win probability — real rate > prior, hard override > both
+    if win_prob > 0:
+        p = win_prob
+    elif strategy_name and strategy_name in _win_rates:
+        p = _win_rates[strategy_name]
+    elif intensity < 0.3:
+        p = KELLY_P_WEAK
+    elif intensity < 0.7:
+        p = KELLY_P_MED
+    else:
+        p = KELLY_P_STRONG
+
+    q = 1.0 - p
+
+    # Full Kelly fraction
+    kelly_f = (p * b - q) / b
+
+    if kelly_f <= 0:
+        # Negative Kelly = no edge at this price — skip
+        return 0.0
+
+    # Fractional Kelly
+    frac_kelly = kelly_f * KELLY_FRACTION
+
+    # Scale by signal intensity within the Kelly allocation
+    frac_kelly *= intensity
+
+    # Bet size in dollars
+    size = frac_kelly * bankroll
+
+    # Hard cap: never exceed MAX_BET_PCT of bankroll regardless of Kelly
+    size = min(size, bankroll * MAX_BET_PCT)
+
+    # Floor
+    size = max(size, MIN_BET)
+
+    return round(size, 4)
 
 
 # ---------------------------------------------------------------- SUPABASE ---
@@ -351,6 +490,8 @@ class StrategyTracker:
             "session":         _regime.get("session",   "UNKNOWN"),
             "activity":        _regime.get("activity",  "UNKNOWN"),
             "day_type":        _regime.get("day_type",  "UNKNOWN"),
+            "kelly_fraction":  round(KELLY_FRACTION, 4),
+            "max_bet_pct":     round(MAX_BET_PCT, 4),
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
                  f"portfolio=${self.portfolio.available():.2f} | trade_id={trade_id[:8]}... | "
@@ -1327,11 +1468,11 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
                         reason="spread_too_wide")
             return position
 
-        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
-        # Size scales with divergence strength — stronger divergence = bigger bet
+        price     = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         intensity = min(abs(divergence) / 0.30, 1.0)
-        size      = min(MAX_BET * intensity, tracker.balance * 0.4)
-        size      = max(size, MIN_BET)
+        size      = kelly_size(intensity, price, tracker.balance, "Chainlink Arb")
+        if size == 0.0:
+            return position  # Kelly says no edge at this price
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
@@ -1426,8 +1567,9 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
 
         price     = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         intensity = min(abs(avg_rate) / 0.001, 1.0)
-        size      = min(MAX_BET * intensity, tracker.balance * 0.3)
-        size      = max(size, MIN_BET)
+        size      = kelly_size(intensity, price, tracker.balance, "Funding Reversion")
+        if size == 0.0:
+            return position  # Kelly says no edge at this price
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
@@ -1509,8 +1651,9 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
             return position
 
         price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
-        size  = min(MAX_BET * adjusted_intensity, tracker.balance * 0.3)
-        size  = max(size, MIN_BET)
+        size  = kelly_size(adjusted_intensity, price, tracker.balance, "Liquidation Cascade")
+        if size == 0.0:
+            return position  # Kelly says no edge at this price
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
@@ -1593,8 +1736,9 @@ def strategy_basis_arb(market, secs_left, tracker, position):
             return position
 
         price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
-        size  = min(MAX_BET * intensity, tracker.balance * 0.3)
-        size  = max(size, MIN_BET)
+        size  = kelly_size(intensity, price, tracker.balance, "Basis Arb")
+        if size == 0.0:
+            return position  # Kelly says no edge at this price
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
@@ -1676,8 +1820,9 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         direction = "DOWN" if deviation > 0 else "UP"
         intensity = min(abs(deviation) / 0.15, 1.0)
         price     = prices["fill_up"] if direction == "UP" else prices["fill_down"]
-        size      = min(MAX_BET * intensity, tracker.balance * 0.3)
-        size      = max(size, MIN_BET)
+        size      = kelly_size(intensity, price, tracker.balance, "Odds Mispricing")
+        if size == 0.0:
+            return position  # Kelly says no edge at this price
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
@@ -1754,8 +1899,9 @@ def strategy_volume_clock(market, secs_left, tracker, position):
             return position
 
         price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
-        size  = min(MAX_BET * intensity, tracker.balance * 0.3)
-        size  = max(size, MIN_BET)
+        size  = kelly_size(intensity, price, tracker.balance, "Volume Clock")
+        if size == 0.0:
+            return position  # Kelly says no edge at this price
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
@@ -1866,11 +2012,11 @@ def strategy_ob_pressure(market, secs_left, tracker, position):
 
         # Size scales with imbalance strength
         intensity = min(abs(imbalance) / 0.40, 1.0)
-        size      = min(MAX_BET * intensity, tracker.balance * 0.3)
-        size      = max(size, MIN_BET)
-
-        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
-        slip  = prices["slip_up"] if direction == "UP" else prices["slip_down"]
+        price     = prices["fill_up"] if direction == "UP" else prices["fill_down"]
+        slip      = prices["slip_up"] if direction == "UP" else prices["slip_down"]
+        size      = kelly_size(intensity, price, tracker.balance, "OB Pressure")
+        if size == 0.0:
+            return position  # Kelly says no edge at this price
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
@@ -2046,11 +2192,17 @@ def run():
     # Restore open positions and exposure from Supabase before first poll cycle.
     # This ensures the exposure cap is correct even after a redeploy mid-market.
     restored_state   = restore_state_from_supabase(portfolio)
+
+    # Load real per-strategy win rates for Kelly sizing.
+    # Strategies with < MIN_KELLY_SAMPLES resolved trades fall back to priors.
+    _win_rates.update(fetch_win_rates())
+
     positions        = {k: None for k in trackers}
     cl_history       = deque(maxlen=6)
     current_market   = None
-    last_market_fetch = 0
-    last_summary      = 0
+    last_market_fetch  = 0
+    last_summary       = 0
+    last_winrate_fetch = time.time()
 
     while True:
         try:
@@ -2137,6 +2289,14 @@ def run():
             positions["ob_pressure"] = strategy_ob_pressure(
                 current_market, secs_left, trackers["ob_pressure"],
                 positions["ob_pressure"])
+
+            # Refresh win rates every 30 minutes so Kelly sizing
+            # automatically improves as more trades resolve
+            if time.time() - last_winrate_fetch > 1800:
+                new_rates = fetch_win_rates()
+                _win_rates.clear()
+                _win_rates.update(new_rates)
+                last_winrate_fetch = time.time()
 
             # Print summary every 30 minutes
             if time.time() - last_summary > 1800:
