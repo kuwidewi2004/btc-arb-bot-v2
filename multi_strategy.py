@@ -1229,8 +1229,14 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
     Strategy 2: Funding rate reversion.
     Extreme positive funding = longs overextended = bet DOWN.
     Extreme negative funding = shorts overextended = bet UP.
-    Requires BOTH OKX and Binance to agree on direction — filters false signals.
-    Threshold lowered to 0.0003 (was 0.0005) for more frequent firing.
+    Requires BOTH OKX and Gate.io to agree on direction.
+
+    Regime filter: funding is a slow-moving signal that can be stale.
+    Only fade when recent BTC momentum (30s) is ALREADY moving in the
+    crowded direction — confirming the crowding is still active and
+    price hasn't already digested it. This prevents fading a cold print.
+    Example: positive funding → longs crowded → fade DOWN, but only if
+    BTC has been ticking UP recently (confirming longs are still piling in).
     """
     try:
         okx_rate = _funding_cache["okx"]
@@ -1248,6 +1254,32 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
             _log_signal("Funding Reversion", market, secs_left,
                         signal_value=abs(avg_rate), threshold=THRESHOLD,
                         reason="exchanges_disagree_or_not_extreme")
+            return position
+
+        # Regime filter: confirm crowding is still active via 30s momentum.
+        # Positive funding = longs crowded = price should still be ticking UP.
+        # Negative funding = shorts crowded = price should still be ticking DOWN.
+        # If momentum has already reversed, the funding signal is stale — skip.
+        momentum = btc_momentum_pct(lookback_secs=30)
+        if momentum is None:
+            return position
+
+        crowded_direction = "UP" if avg_rate > 0 else "DOWN"
+        momentum_dir      = "UP" if momentum > 0 else "DOWN"
+        MOMENTUM_MIN      = 0.02  # price must have moved at least 0.02% in crowded direction
+
+        if momentum_dir != crowded_direction or abs(momentum) < MOMENTUM_MIN:
+            _log_signal("Funding Reversion", market, secs_left,
+                        signal_value=abs(momentum), threshold=MOMENTUM_MIN,
+                        reason="momentum_not_confirming_crowding")
+            return position
+
+        # Also skip if momentum is too strong — may still be accelerating, not ready to fade
+        MOMENTUM_MAX = 0.15  # above this, don't fade yet
+        if abs(momentum) > MOMENTUM_MAX:
+            _log_signal("Funding Reversion", market, secs_left,
+                        signal_value=abs(momentum), threshold=MOMENTUM_MAX,
+                        reason="momentum_too_strong_to_fade")
             return position
 
         if secs_left < 60:
@@ -1277,6 +1309,7 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
                         {"okx_rate":  round(okx_rate, 6),
                          "bnb_rate":  round(bnb_rate, 6),
                          "avg_rate":  round(avg_rate, 6),
+                         "momentum":  round(momentum, 4),
                          "intensity": round(intensity, 3)},
                         market)
             if not trade_id:
@@ -1378,6 +1411,12 @@ def strategy_basis_arb(market, secs_left, tracker, position):
     OKX mark price vs Coinbase spot.
     Futures at premium = convergence expected = bet DOWN.
     Futures at discount = convergence expected = bet UP.
+
+    Regime filter: do not fade basis when short-term momentum is strong
+    in the same direction as the premium/discount. A futures premium during
+    a BTC rip is momentum, not mispricing — fading it means shorting a move
+    that may still have legs. Only fade when momentum is weak or absent,
+    meaning the premium is genuinely stale relative to price action.
     """
     try:
         spot    = _basis_cache["spot"]
@@ -1393,6 +1432,22 @@ def strategy_basis_arb(market, secs_left, tracker, position):
                         signal_value=abs(basis_pct), threshold=0.10,
                         reason="basis_too_small")
             return position
+
+        # Regime filter: skip if 30s momentum is strong in the direction of the premium.
+        # Positive basis (futures premium) → we'd fade DOWN. If momentum is also DOWN
+        # (price already converging) that's fine. But if momentum is UP (premium growing),
+        # we're fading an accelerating move — skip.
+        momentum = btc_momentum_pct(lookback_secs=30)
+        if momentum is not None:
+            premium_direction = "UP" if basis_pct > 0 else "DOWN"
+            momentum_dir      = "UP" if momentum > 0 else "DOWN"
+            STRONG_MOMENTUM   = 0.08  # above this, premium may still be growing
+
+            if momentum_dir == premium_direction and abs(momentum) > STRONG_MOMENTUM:
+                _log_signal("Basis Arb", market, secs_left,
+                            signal_value=abs(momentum), threshold=STRONG_MOMENTUM,
+                            reason="momentum_confirms_premium_skip_fade")
+                return position
 
         if secs_left < 60:
             _log_signal("Basis Arb", market, secs_left,
@@ -1419,7 +1474,9 @@ def strategy_basis_arb(market, secs_left, tracker, position):
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
                         {"basis_pct": round(basis_pct, 4),
-                         "spot": round(spot, 2), "futures": round(futures, 2)},
+                         "momentum":  round(momentum, 4) if momentum is not None else 0.0,
+                         "spot":      round(spot, 2),
+                         "futures":   round(futures, 2)},
                         market)
             if not trade_id:
                 return position
@@ -1436,6 +1493,12 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
     Strategy 5: Polymarket odds mispricing.
     In first 2 minutes of market, if UP odds deviate 8%+ from 0.50,
     bet on reversion back toward 0.50.
+
+    Regime filter: only fade odds when external BTC signals are neutral
+    or conflicting. If Polymarket is 58/42 because BTC is genuinely
+    ripping, that's correct pricing not mispricing. Only fade when
+    30s BTC momentum is weak — meaning the deviation is likely a
+    Polymarket-specific overreaction, not a real directional signal.
     """
     try:
         if secs_left < 120:
@@ -1469,6 +1532,22 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
                         reason="deviation_too_small")
             return position
 
+        # Regime filter: check if BTC momentum justifies the deviation.
+        # If odds are high for UP and BTC is actually moving UP strongly,
+        # that's real — don't fade it.
+        # Only fade when momentum is weak (market is overreacting to noise).
+        momentum = btc_momentum_pct(lookback_secs=30)
+        if momentum is not None:
+            deviation_direction = "UP" if deviation > 0 else "DOWN"
+            momentum_dir        = "UP" if momentum > 0 else "DOWN"
+            MOMENTUM_JUSTIFY    = 0.05  # above this, odds deviation may be justified
+
+            if momentum_dir == deviation_direction and abs(momentum) > MOMENTUM_JUSTIFY:
+                _log_signal("Odds Mispricing", market, secs_left,
+                            signal_value=abs(momentum), threshold=MOMENTUM_JUSTIFY,
+                            reason="btc_momentum_justifies_odds_deviation")
+                return position
+
         direction = "DOWN" if deviation > 0 else "UP"
         intensity = min(abs(deviation) / 0.15, 1.0)
         price     = prices["fill_up"] if direction == "UP" else prices["fill_down"]
@@ -1477,7 +1556,9 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
 
         if tracker.balance >= MIN_BET:
             trade_id = tracker.open(direction, price, size,
-                        {"up_mid": round(up_mid, 4), "deviation": round(deviation, 4),
+                        {"up_mid":    round(up_mid, 4),
+                         "deviation": round(deviation, 4),
+                         "momentum":  round(momentum, 4) if momentum is not None else 0.0,
                          "secs_left": round(secs_left)},
                         market)
             if not trade_id:
