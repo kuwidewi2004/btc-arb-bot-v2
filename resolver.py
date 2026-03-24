@@ -132,6 +132,35 @@ def resolve_snapshots(outcome: str, condition_id: str):
         log.warning(f"Snapshot resolution failed: {e}")
 
 
+def resolve_signal_logs(outcome: str, condition_id: str):
+    """
+    Patch all signal_log rows for this condition_id with the resolved outcome.
+    This allows win-rate analysis on signals that did NOT fire (fired=False),
+    showing whether the signal direction was correct even when it didn't trade.
+    Requires: ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS resolved_outcome text;
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/signal_log",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=representation",
+            },
+            params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
+            json={"resolved_outcome": outcome},
+            timeout=10,
+        )
+        updated = resp.json() if resp.content else []
+        if updated:
+            log.info(f"Updated {len(updated)} signal_log row(s) for {condition_id[:12]}... → {outcome}")
+    except Exception as e:
+        log.warning(f"Signal log resolution failed: {e}")
+
+
 def fetch_strategy_summary() -> list:
     try:
         resp = requests.get(
@@ -329,6 +358,7 @@ def resolve_pending_trades():
                      f"age={age_secs:.0f}s | {trade.get('strategy','')} | "
                      f"{trade.get('question','')[:50]}")
             resolve_snapshots(outcome, condition_id)
+            resolve_signal_logs(outcome, condition_id)
             resolved_count += 1
 
     if skipped_young:
@@ -383,7 +413,8 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3 — CLOB API, patching by integer id")
+    log.info("Resolution Tracker v3.1 — CLOB API, patching by integer id")
+    log.info("Resolves: trades + signal_snapshots + signal_log")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Checking every {CHECK_INTERVAL}s")
 
