@@ -159,8 +159,14 @@ def _log_signal(strategy: str, market, secs_left: float,
         "threshold":       round(threshold, 6),
         "fired":           False,
         "reason":          reason,
+        # Regime labels — allows slicing win rates by market condition
+        "regime":          _regime.get("composite", "UNKNOWN"),
+        "session":         _regime.get("session", "UNKNOWN"),
+        "activity":        _regime.get("activity", "UNKNOWN"),
+        "day_type":        _regime.get("day_type", "UNKNOWN"),
     }
-    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f}")
+    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
+              f"| regime={entry['regime']} session={entry['session']}")
     supabase_signal_log(entry)
 
 
@@ -330,17 +336,21 @@ class StrategyTracker:
         # Outcome fields (actual_win, resolved_outcome, pnl, etc.) will be
         # patched later by resolver.py using trade_id as the key.
         supabase_insert({
-            "trade_id":       trade_id,
-            "strategy":       self.name,
-            "action":         "OPEN",
-            "side":           side,
-            "price":          price,
-            "size":           size,
-            "fee":            round(size * TAKER_FEE, 4),
-            "condition_id":   market.condition_id,
-            "question":       market.question,
+            "trade_id":        trade_id,
+            "strategy":        self.name,
+            "action":          "OPEN",
+            "side":            side,
+            "price":           price,
+            "size":            size,
+            "fee":             round(size * TAKER_FEE, 4),
+            "condition_id":    market.condition_id,
+            "question":        market.question,
             "market_end_time": market.end_time.isoformat(),
-            "signal_data":    signal_data,
+            "signal_data":     signal_data,
+            "regime":          _regime.get("composite", "UNKNOWN"),
+            "session":         _regime.get("session",   "UNKNOWN"),
+            "activity":        _regime.get("activity",  "UNKNOWN"),
+            "day_type":        _regime.get("day_type",  "UNKNOWN"),
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
                  f"portfolio=${self.portfolio.available():.2f} | trade_id={trade_id[:8]}... | "
@@ -436,6 +446,17 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
+_regime:         dict  = {
+    # Market microstructure regime — recomputed every poll cycle
+    "momentum_label":  "NEUTRAL",   # TREND_UP | TREND_DOWN | NEUTRAL
+    "volatility_label": "NORMAL",   # VOLATILE | NORMAL | DEAD
+    "flow_label":      "BALANCED",  # LONG_CROWDED | SHORT_CROWDED | BALANCED
+    "composite":       "CALM",      # TREND_UP | TREND_DOWN | CALM | VOLATILE | DEAD
+    # Time-of-day / calendar regime — stable within a session
+    "session":         "UNKNOWN",   # ASIA | LONDON | US | OVERLAP | OFFPEAK
+    "day_type":        "WEEKDAY",   # WEEKDAY | WEEKEND
+    "activity":        "NORMAL",    # HIGH | NORMAL | LOW | DEAD
+}
 _btc_history:    deque = deque(maxlen=12)  # last 60s of BTC prices (5s poll = 12 readings)
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
@@ -626,6 +647,110 @@ def refresh_shared_data():
                   f"spread={spread_pct:.4f}%")
     except Exception as e:
         log.warning(f"OB pressure fetch failed: {e}")
+def compute_regime():
+    """
+    Compute market regime labels once per poll cycle.
+    Writes to _regime dict so all strategies read a consistent snapshot
+    rather than each computing their own momentum independently.
+
+    Two axes:
+      1. Microstructure regime  — what the market is doing RIGHT NOW
+      2. Calendar regime        — what session/day we're in (structural baseline)
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── 1. CALENDAR REGIME ────────────────────────────────────────────────────
+    hour    = now.hour
+    weekday = now.weekday()  # 0=Monday, 6=Sunday
+    is_weekend = weekday >= 5
+
+    # Trading sessions (UTC)
+    if 0 <= hour < 6:
+        session = "ASIA" if hour >= 1 else "OFFPEAK"
+    elif 6 <= hour < 8:
+        session = "LONDON"
+    elif 8 <= hour < 12:
+        session = "OVERLAP"   # London + early US
+    elif 12 <= hour < 17:
+        session = "US"
+    elif 17 <= hour < 21:
+        session = "OFFPEAK"
+    else:
+        session = "ASIA"      # late UTC = early Asia
+
+    day_type = "WEEKEND" if is_weekend else "WEEKDAY"
+
+    # Activity level based on session + day
+    if is_weekend:
+        activity = "LOW"
+    elif session in ("US", "OVERLAP"):
+        activity = "HIGH"
+    elif session == "LONDON":
+        activity = "NORMAL"
+    elif session == "ASIA":
+        activity = "NORMAL"
+    else:
+        activity = "LOW"      # OFFPEAK
+
+    _regime["session"]  = session
+    _regime["day_type"] = day_type
+    _regime["activity"] = activity
+
+    # ── 2. MICROSTRUCTURE REGIME ──────────────────────────────────────────────
+    momentum   = btc_momentum_pct(lookback_secs=30) or 0.0
+    vol_range  = _vol_cache.get("range_pct", 0.0)
+    ob_imbal   = _ob_cache.get("imbalance", 0.0)
+    funding    = _funding_cache.get("rate", 0.0)
+
+    # Momentum label
+    if momentum > 0.08 and ob_imbal > 0.10:
+        momentum_label = "TREND_UP"
+    elif momentum < -0.08 and ob_imbal < -0.10:
+        momentum_label = "TREND_DOWN"
+    else:
+        momentum_label = "NEUTRAL"
+
+    # Volatility label
+    if vol_range > 0.25:
+        volatility_label = "VOLATILE"
+    elif vol_range < 0.04:
+        volatility_label = "DEAD"
+    else:
+        volatility_label = "NORMAL"
+
+    # Flow/crowding label
+    if funding > 0.0003 and momentum > 0:
+        flow_label = "LONG_CROWDED"
+    elif funding < -0.0003 and momentum < 0:
+        flow_label = "SHORT_CROWDED"
+    else:
+        flow_label = "BALANCED"
+
+    # Composite label — single string for logging and strategy gating
+    if volatility_label == "DEAD":
+        composite = "DEAD"
+    elif volatility_label == "VOLATILE" and momentum_label == "NEUTRAL":
+        composite = "VOLATILE"
+    elif momentum_label == "TREND_UP":
+        composite = "TREND_UP"
+    elif momentum_label == "TREND_DOWN":
+        composite = "TREND_DOWN"
+    else:
+        composite = "CALM"
+
+    _regime["momentum_label"]   = momentum_label
+    _regime["volatility_label"] = volatility_label
+    _regime["flow_label"]       = flow_label
+    _regime["composite"]        = composite
+
+    log.debug(
+        f"Regime: {composite} | session={session} ({day_type}/{activity}) | "
+        f"momentum={momentum:+.3f}% | vol={vol_range:.3f}% | "
+        f"ob={ob_imbal:+.3f} | flow={flow_label}"
+    )
+
+
+# ------------------------------------------------- CHAINLINK WEBSOCKET CACHE --
 # Polymarket broadcasts the exact Chainlink price it uses for resolution
 # via wss://ws-subscriptions-clob.polymarket.com/ws/ on topic
 # crypto_prices_chainlink. We subscribe in a background thread and keep
@@ -1811,6 +1936,7 @@ def run():
                 continue
 
             refresh_shared_data()
+            compute_regime()
 
             # Refresh market every 60s
             if time.time() - last_market_fetch > 60:
@@ -1846,7 +1972,9 @@ def run():
             basis   = (futures - spot) / spot * 100 if spot > 0 and futures > 0 else 0.0
 
             log.info(f"BTC=${spot:.2f} | {secs_left:.0f}s left | "
-                     f"funding={_funding_cache['rate']:+.6f} | basis={basis:+.3f}%")
+                     f"funding={_funding_cache['rate']:+.6f} | basis={basis:+.3f}% | "
+                     f"regime={_regime['composite']} | session={_regime['session']} | "
+                     f"activity={_regime['activity']}")
 
             # Run all 7 strategies
             positions["chainlink"]   = strategy_chainlink_arb(
