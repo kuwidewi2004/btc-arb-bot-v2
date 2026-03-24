@@ -391,9 +391,10 @@ class SharedPortfolio:
             return self._exposure.get(condition_id, {}).get(direction, 0.0)
 
     def exposure_cap_remaining(self, condition_id: str, direction: str) -> float:
-        """How much more size is allowed in this direction before hitting the cap."""
+        """How much more size is allowed in this direction before hitting the cap.
+        Based on start_bal so opening order doesn't affect the cap."""
         with self._lock:
-            cap       = self.balance * MAX_DIRECTIONAL_EXPOSURE
+            cap       = self.start_bal * MAX_DIRECTIONAL_EXPOSURE
             committed = self._exposure.get(condition_id, {}).get(direction, 0.0)
             return max(0.0, cap - committed)
 
@@ -475,7 +476,9 @@ class StrategyTracker:
             return ""
 
         fee = size * TAKER_FEE
-        self.portfolio.debit(size, fee, market.condition_id, side)
+        # Debit only the stake on open — fees handled on close to avoid double-counting.
+        # Open fee is tracked for Supabase record-keeping only, not deducted from portfolio.
+        self.portfolio.debit(size, 0.0, market.condition_id, side)
         trade_id = str(uuid.uuid4())
 
         entry = {
@@ -532,7 +535,7 @@ class StrategyTracker:
             pnl = (exit_price - entry_price) * size / entry_price
         else:
             pnl = (entry_price - exit_price) * size / entry_price
-        # Round-trip fee: open taker + close taker — matches resolver.py accounting
+        # Subtract round-trip fees: open taker (not previously debited) + close taker
         fee = size * TAKER_FEE * 2
         pnl -= fee
         self.portfolio.credit(size + pnl, market.condition_id, side, size)
@@ -2215,6 +2218,12 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
         if not condition_id or not strategy_name or not side or size <= 0:
             continue
 
+        # Validate strategy name BEFORE any balance mutation
+        strategy_key = strategy_key_map.get(strategy_name)
+        if not strategy_key:
+            log.warning(f"State restore: unknown strategy name '{strategy_name}' — skipping without debit")
+            continue
+
         # Parse market end time
         try:
             end_time = datetime.fromisoformat(
@@ -2228,9 +2237,8 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
                      f"({strategy_name} on {condition_id[:12]}...)")
             continue
 
-        # Re-register exposure in portfolio — deduct size+fee from balance
-        # Use _lock-safe debit to restore the pre-restart state
-        portfolio.debit(size, fee, condition_id, side)
+        # Re-register exposure — debit only size (fees handled on close, consistent with open())
+        portfolio.debit(size, 0.0, condition_id, side)
 
         # Reconstruct a minimal StrategyTrade so the main loop knows
         # this strategy already has a position on this market
@@ -2249,11 +2257,6 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
             market      = market,
         )
         st.trade_id = trade_id
-
-        strategy_key = strategy_key_map.get(strategy_name)
-        if not strategy_key:
-            log.warning(f"State restore: unknown strategy name '{strategy_name}' — skipping")
-            continue
 
         if condition_id not in restored:
             restored[condition_id] = {}
