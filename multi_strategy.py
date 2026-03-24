@@ -586,25 +586,24 @@ def refresh_shared_data():
         except Exception as e:
             log.warning(f"Volume fetch failed: {e}")
 
-    # Binance futures order book imbalance — refreshed every 5s (every poll cycle)
-    # Uses top 10 levels on each side, depth weighted by size not just count
+    # OKX futures order book imbalance — refreshed every poll cycle
+    # Uses top 20 levels on each side, depth weighted by size
     try:
-        BINANCE_FUTURES = "https://fapi.binance.com"
         r = requests.get(
-            f"{BINANCE_FUTURES}/fapi/v1/depth",
-            params={"symbol": "BTCUSDT", "limit": 20},
+            f"{OKX_BASE}/api/v5/market/books",
+            params={"instId": OKX_BTC, "sz": "20"},
             timeout=4,
         )
         r.raise_for_status()
-        book      = r.json()
-        bid_depth = sum(float(b[1]) for b in book.get("bids", []))
-        ask_depth = sum(float(a[1]) for a in book.get("asks", []))
+        data      = r.json().get("data", [{}])[0]
+        bids_raw  = data.get("bids", [])   # each entry: [price, size, ...]
+        asks_raw  = data.get("asks", [])
+        bid_depth = sum(float(b[1]) for b in bids_raw)
+        ask_depth = sum(float(a[1]) for a in asks_raw)
         total     = bid_depth + ask_depth
         imbalance = (bid_depth - ask_depth) / total if total > 0 else 0.0
-        bids      = book.get("bids", [])
-        asks      = book.get("asks", [])
-        best_bid  = float(bids[0][0]) if bids else 0.0
-        best_ask  = float(asks[0][0]) if asks else 0.0
+        best_bid  = float(bids_raw[0][0]) if bids_raw else 0.0
+        best_ask  = float(asks_raw[0][0]) if asks_raw else 0.0
         mid       = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
         spread_pct = (best_ask - best_bid) / mid * 100 if mid > 0 else 0.0
         _ob_cache["imbalance"]  = round(imbalance, 4)
