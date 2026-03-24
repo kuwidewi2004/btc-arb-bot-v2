@@ -1,7 +1,7 @@
 """
-Multi-Strategy Mechanical Edge Simulator v3
-=============================================
-Runs 6 independent mechanical edge strategies simultaneously in dry run.
+Multi-Strategy Mechanical Edge Simulator v3.2
+==============================================
+Runs 7 independent mechanical edge strategies simultaneously in dry run.
 
 Strategies:
   1. Chainlink lag arb     — Coinbase (real-time) vs Chainlink (lagging oracle)
@@ -10,6 +10,7 @@ Strategies:
   4. Basis arbitrage       — futures premium/discount mean reversion (OKX data)
   5. Odds mispricing       — Polymarket odds deviating from 50/50
   6. Volume clock          — aggressive order flow before resolution
+  7. OB pressure           — Binance futures order book imbalance
 
 Data sources (all work on Railway US servers):
   - Spot prices:    Coinbase + Kraken fallback
@@ -35,6 +36,20 @@ CHANGES (v3.1):
     data.chain.link proxy which showed stale display-only data
   - Background thread maintains WebSocket connection with auto-reconnect
   - fetch_chainlink_price() now reads from shared in-memory cache
+
+CHANGES (v3.2):
+  - All HTTP calls use a shared requests.Session with retry + exponential
+    backoff (3 retries, 0.5s backoff, retries on 429/5xx)
+  - StrategyTracker.close() PnL formula corrected to binary options payoff:
+      WIN:  size * (1/entry_price - 1) - round_trip_fees
+      LOSS: -size - round_trip_fees
+    Previously used CFD-style formula which was wrong for non-0/1 exit prices
+  - kelly_size() returns 0.0 (not MIN_BET) when entry_price is 0 or 1
+  - _binance_liq_buffer switched from list to deque; pop(0) → popleft() O(1)
+  - SharedPortfolio._wins/_losses mutations moved inside _lock
+  - fetch_win_rates() and restore_state_from_supabase() use paginated
+    Supabase fetches via _sb_fetch_all() — no more silent 1000-row truncation
+  - import math moved to top-level (was inside compute_regime() every cycle)
 """
 
 import os
@@ -50,7 +65,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 from collections import deque
 
+import math
+
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import numpy as np
 import websocket
 
@@ -108,23 +127,11 @@ def fetch_win_rates() -> dict:
     if not SUPABASE_URL or not SUPABASE_KEY:
         return {}
     try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/trades",
-            headers={
-                "apikey":        SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type":  "application/json",
-                "Range":         "0-9999",
-            },
-            params={
-                "action":           "eq.OPEN",
-                "resolved_outcome": "not.is.null",
-                "select":           "strategy,actual_win",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        rows = resp.json()
+        rows = _sb_fetch_all("trades", {
+            "action":           "eq.OPEN",
+            "resolved_outcome": "not.is.null",
+            "select":           "strategy,actual_win",
+        })
     except Exception as e:
         log.warning(f"fetch_win_rates: Supabase query failed — {e}")
         return {}
@@ -180,7 +187,7 @@ def kelly_size(intensity: float, entry_price: float, bankroll: float,
     Returns 0.0 if Kelly is zero or negative (no edge at this price).
     """
     if entry_price <= 0 or entry_price >= 1:
-        return MIN_BET
+        return 0.0
 
     # Net odds on a Polymarket binary
     b = (1.0 / entry_price) - 1.0
@@ -230,12 +237,84 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 
+# --------------------------------------------------------- HTTP SESSION ------
+
+def _make_session() -> requests.Session:
+    """Shared session with retry + exponential backoff for all HTTP calls."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,          # 0.5s, 1s, 2s between retries
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET", "POST", "PATCH"},
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://",  adapter)
+    return session
+
+_session = _make_session()
+
+
+# --------------------------------------------------------- SUPABASE HELPERS --
+
+_SB_PAGE_SIZE = 1000
+
+
+def _sb_fetch_all(table: str, params: dict) -> list:
+    """
+    Paginate through Supabase results using Content-Range header.
+    Supabase returns 'Content-Range: 0-999/2345' — we iterate until all
+    rows are fetched rather than silently truncating at page size.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    rows   = []
+    offset = 0
+    while True:
+        range_header = f"{offset}-{offset + _SB_PAGE_SIZE - 1}"
+        try:
+            resp = _session.get(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers={
+                    "apikey":        SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type":  "application/json",
+                    "Range":         range_header,
+                },
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            page = resp.json()
+            if not page:
+                break
+            rows.extend(page)
+            content_range = resp.headers.get("Content-Range", "")
+            if "/" in content_range:
+                try:
+                    total = int(content_range.split("/")[1])
+                    if offset + _SB_PAGE_SIZE >= total:
+                        break
+                except ValueError:
+                    break
+            else:
+                if len(page) < _SB_PAGE_SIZE:
+                    break
+            offset += _SB_PAGE_SIZE
+        except Exception as e:
+            log.warning(f"Supabase paginated fetch failed ({table}, offset={offset}): {e}")
+            break
+    return rows
+
+
 def supabase_insert(record: dict):
     """Insert a trade record into Supabase. Never blocks on failure."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        requests.post(
+        _session.post(
             f"{SUPABASE_URL}/rest/v1/trades",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -271,7 +350,7 @@ def supabase_signal_log(entry: dict):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        requests.post(
+        _session.post(
             f"{SUPABASE_URL}/rest/v1/signal_log",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -295,7 +374,7 @@ def supabase_market_snapshot(snapshot: dict):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        requests.post(
+        _session.post(
             f"{SUPABASE_URL}/rest/v1/market_snapshots",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -422,17 +501,23 @@ class SharedPortfolio:
             self._exposure.pop(condition_id, None)
 
     def record_win(self, strategy: str):
-        self._wins[strategy]   = self._wins.get(strategy, 0) + 1
+        with self._lock:
+            self._wins[strategy] = self._wins.get(strategy, 0) + 1
 
     def record_loss(self, strategy: str):
-        self._losses[strategy] = self._losses.get(strategy, 0) + 1
+        with self._lock:
+            self._losses[strategy] = self._losses.get(strategy, 0) + 1
 
     def summary_lines(self) -> list:
-        lines = [f"Portfolio balance: ${self.balance:.2f} | "
-                 f"PnL={self.balance - self.start_bal:+.2f}"]
-        for name in sorted(set(list(self._wins) + list(self._losses))):
-            w = self._wins.get(name, 0)
-            l = self._losses.get(name, 0)
+        with self._lock:
+            wins_copy   = dict(self._wins)
+            losses_copy = dict(self._losses)
+            bal         = self.balance
+        lines = [f"Portfolio balance: ${bal:.2f} | "
+                 f"PnL={bal - self.start_bal:+.2f}"]
+        for name in sorted(set(list(wins_copy) + list(losses_copy))):
+            w = wins_copy.get(name, 0)
+            l = losses_copy.get(name, 0)
             total = w + l
             wr    = (w / total * 100) if total else 0
             lines.append(f"  {name}: WR={wr:.0f}% ({w}W/{l}L) — ground truth in Supabase")
@@ -530,22 +615,29 @@ class StrategyTracker:
         """
         Updates shared portfolio balance and per-strategy win/loss counters only.
         Does NOT write to Supabase — resolver.py owns all outcome writes.
+
+        Binary options payoff (matches resolver.py exactly):
+          WIN:  pnl = size * (1/entry_price - 1) - round_trip_fees
+          LOSS: pnl = -size - round_trip_fees
+        exit_price == 1.0 means won, 0.0 means lost.
         """
-        if side == "UP":
-            pnl = (exit_price - entry_price) * size / entry_price
+        won = exit_price >= 0.5
+        fee = size * TAKER_FEE * 2   # round-trip: open taker + close taker
+        if won:
+            pnl = size * (1.0 / entry_price - 1.0) - fee
         else:
-            pnl = (entry_price - exit_price) * size / entry_price
-        # Subtract round-trip fees: open taker (not previously debited) + close taker
-        fee = size * TAKER_FEE * 2
-        pnl -= fee
-        self.portfolio.credit(size + pnl, market.condition_id, side, size)
+            pnl = -size - fee
+
+        self.portfolio.credit(size + pnl if won else max(0.0, size + pnl),
+                              market.condition_id, side, size)
         if pnl > 0:
             self.portfolio.record_win(self.name)
         else:
             self.portfolio.record_loss(self.name)
 
-        w     = self.portfolio._wins.get(self.name, 0)
-        l     = self.portfolio._losses.get(self.name, 0)
+        with self.portfolio._lock:
+            w     = self.portfolio._wins.get(self.name, 0)
+            l     = self.portfolio._losses.get(self.name, 0)
         total = w + l
         wr    = (w / total * 100) if total else 0
 
@@ -597,8 +689,9 @@ class StrategyTracker:
                  f"portfolio=${self.portfolio.available():.2f}")
 
     def summary(self) -> str:
-        w     = self.portfolio._wins.get(self.name, 0)
-        l     = self.portfolio._losses.get(self.name, 0)
+        with self.portfolio._lock:
+            w = self.portfolio._wins.get(self.name, 0)
+            l = self.portfolio._losses.get(self.name, 0)
         total = w + l
         wr    = (w / total * 100) if total else 0
         return (f"{self.name}: WR={wr:.0f}% | {total} trades (local estimate — "
@@ -649,7 +742,7 @@ def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
     coin_map   = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD"}
     kraken_map = {"BTCUSDT": "XBTUSD",  "ETHUSDT": "ETHUSD"}
     try:
-        r = requests.get(
+        r = _session.get(
             f"https://api.coinbase.com/v2/prices/{coin_map.get(symbol,'BTC-USD')}/spot",
             timeout=5)
         r.raise_for_status()
@@ -657,7 +750,7 @@ def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
     except Exception:
         pass
     try:
-        r = requests.get(
+        r = _session.get(
             f"https://api.kraken.com/0/public/Ticker?pair={kraken_map.get(symbol,'XBTUSD')}",
             timeout=5)
         r.raise_for_status()
@@ -684,7 +777,7 @@ def refresh_shared_data():
     # Funding rate — OKX + Binance, both required for signal agreement
     if now - _funding_cache["fetched_at"] >= 60:
         try:
-            r = requests.get(
+            r = _session.get(
                 f"{OKX_BASE}/api/v5/public/funding-rate",
                 params={"instId": OKX_BTC},
                 timeout=5)
@@ -696,7 +789,7 @@ def refresh_shared_data():
             log.warning(f"OKX funding fetch failed: {e}")
 
         try:
-            r = requests.get(
+            r = _session.get(
                 "https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT",
                 timeout=5)
             r.raise_for_status()
@@ -715,7 +808,7 @@ def refresh_shared_data():
     # Basis via OKX mark price vs spot
     if now - _basis_cache["fetched_at"] >= 10:
         try:
-            r = requests.get(
+            r = _session.get(
                 f"{OKX_BASE}/api/v5/public/mark-price",
                 params={"instType": "SWAP", "instId": OKX_BTC},
                 timeout=5)
@@ -732,7 +825,7 @@ def refresh_shared_data():
     # inside strategy_liquidation_cascade() with a matching 2-minute window.
     if now - _liq_cache["fetched_at"] >= 60:
         try:
-            r = requests.get(
+            r = _session.get(
                 f"{OKX_BASE}/api/v5/public/liquidation-orders",
                 params={"instType": "SWAP", "uly": "BTC-USDT",
                         "state": "filled", "limit": "20"},
@@ -758,7 +851,7 @@ def refresh_shared_data():
     global _vol_cache
     if now - _vol_cache["fetched_at"] >= 60:
         try:
-            r = requests.get(
+            r = _session.get(
                 f"{OKX_BASE}/api/v5/market/candles",
                 params={"instId": OKX_BTC, "bar": "1m", "limit": "5"},
                 timeout=5)
@@ -779,7 +872,7 @@ def refresh_shared_data():
     global _volume_fetched
     if now - _volume_fetched >= 60:
         try:
-            r = requests.get(
+            r = _session.get(
                 f"{OKX_BASE}/api/v5/market/candles",
                 params={"instId": OKX_BTC, "bar": "1m", "limit": "22"},
                 timeout=8)
@@ -803,7 +896,7 @@ def refresh_shared_data():
     # OKX futures order book imbalance — refreshed every poll cycle
     # Uses top 20 levels on each side, depth weighted by size
     try:
-        r = requests.get(
+        r = _session.get(
             f"{OKX_BASE}/api/v5/market/books",
             params={"instId": OKX_BTC, "sz": "20"},
             timeout=4,
@@ -926,7 +1019,6 @@ def compute_regime():
     _regime["composite"]        = composite
 
     # ── 3. CONTINUOUS SCORES ──────────────────────────────────────────────────
-    import math
 
     # Momentum score: tanh-scaled so ±0.08% maps to ±0.66, ±0.20% maps to ±0.97
     # Smooth gradient — model sees "how much" not just "which side of threshold"
@@ -1113,7 +1205,7 @@ def fetch_chainlink_price() -> tuple:
 # window. The OKX REST poll and this WebSocket feed are combined in
 # _liq_cache so the liquidation cascade strategy sees the full market picture.
 
-_binance_liq_buffer: list = []   # raw events: {"side": "BUY"|"SELL", "usd": float, "ts": ms}
+_binance_liq_buffer: deque = deque()   # raw events: {"side": "BUY"|"SELL", "usd": float, "ts": ms}
 _binance_liq_lock = threading.Lock()
 _BINANCE_LIQ_WS   = "wss://fstream.binance.com/ws/!forceOrder@arr"
 
@@ -1135,7 +1227,7 @@ def _on_binance_liq_message(ws, message):
             # Keep only last 10 minutes of events to bound memory
             cutoff = (time.time() - 600) * 1000
             while _binance_liq_buffer and _binance_liq_buffer[0]["ts"] < cutoff:
-                _binance_liq_buffer.pop(0)
+                _binance_liq_buffer.popleft()
         log.debug(f"[Binance Liq] {side} ${usd:,.0f} BTCUSDT")
     except Exception as e:
         log.warning(f"[Binance Liq] message parse error: {e}")
@@ -1241,7 +1333,7 @@ def fetch_current_market() -> Optional[Market]:
         for window_ts in [current_5m + 300, current_5m + 600, current_5m + 900]:
             slug = f"btc-updown-5m-{window_ts}"
             try:
-                r = requests.get(f"{GAMMA_API}/markets",
+                r = _session.get(f"{GAMMA_API}/markets",
                                  params={"slug": slug}, timeout=10)
                 r.raise_for_status()
                 markets = r.json()
@@ -1325,9 +1417,9 @@ def fetch_poly_prices(market: Market, size_usdc: float = 50.0) -> dict:
     do not use as entry price.
     """
     try:
-        up_book   = requests.get(f"{POLYMARKET_HOST}/book",
+        up_book   = _session.get(f"{POLYMARKET_HOST}/book",
                                  params={"token_id": market.up_token_id},   timeout=8).json()
-        down_book = requests.get(f"{POLYMARKET_HOST}/book",
+        down_book = _session.get(f"{POLYMARKET_HOST}/book",
                                  params={"token_id": market.down_token_id}, timeout=8).json()
 
         up_asks   = sorted(up_book.get("asks",   []), key=lambda x: float(x["price"]))
@@ -1392,7 +1484,7 @@ def fetch_market_winner(condition_id: str) -> Optional[str]:
             return "VOID"
 
         try:
-            r = requests.get(
+            r = _session.get(
                 f"{GAMMA_API}/markets",
                 params={"conditionId": condition_id},
                 timeout=10,
@@ -2162,24 +2254,12 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
         return {}
 
     try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/trades",
-            headers={
-                "apikey":        SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type":  "application/json",
-                "Range":         "0-999",
-            },
-            params={
-                "action":           "eq.OPEN",
-                "resolved_outcome": "is.null",
-                "select":           "id,trade_id,strategy,side,price,size,fee,"
-                                    "condition_id,question,market_end_time",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        open_trades = resp.json()
+        open_trades = _sb_fetch_all("trades", {
+            "action":           "eq.OPEN",
+            "resolved_outcome": "is.null",
+            "select":           "id,trade_id,strategy,side,price,size,fee,"
+                                "condition_id,question,market_end_time",
+        })
     except Exception as e:
         log.warning(f"State restore failed — could not fetch open trades: {e}")
         return {}
@@ -2419,8 +2499,6 @@ def run():
             # Write one row per poll cycle with ALL signal values simultaneously.
             # resolved_outcome patched later by resolver.py.
             try:
-                import math
-
                 cl_price, cl_age = fetch_chainlink_price()
                 cl_div = round((spot - cl_price) / cl_price * 100, 6) if cl_price else 0.0
 
