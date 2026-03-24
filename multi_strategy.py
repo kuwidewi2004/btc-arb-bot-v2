@@ -1307,9 +1307,9 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         short_liqs = _liq_cache["short"] + binance["short"]
         total      = long_liqs + short_liqs
 
-        if total < 300_000:
+        if total < 10_000:
             _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=300_000,
+                        signal_value=total, threshold=10_000,
                         reason="liquidation_volume_too_low")
             return position
 
@@ -1339,7 +1339,7 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         # Low volatility = liquidations are surprising = stronger signal
         vol_range = _vol_cache.get("range_pct", 0.1)
         vol_range = max(vol_range, 0.05)  # floor to avoid division by zero
-        raw_intensity    = min(total / 2_000_000, 1.0)
+        raw_intensity    = min(total / 500_000, 1.0)
         vol_scalar       = max(0.3, min(1.0, 0.15 / vol_range))  # inverse vol
         adjusted_intensity = min(raw_intensity * vol_scalar, 1.0)
 
