@@ -613,15 +613,29 @@ _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
-    "momentum_label":  "NEUTRAL",   # TREND_UP | TREND_DOWN | NEUTRAL
+    "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
     "volatility_label": "NORMAL",   # VOLATILE | NORMAL | DEAD
-    "flow_label":      "BALANCED",  # LONG_CROWDED | SHORT_CROWDED | BALANCED
-    "composite":       "CALM",      # TREND_UP | TREND_DOWN | CALM | VOLATILE | DEAD
-    # Time-of-day / calendar regime — stable within a session
-    "session":         "UNKNOWN",   # ASIA | LONDON | US | OVERLAP | OFFPEAK
-    "day_type":        "WEEKDAY",   # WEEKDAY | WEEKEND
-    "activity":        "NORMAL",    # HIGH | NORMAL | LOW | DEAD
+    "flow_label":       "BALANCED", # LONG_CROWDED | SHORT_CROWDED | BALANCED
+    "composite":        "CALM",     # TREND_UP | TREND_DOWN | CALM | VOLATILE | DEAD
+    # Continuous scores — smooth versions for ML (no information loss at boundaries)
+    "momentum_score":   0.0,        # -1 to +1, tanh-scaled 30s BTC momentum
+    "volatility_pct":   0.5,        # 0 to 1, percentile of vol vs recent 24h history
+    "flow_score":       0.0,        # -1 to +1, combined directional flow pressure
+    "liquidity_score":  1.0,        # 0 to 1, higher = more liquid / tighter spread
+    "funding_zscore":   0.0,        # z-score of funding vs recent 24h history
+    # Cyclical time encoding — preserves continuity across midnight/week boundaries
+    "hour_sin":         0.0,        # sin(2π * hour/24)
+    "hour_cos":         1.0,        # cos(2π * hour/24)
+    "dow_sin":          0.0,        # sin(2π * weekday/7)
+    "dow_cos":          1.0,        # cos(2π * weekday/7)
+    # Calendar labels (kept for human readability and categorical ML features)
+    "session":          "UNKNOWN",  # ASIA | LONDON | OVERLAP | US | OFFPEAK
+    "day_type":         "WEEKDAY",  # WEEKDAY | WEEKEND
+    "activity":         "NORMAL",   # HIGH | NORMAL | LOW | DEAD
 }
+# Rolling 24h histories for percentile / z-score computation (~288 samples at 5min intervals)
+_vol_history_pct:     deque = deque(maxlen=288)
+_funding_history_pct: deque = deque(maxlen=288)
 _btc_history:    deque = deque(maxlen=12)  # last 60s of BTC prices (5s poll = 12 readings)
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
@@ -908,10 +922,75 @@ def compute_regime():
     _regime["flow_label"]       = flow_label
     _regime["composite"]        = composite
 
+    # ── 3. CONTINUOUS SCORES ──────────────────────────────────────────────────
+    import math
+
+    # Momentum score: tanh-scaled so ±0.08% maps to ±0.66, ±0.20% maps to ±0.97
+    # Smooth gradient — model sees "how much" not just "which side of threshold"
+    momentum_score = round(math.tanh(momentum / 0.10), 4)
+
+    # Volatility percentile: where does today's vol_range sit vs recent 24h history
+    _vol_history_pct.append(vol_range)
+    if len(_vol_history_pct) >= 10:
+        sorted_vols = sorted(_vol_history_pct)
+        rank = sum(1 for v in sorted_vols if v <= vol_range)
+        volatility_pct = round(rank / len(sorted_vols), 4)
+    else:
+        volatility_pct = 0.5  # not enough history yet, use neutral prior
+
+    # Flow score: weighted combination of OB imbalance, liquidation imbalance, volume
+    binance_liq  = get_binance_liq_2min()
+    liq_long     = _liq_cache.get("long", 0.0)  + binance_liq["long"]
+    liq_short    = _liq_cache.get("short", 0.0) + binance_liq["short"]
+    liq_total    = liq_long + liq_short
+    liq_imbal    = (liq_long - liq_short) / liq_total if liq_total > 0 else 0.0
+
+    candles      = list(_volume_history)
+    recent       = candles[-3:] if len(candles) >= 3 else []
+    total_vol    = sum(c["volume"] for c in recent)
+    buy_vol      = sum(c["buy_vol"] for c in recent)
+    buy_ratio    = (buy_vol / total_vol) if total_vol > 0 else 0.5
+    vol_flow     = (buy_ratio - 0.5) * 2  # -1 to +1
+
+    # Weighted combination: OB imbalance most responsive, liq most impactful, vol confirmatory
+    flow_score = round(ob_imbal * 0.40 + liq_imbal * 0.40 + vol_flow * 0.20, 4)
+
+    # Liquidity score: inverse of OB spread — tight spread = liquid market
+    ob_spread    = _ob_cache.get("spread_pct", 1.0)
+    MAX_SPREAD   = 0.05  # above this = very illiquid
+    liquidity_score = round(max(0.0, 1.0 - (ob_spread / MAX_SPREAD)), 4)
+
+    # Funding z-score: how extreme is current funding vs recent history
+    _funding_history_pct.append(funding)
+    if len(_funding_history_pct) >= 10:
+        f_mean = sum(_funding_history_pct) / len(_funding_history_pct)
+        f_std  = (sum((x - f_mean) ** 2 for x in _funding_history_pct) / len(_funding_history_pct)) ** 0.5
+        funding_zscore = round((funding - f_mean) / f_std, 4) if f_std > 0 else 0.0
+    else:
+        funding_zscore = 0.0
+
+    # Cyclical time encoding — preserves continuity at midnight and end of week
+    hour_sin = round(math.sin(2 * math.pi * now.hour / 24), 4)
+    hour_cos = round(math.cos(2 * math.pi * now.hour / 24), 4)
+    dow_sin  = round(math.sin(2 * math.pi * now.weekday() / 7), 4)
+    dow_cos  = round(math.cos(2 * math.pi * now.weekday() / 7), 4)
+
+    _regime["momentum_score"]  = momentum_score
+    _regime["volatility_pct"]  = volatility_pct
+    _regime["flow_score"]      = flow_score
+    _regime["liquidity_score"] = liquidity_score
+    _regime["funding_zscore"]  = funding_zscore
+    _regime["hour_sin"]        = hour_sin
+    _regime["hour_cos"]        = hour_cos
+    _regime["dow_sin"]         = dow_sin
+    _regime["dow_cos"]         = dow_cos
+
     log.debug(
         f"Regime: {composite} | session={session} ({day_type}/{activity}) | "
-        f"momentum={momentum:+.3f}% | vol={vol_range:.3f}% | "
-        f"ob={ob_imbal:+.3f} | flow={flow_label}"
+        f"momentum={momentum:+.3f}% (score={momentum_score:+.2f}) | "
+        f"vol={vol_range:.3f}% (pct={volatility_pct:.2f}) | "
+        f"flow={flow_score:+.3f} | liq={liquidity_score:.2f} | "
+        f"funding_z={funding_zscore:+.2f}"
     )
 
 
@@ -2359,7 +2438,7 @@ def run():
                     "ob_spread_pct":      round(_ob_cache.get("spread_pct", 0.0), 6),
                     # Volume signal
                     "volume_buy_ratio":   buy_ratio,
-                    # Regime
+                    # Regime labels (categorical)
                     "regime":             _regime["composite"],
                     "momentum_label":     _regime["momentum_label"],
                     "volatility_label":   _regime["volatility_label"],
@@ -2367,6 +2446,16 @@ def run():
                     "session":            _regime["session"],
                     "activity":           _regime["activity"],
                     "day_type":           _regime["day_type"],
+                    # Continuous regime scores (for ML)
+                    "momentum_score":     _regime["momentum_score"],
+                    "volatility_pct":     _regime["volatility_pct"],
+                    "flow_score":         _regime["flow_score"],
+                    "liquidity_score":    _regime["liquidity_score"],
+                    "funding_zscore":     _regime["funding_zscore"],
+                    "hour_sin":           _regime["hour_sin"],
+                    "hour_cos":           _regime["hour_cos"],
+                    "dow_sin":            _regime["dow_sin"],
+                    "dow_cos":            _regime["dow_cos"],
                     # Label — patched by resolver when market settles
                     "resolved_outcome":   None,
                 })
