@@ -2308,13 +2308,14 @@ def run():
     last_winrate_fetch = time.time()
 
     # Per-market state for delta and opening price computations
-    market_open_price:  float = 0.0   # BTC price at start of current market
-    cl_open_price:      float = 0.0   # Chainlink price at start of current market
-    prev_liq_total:     float = 0.0   # liq_total from previous poll cycle
-    prev_liq_total_30s: float = 0.0   # liq_total from ~30s ago (for acceleration)
-    prev_ob_bid_depth:  float = 0.0   # OB bid depth from previous cycle
-    prev_ob_ask_depth:  float = 0.0   # OB ask depth from previous cycle
-    liq_total_history:  deque = deque(maxlen=6)  # last 30s of liq totals
+    market_open_price:  float = 0.0
+    cl_open_price:      float = 0.0
+    prev_liq_total:     float = 0.0
+    prev_liq_total_30s: float = 0.0
+    prev_ob_bid_depth:  float = 0.0
+    prev_ob_ask_depth:  float = 0.0
+    max_secs_left:      float = 0.0   # tracks true market duration
+    liq_total_history:  deque = deque(maxlen=6)
 
     while True:
         try:
@@ -2348,6 +2349,7 @@ def run():
                     prev_liq_total_30s = 0.0
                     prev_ob_bid_depth  = 0.0
                     prev_ob_ask_depth  = 0.0
+                    max_secs_left      = 0.0
                     # Restore any open positions from pre-restart state
                     if market.condition_id in restored_state:
                         for strategy_key, st in restored_state[market.condition_id].items():
@@ -2447,8 +2449,10 @@ def run():
                                  if cl_price and cl_open_price > 0 else 0.0
 
                 # Market progress 0→1 (open→close)
-                market_duration = 300.0  # 5-minute markets
-                market_progress = round(max(0.0, min(1.0, 1.0 - secs_left / market_duration)), 4)
+                # Track max secs_left seen this market to infer true duration
+                max_secs_left = max(max_secs_left, secs_left)
+                effective_duration = max_secs_left if max_secs_left > 0 else 300.0
+                market_progress = round(max(0.0, min(1.0, 1.0 - secs_left / effective_duration)), 4)
 
                 # Multi-timeframe momentum
                 momentum_10s  = round(btc_momentum_pct(lookback_secs=10)  or 0.0, 6)
