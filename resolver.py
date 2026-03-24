@@ -1,6 +1,6 @@
 """
-Resolution Tracker v3
-======================
+Resolution Tracker v3.2
+========================
 Runs alongside multi_strategy.py on Railway.
 
 Every 60 seconds it:
@@ -19,6 +19,12 @@ Every 60 seconds it:
   4. If not yet resolved: skips — will retry next cycle
   5. If market_end_time > 1 hour ago and still unresolved: marks VOID + gave_up_at
 
+INDEPENDENT RESOLUTION (v3.2):
+  - signal_snapshots and signal_log are resolved independently of trades.
+  - Any condition_id with unresolved rows in either table is checked against
+    the CLOB API and patched, even if no trade was placed on that market.
+  - Outcome cache is shared within each cycle to avoid duplicate CLOB calls.
+
 NOTE: Patching is done by integer id (primary key) not trade_id UUID,
 because Supabase REST API uuid column filtering is unreliable.
 trade_id is still stored on every row for reference and traceability.
@@ -30,7 +36,6 @@ so all win-rate stats are 100% ground truth from Polymarket.
 import os
 import time
 import logging
-import json
 import requests
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -82,12 +87,34 @@ def fetch_pending_trades() -> list:
         return []
 
 
+def fetch_unresolved_condition_ids() -> set:
+    """
+    Collect all distinct condition_ids that have unresolved rows in
+    signal_snapshots or signal_log — regardless of whether a trade exists.
+    """
+    condition_ids = set()
+    for table in ("signal_snapshots", "signal_log"):
+        try:
+            resp = requests.get(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers={**sb_headers(), "Range": "0-999"},
+                params={
+                    "resolved_outcome": "is.null",
+                    "select":           "condition_id",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            for row in resp.json():
+                cid = row.get("condition_id")
+                if cid:
+                    condition_ids.add(cid)
+        except Exception as e:
+            log.warning(f"Failed to fetch unresolved condition_ids from {table}: {e}")
+    return condition_ids
+
+
 def patch_trade(row_id: int, trade_id: str, outcome_data: dict) -> bool:
-    """
-    Patch a single trade row by integer primary key id.
-    Using id instead of trade_id UUID because Supabase REST API
-    uuid column filtering is unreliable — integer pk always works.
-    """
     try:
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/trades",
@@ -113,12 +140,7 @@ def resolve_snapshots(outcome: str, condition_id: str):
     try:
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/signal_snapshots",
-            headers={
-                "apikey":        SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type":  "application/json",
-                "Prefer":        "return=representation",
-            },
+            headers={**sb_headers(), "Prefer": "return=representation"},
             params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
             json={"resolved_outcome": outcome},
             timeout=10,
@@ -126,8 +148,6 @@ def resolve_snapshots(outcome: str, condition_id: str):
         updated = resp.json() if resp.content else []
         if updated:
             log.info(f"Updated {len(updated)} snapshot(s) for {condition_id[:12]}... → {outcome}")
-        else:
-            log.warning(f"resolve_snapshots: no rows matched condition_id={condition_id[:12]}...")
     except Exception as e:
         log.warning(f"Snapshot resolution failed: {e}")
 
@@ -135,7 +155,7 @@ def resolve_snapshots(outcome: str, condition_id: str):
 def resolve_signal_logs(outcome: str, condition_id: str):
     """
     Patch all signal_log rows for this condition_id with the resolved outcome.
-    This allows win-rate analysis on signals that did NOT fire (fired=False),
+    Allows win-rate analysis on signals that did NOT fire (fired=False),
     showing whether the signal direction was correct even when it didn't trade.
     Requires: ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS resolved_outcome text;
     """
@@ -144,12 +164,7 @@ def resolve_signal_logs(outcome: str, condition_id: str):
     try:
         resp = requests.patch(
             f"{SUPABASE_URL}/rest/v1/signal_log",
-            headers={
-                "apikey":        SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type":  "application/json",
-                "Prefer":        "return=representation",
-            },
+            headers={**sb_headers(), "Prefer": "return=representation"},
             params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
             json={"resolved_outcome": outcome},
             timeout=10,
@@ -224,7 +239,7 @@ def fetch_market_outcome(condition_id: str) -> dict:
 
 # --------------------------------------------------------- MAIN LOOP ---------
 
-def resolve_pending_trades():
+def resolve_pending_trades(outcome_cache: dict) -> int:
     trades = fetch_pending_trades()
 
     if not trades:
@@ -239,15 +254,13 @@ def resolve_pending_trades():
     gave_up_count  = 0
     waiting_count  = 0
 
-    outcome_cache: dict = {}
-
     for trade in trades:
         row_id       = trade.get("id")
         trade_id     = trade.get("trade_id", "unknown")
         condition_id = trade.get("condition_id", "")
 
         if not row_id:
-            log.warning(f"Trade has no integer id — skipping.")
+            log.warning("Trade has no integer id — skipping.")
             continue
 
         if not condition_id:
@@ -327,10 +340,6 @@ def resolve_pending_trades():
         entry_px   = float(trade.get("price", 0.5))
         fee        = size * TAKER_FEE * 2
 
-        # Edge = implied return at entry price, same formula win or loss.
-        # Positive edge means you were buying at a discount to fair value (0.5).
-        # Negative edge means you were buying at a premium.
-        # This is meaningful for analysis regardless of outcome.
         edge = round(1 / entry_px - 1, 4)
 
         if won:
@@ -369,6 +378,36 @@ def resolve_pending_trades():
         log.info(f"Gave up on {gave_up_count} trade(s) — marked VOID after >{MAX_AGE_SECS}s")
 
     return resolved_count
+
+
+def resolve_independent_signals(outcome_cache: dict):
+    """
+    Independently resolve signal_snapshots and signal_log for any condition_id
+    that has unresolved rows, even if no trade was placed on that market.
+    Shares outcome_cache with resolve_pending_trades to avoid duplicate CLOB calls.
+    """
+    condition_ids = fetch_unresolved_condition_ids()
+
+    if not condition_ids:
+        return
+
+    log.info(f"Checking {len(condition_ids)} condition_id(s) for independent signal resolution...")
+
+    for condition_id in condition_ids:
+        if condition_id not in outcome_cache:
+            outcome_cache[condition_id] = fetch_market_outcome(condition_id)
+            time.sleep(0.3)
+
+        result = outcome_cache[condition_id]
+
+        if result.get("resolved") is True:
+            outcome = result["outcome"]
+            resolve_snapshots(outcome, condition_id)
+            resolve_signal_logs(outcome, condition_id)
+        elif result.get("resolved") == "ZERO_PRICES":
+            log.debug(f"condition_id={condition_id[:12]}... closed but no winner yet — will retry")
+        else:
+            log.debug(f"condition_id={condition_id[:12]}... not resolved yet — will retry")
 
 
 def print_summary():
@@ -413,8 +452,8 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3.1 — CLOB API, patching by integer id")
-    log.info("Resolves: trades + signal_snapshots + signal_log")
+    log.info("Resolution Tracker v3.2 — CLOB API, patching by integer id")
+    log.info("Resolves: trades + signal_snapshots + signal_log (independent of trades)")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Checking every {CHECK_INTERVAL}s")
 
@@ -422,9 +461,16 @@ def run():
 
     while True:
         try:
-            count = resolve_pending_trades()
+            # Shared cache so we don't double-hit the CLOB API
+            # for the same condition_id within one cycle
+            outcome_cache: dict = {}
+
+            count = resolve_pending_trades(outcome_cache)
             if count > 0:
                 log.info(f"Resolved {count} new trade(s) this cycle")
+
+            # Independently resolve snapshots/signal_log even with no trades
+            resolve_independent_signals(outcome_cache)
 
             if time.time() - last_summary > 1800:
                 print_summary()
