@@ -2307,6 +2307,15 @@ def run():
     last_summary       = 0
     last_winrate_fetch = time.time()
 
+    # Per-market state for delta and opening price computations
+    market_open_price:  float = 0.0   # BTC price at start of current market
+    cl_open_price:      float = 0.0   # Chainlink price at start of current market
+    prev_liq_total:     float = 0.0   # liq_total from previous poll cycle
+    prev_liq_total_30s: float = 0.0   # liq_total from ~30s ago (for acceleration)
+    prev_ob_bid_depth:  float = 0.0   # OB bid depth from previous cycle
+    prev_ob_ask_depth:  float = 0.0   # OB ask depth from previous cycle
+    liq_total_history:  deque = deque(maxlen=6)  # last 30s of liq totals
+
     while True:
         try:
             now  = datetime.now(timezone.utc)
@@ -2331,6 +2340,14 @@ def run():
                     current_market = market
                     positions      = {k: None for k in trackers}
                     cl_history.clear()
+                    liq_total_history.clear()
+                    # Reset opening prices — captured on first poll of new market
+                    market_open_price  = 0.0
+                    cl_open_price      = 0.0
+                    prev_liq_total     = 0.0
+                    prev_liq_total_30s = 0.0
+                    prev_ob_bid_depth  = 0.0
+                    prev_ob_ask_depth  = 0.0
                     # Restore any open positions from pre-restart state
                     if market.condition_id in restored_state:
                         for strategy_key, st in restored_state[market.condition_id].items():
@@ -2395,69 +2412,140 @@ def run():
 
             # ── ML TRAINING SNAPSHOT ──────────────────────────────────────────
             # Write one row per poll cycle with ALL signal values simultaneously.
-            # resolved_outcome patched later by resolver.py — same as signal_log.
-            # This is the primary feature matrix for future ML training.
+            # resolved_outcome patched later by resolver.py.
             try:
+                import math
+
                 cl_price, cl_age = fetch_chainlink_price()
                 cl_div = round((spot - cl_price) / cl_price * 100, 6) if cl_price else 0.0
 
-                binance_liq     = get_binance_liq_2min()
-                liq_long        = _liq_cache["long"]  + binance_liq["long"]
-                liq_short       = _liq_cache["short"] + binance_liq["short"]
-                liq_total       = liq_long + liq_short
-                liq_imbalance   = round((liq_long - liq_short) / liq_total, 4) if liq_total > 0 else 0.0
+                binance_liq   = get_binance_liq_2min()
+                liq_long      = _liq_cache["long"]  + binance_liq["long"]
+                liq_short     = _liq_cache["short"] + binance_liq["short"]
+                liq_total     = liq_long + liq_short
+                liq_imbalance = round((liq_long - liq_short) / liq_total, 4) if liq_total > 0 else 0.0
 
-                candles     = list(_volume_history)
-                recent      = candles[-3:] if len(candles) >= 3 else []
-                total_vol   = sum(c["volume"] for c in recent)
-                buy_vol     = sum(c["buy_vol"] for c in recent)
-                buy_ratio   = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
+                candles   = list(_volume_history)
+                recent    = candles[-3:] if len(candles) >= 3 else []
+                total_vol = sum(c["volume"] for c in recent)
+                buy_vol   = sum(c["buy_vol"] for c in recent)
+                buy_ratio = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
+
+                # Capture opening prices on first poll of each market
+                if market_open_price == 0.0 and spot > 0:
+                    market_open_price = spot
+                if cl_open_price == 0.0 and cl_price:
+                    cl_open_price = cl_price
+
+                # Price vs opening — core resolution feature
+                price_vs_open_pct   = round((spot - market_open_price) / market_open_price * 100, 6) \
+                                      if market_open_price > 0 else 0.0
+                price_vs_open_score = round(math.tanh(price_vs_open_pct / 0.10), 4)
+
+                # Chainlink vs its opening price
+                cl_vs_open_pct = round((cl_price - cl_open_price) / cl_open_price * 100, 6) \
+                                 if cl_price and cl_open_price > 0 else 0.0
+
+                # Market progress 0→1 (open→close)
+                market_duration = 300.0  # 5-minute markets
+                market_progress = round(max(0.0, min(1.0, 1.0 - secs_left / market_duration)), 4)
+
+                # Multi-timeframe momentum
+                momentum_10s  = round(btc_momentum_pct(lookback_secs=10)  or 0.0, 6)
+                momentum_30s  = round(btc_momentum_pct(lookback_secs=30)  or 0.0, 6)
+                momentum_60s  = round(btc_momentum_pct(lookback_secs=60)  or 0.0, 6)
+                momentum_120s = round(btc_momentum_pct(lookback_secs=120) or 0.0, 6)
+
+                # Liquidation delta and acceleration
+                liq_total_history.append(liq_total)
+                liq_delta = round(liq_total - prev_liq_total, 2)
+                liq_accel = round(liq_delta - (prev_liq_total - (liq_total_history[0] if len(liq_total_history) >= 3 else prev_liq_total)), 2)
+                prev_liq_total = liq_total
+
+                # OB depth deltas
+                cur_bid_depth = _ob_cache.get("bid_depth", 0.0)
+                cur_ask_depth = _ob_cache.get("ask_depth", 0.0)
+                ob_bid_delta  = round(cur_bid_depth - prev_ob_bid_depth, 2)
+                ob_ask_delta  = round(cur_ask_depth - prev_ob_ask_depth, 2)
+                prev_ob_bid_depth = cur_bid_depth
+                prev_ob_ask_depth = cur_ask_depth
+
+                # Polymarket book state
+                poly_prices    = fetch_poly_prices(current_market, 20.0)
+                poly_up_mid    = round(poly_prices.get("up_mid", 0.5), 4)
+                poly_spread    = round(poly_prices.get("spread", 0.1), 4)
+                poly_fill_up   = round(poly_prices.get("fill_up", 0.5), 4)
+                poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
+                poly_deviation = round(poly_up_mid - 0.50, 4)
 
                 supabase_market_snapshot({
-                    "condition_id":       current_market.condition_id,
-                    "market_question":    current_market.question,
-                    "market_end_time":    current_market.end_time.isoformat(),
-                    "secs_left":          round(secs_left, 1),
+                    "condition_id":        current_market.condition_id,
+                    "market_question":     current_market.question,
+                    "market_end_time":     current_market.end_time.isoformat(),
+                    "secs_left":           round(secs_left, 1),
+                    "market_progress":     market_progress,
                     # Price and macro
-                    "btc_price":          round(spot, 2),
-                    "basis_pct":          round(basis, 6),
-                    "funding_rate":       round(_funding_cache["rate"], 6),
-                    "okx_funding":        round(_funding_cache["okx"], 6),
-                    "gate_funding":       round(_funding_cache["binance"], 6),
+                    "btc_price":           round(spot, 2),
+                    "market_open_price":   round(market_open_price, 2),
+                    "price_vs_open_pct":   price_vs_open_pct,
+                    "price_vs_open_score": price_vs_open_score,
+                    "basis_pct":           round(basis, 6),
+                    "funding_rate":        round(_funding_cache["rate"], 6),
+                    "okx_funding":         round(_funding_cache["okx"], 6),
+                    "gate_funding":        round(_funding_cache["binance"], 6),
+                    # Multi-timeframe momentum
+                    "momentum_10s":        momentum_10s,
+                    "momentum_30s":        momentum_30s,
+                    "momentum_60s":        momentum_60s,
+                    "momentum_120s":       momentum_120s,
                     # Chainlink signal
-                    "cl_divergence":      round(cl_div, 6),
-                    "cl_age":             round(cl_age, 1) if cl_age else 0.0,
+                    "cl_divergence":       round(cl_div, 6),
+                    "cl_age":              round(cl_age, 1) if cl_age else 0.0,
+                    "cl_open_price":       round(cl_open_price, 2),
+                    "cl_vs_open_pct":      cl_vs_open_pct,
                     # Liquidation signal
-                    "liq_total":          round(liq_total, 2),
-                    "liq_long":           round(liq_long, 2),
-                    "liq_short":          round(liq_short, 2),
-                    "liq_imbalance":      liq_imbalance,
-                    "vol_range_pct":      round(_vol_cache.get("range_pct", 0.0), 6),
+                    "liq_total":           round(liq_total, 2),
+                    "liq_long":            round(liq_long, 2),
+                    "liq_short":           round(liq_short, 2),
+                    "liq_imbalance":       liq_imbalance,
+                    "liq_delta":           liq_delta,
+                    "liq_accel":           liq_accel,
+                    "vol_range_pct":       round(_vol_cache.get("range_pct", 0.0), 6),
                     # Order book signal
-                    "ob_imbalance":       round(_ob_cache.get("imbalance", 0.0), 4),
-                    "ob_spread_pct":      round(_ob_cache.get("spread_pct", 0.0), 6),
+                    "ob_imbalance":        round(_ob_cache.get("imbalance", 0.0), 4),
+                    "ob_spread_pct":       round(_ob_cache.get("spread_pct", 0.0), 6),
+                    "ob_bid_depth":        round(cur_bid_depth, 2),
+                    "ob_ask_depth":        round(cur_ask_depth, 2),
+                    "ob_bid_delta":        ob_bid_delta,
+                    "ob_ask_delta":        ob_ask_delta,
                     # Volume signal
-                    "volume_buy_ratio":   buy_ratio,
+                    "volume_buy_ratio":    buy_ratio,
+                    # Polymarket book
+                    "poly_up_mid":         poly_up_mid,
+                    "poly_spread":         poly_spread,
+                    "poly_fill_up":        poly_fill_up,
+                    "poly_slip_up":        poly_slip_up,
+                    "poly_deviation":      poly_deviation,
                     # Regime labels (categorical)
-                    "regime":             _regime["composite"],
-                    "momentum_label":     _regime["momentum_label"],
-                    "volatility_label":   _regime["volatility_label"],
-                    "flow_label":         _regime["flow_label"],
-                    "session":            _regime["session"],
-                    "activity":           _regime["activity"],
-                    "day_type":           _regime["day_type"],
-                    # Continuous regime scores (for ML)
-                    "momentum_score":     _regime["momentum_score"],
-                    "volatility_pct":     _regime["volatility_pct"],
-                    "flow_score":         _regime["flow_score"],
-                    "liquidity_score":    _regime["liquidity_score"],
-                    "funding_zscore":     _regime["funding_zscore"],
-                    "hour_sin":           _regime["hour_sin"],
-                    "hour_cos":           _regime["hour_cos"],
-                    "dow_sin":            _regime["dow_sin"],
-                    "dow_cos":            _regime["dow_cos"],
+                    "regime":              _regime["composite"],
+                    "momentum_label":      _regime["momentum_label"],
+                    "volatility_label":    _regime["volatility_label"],
+                    "flow_label":          _regime["flow_label"],
+                    "session":             _regime["session"],
+                    "activity":            _regime["activity"],
+                    "day_type":            _regime["day_type"],
+                    # Continuous regime scores
+                    "momentum_score":      _regime["momentum_score"],
+                    "volatility_pct":      _regime["volatility_pct"],
+                    "flow_score":          _regime["flow_score"],
+                    "liquidity_score":     _regime["liquidity_score"],
+                    "funding_zscore":      _regime["funding_zscore"],
+                    "hour_sin":            _regime["hour_sin"],
+                    "hour_cos":            _regime["hour_cos"],
+                    "dow_sin":             _regime["dow_sin"],
+                    "dow_cos":             _regime["dow_cos"],
                     # Label — patched by resolver when market settles
-                    "resolved_outcome":   None,
+                    "resolved_outcome":    None,
                 })
             except Exception as e:
                 log.debug(f"market_snapshot write failed: {e}")
