@@ -38,15 +38,14 @@ CHANGES (v3.1):
   - Background thread maintains WebSocket connection with auto-reconnect
   - fetch_chainlink_price() now reads from shared in-memory cache
 
-CHANGES (v3.3):
-  - Strategy 8: Price Anchor added
-    Directly models the resolution condition: BTC must close above its
-    opening price for UP to win. Fires when displacement from open is
-    large enough and time remaining is short enough that reversal is
-    unlikely. Intensity scales with both displacement magnitude and
-    market progress (how far through the 5-minute window we are).
-    New columns added to trades, signal_log, market_snapshots:
-      price_anchor_pct, price_anchor_score, anchor_market_progress
+CHANGES (v3.4):
+  - Fee accounting made consistent across open/close/void:
+      open()  debits size + open_fee immediately (was: size only)
+      close() debits exit_fee only (open already paid); net_pnl correct
+      void()  credits back stake only; logs pnl = -open_fee (was: pnl=0.0)
+    All three paths now follow the same convention and match resolver.py
+  - exposure_cap_remaining() now uses current balance not start_bal (fix #3)
+    Cap now shrinks after losses and grows after gains, tracking real equity
 """
 
 import os
@@ -468,9 +467,10 @@ class SharedPortfolio:
 
     def exposure_cap_remaining(self, condition_id: str, direction: str) -> float:
         """How much more size is allowed in this direction before hitting the cap.
-        Based on start_bal so opening order doesn't affect the cap."""
+        Based on current balance so the cap scales with real equity — after losses
+        the cap shrinks, after gains it grows."""
         with self._lock:
-            cap       = self.start_bal * MAX_DIRECTIONAL_EXPOSURE
+            cap       = self.balance * MAX_DIRECTIONAL_EXPOSURE
             committed = self._exposure.get(condition_id, {}).get(direction, 0.0)
             return max(0.0, cap - committed)
 
@@ -558,9 +558,9 @@ class StrategyTracker:
             return ""
 
         fee = size * TAKER_FEE
-        # Debit only the stake on open — fees handled on close to avoid double-counting.
-        # Open fee is tracked for Supabase record-keeping only, not deducted from portfolio.
-        self.portfolio.debit(size, 0.0, market.condition_id, side)
+        # Debit stake + open fee immediately. Close will debit only the exit fee.
+        # This way open + close each pay one taker fee, totalling one round-trip.
+        self.portfolio.debit(size + fee, 0.0, market.condition_id, side)
         trade_id = str(uuid.uuid4())
 
         entry = {
@@ -613,21 +613,36 @@ class StrategyTracker:
         Updates shared portfolio balance and per-strategy win/loss counters only.
         Does NOT write to Supabase — resolver.py owns all outcome writes.
 
-        Binary options payoff (matches resolver.py exactly):
-          WIN:  pnl = size * (1/entry_price - 1) - round_trip_fees
-          LOSS: pnl = -size - round_trip_fees
+        Fee convention (consistent with open()):
+          open()  debits: size + open_fee  (open_fee = size * TAKER_FEE)
+          close() debits: exit_fee         (exit_fee = size * TAKER_FEE)
+          Total fees paid = size * TAKER_FEE * 2 across the round-trip.
+
+        Binary options payoff (matches resolver.py):
+          WIN:  gross = size * (1/entry_price - 1)
+                net   = gross - exit_fee   (open_fee already debited)
+                credit back: size + net
+          LOSS: gross = -size
+                net   = gross - exit_fee
+                credit back: 0 (stake was already debited; just absorb exit fee)
         exit_price == 1.0 means won, 0.0 means lost.
         """
-        won = exit_price >= 0.5
-        fee = size * TAKER_FEE * 2   # round-trip: open taker + close taker
-        if won:
-            pnl = size * (1.0 / entry_price - 1.0) - fee
-        else:
-            pnl = -size - fee
+        won      = exit_price >= 0.5
+        exit_fee = size * TAKER_FEE   # open fee already paid at open()
 
-        self.portfolio.credit(size + pnl if won else max(0.0, size + pnl),
-                              market.condition_id, side, size)
-        if pnl > 0:
+        if won:
+            gross_pnl = size * (1.0 / entry_price - 1.0)
+            net_pnl   = gross_pnl - exit_fee
+            # Credit back: original stake (already debited) + net profit
+            self.portfolio.credit(size + net_pnl, market.condition_id, side, size)
+        else:
+            net_pnl = -size - exit_fee
+            # Stake already debited at open; just debit the exit fee
+            self.portfolio.credit(-exit_fee, market.condition_id, side, size)
+
+        fee = size * TAKER_FEE * 2   # round-trip total for logging
+
+        if net_pnl > 0:
             self.portfolio.record_win(self.name)
         else:
             self.portfolio.record_loss(self.name)
@@ -647,8 +662,8 @@ class StrategyTracker:
             "entry_price":  entry_price,
             "exit_price":   exit_price,
             "size":         size,
-            "pnl":          round(pnl, 4),
-            "fee":          round(fee, 4),   # round-trip: open + close taker
+            "pnl":          round(net_pnl, 4),
+            "fee":          round(fee, 4),   # round-trip total: open + close taker
             "portfolio":    round(self.portfolio.available(), 2),
             "condition_id": market.condition_id,
         }
@@ -656,18 +671,22 @@ class StrategyTracker:
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
-        # No supabase_insert here — resolver writes the real outcome to the OPEN row.
         log.info(f"[{self.name}] CLOSE_LOCAL {side} ({reason}) | exit={exit_price:.2f} | "
-                 f"PnL={pnl:+.3f} | portfolio=${self.portfolio.available():.2f} | "
+                 f"PnL={net_pnl:+.3f} | portfolio=${self.portfolio.available():.2f} | "
                  f"WR={wr:.0f}% ({w}W/{l}L)")
 
     def void(self, pos: "StrategyTrade", market: Market):
         """
-        Market was voided — refund the position size (minus fees already paid).
+        Market was voided — refund the stake but not the open fee already paid.
+        The open fee was debited at open(), so we credit back only the stake.
+        pnl = -open_fee (the fee is the only real loss on a void).
         Does not count as win or loss. Does not write to Supabase —
         resolver.py will mark the row VOID when it confirms the market outcome.
         """
-        self.portfolio.credit(pos.size, market.condition_id, pos.side, pos.size)  # refund stake, fees are lost
+        open_fee = pos.size * TAKER_FEE
+        # Credit back stake only — open_fee was already debited at open()
+        self.portfolio.credit(pos.size, market.condition_id, pos.side, pos.size)
+        void_pnl = -open_fee   # matches resolver.py void pnl calculation
         entry = {
             "timestamp":    datetime.now(timezone.utc).isoformat(),
             "action":       "VOID_LOCAL",
@@ -675,15 +694,16 @@ class StrategyTracker:
             "side":         pos.side,
             "entry_price":  pos.entry_price,
             "size":         pos.size,
-            "pnl":          0.0,
+            "fee":          round(open_fee, 4),
+            "pnl":          round(void_pnl, 4),
             "portfolio":    round(self.portfolio.available(), 2),
             "condition_id": market.condition_id,
         }
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
-        log.info(f"[{self.name}] VOID_LOCAL {pos.side} | size refunded={pos.size:.2f} | "
-                 f"portfolio=${self.portfolio.available():.2f}")
+        log.info(f"[{self.name}] VOID_LOCAL {pos.side} | stake refunded=${pos.size:.2f} | "
+                 f"fee lost=${open_fee:.4f} | portfolio=${self.portfolio.available():.2f}")
 
     def summary(self) -> str:
         with self.portfolio._lock:
@@ -2426,8 +2446,9 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
                      f"({strategy_name} on {condition_id[:12]}...)")
             continue
 
-        # Re-register exposure — debit only size (fees handled on close, consistent with open())
-        portfolio.debit(size, 0.0, condition_id, side)
+        # Re-register exposure — debit size + open_fee, consistent with open()
+        open_fee = size * TAKER_FEE
+        portfolio.debit(size + open_fee, 0.0, condition_id, side)
 
         # Reconstruct a minimal StrategyTrade so the main loop knows
         # this strategy already has a position on this market
@@ -2462,7 +2483,7 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v3.2")
+    log.info("Multi-Strategy Mechanical Edge Simulator v3.4")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume | OB Pressure | Price Anchor")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
