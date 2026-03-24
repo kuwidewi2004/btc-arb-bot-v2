@@ -111,30 +111,6 @@ def supabase_insert(record: dict):
         log.warning(f"Supabase insert failed: {e}")
 
 
-def supabase_snapshot(snapshot: dict):
-    """Insert a signal snapshot into Supabase every 5 minutes."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-    try:
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/signal_snapshots",
-            headers={
-                "apikey":        SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type":  "application/json",
-                "Prefer":        "return=minimal",
-            },
-            json=snapshot,
-            timeout=5,
-        )
-        if r.status_code == 201:
-            log.info("Snapshot saved to Supabase")
-        else:
-            log.warning(f"Snapshot insert status: {r.status_code} {r.text[:100]}")
-    except Exception as e:
-        log.warning(f"Snapshot insert failed: {e}")
-
-
 def supabase_signal_log(entry: dict):
     """
     Log every signal evaluation that did NOT fire to Supabase signal_log table.
@@ -1691,7 +1667,6 @@ def run():
     current_market    = None
     last_market_fetch = 0
     last_summary      = 0
-    last_snapshot     = 0
 
     while True:
         try:
@@ -1739,42 +1714,7 @@ def run():
             log.info(f"BTC=${spot:.2f} | {secs_left:.0f}s left | "
                      f"funding={_funding_cache['rate']:+.6f} | basis={basis:+.3f}%")
 
-            # Save signal snapshot every 5 minutes
-            if time.time() - last_snapshot > 300:
-                cl_price, cl_age = fetch_chainlink_price()
-                cl_div      = round((spot - cl_price) / cl_price * 100, 4) if cl_price else 0.0
-                candles     = list(_volume_history)
-                recent_vol  = candles[-3:] if len(candles) >= 3 else []
-                total_vol   = sum(c["volume"] for c in recent_vol)
-                buy_vol     = sum(c["buy_vol"] for c in recent_vol)
-                buy_ratio   = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
-                liq_2min    = get_binance_liq_2min()
-                long_liq    = round(_liq_cache["long"]  + liq_2min["long"], 2)
-                short_liq   = round(_liq_cache["short"] + liq_2min["short"], 2)
-                prices      = fetch_poly_prices(current_market) if current_market else {}
-                supabase_snapshot({
-                    "btc_price":        round(spot, 2),
-                    "eth_price":        round(_price_cache["eth"], 2),
-                    "funding_rate":     round(_funding_cache["rate"], 6),
-                    "okx_funding":      round(_funding_cache["okx"], 6),
-                    "gateio_funding":   round(_funding_cache["binance"], 6),
-                    "basis_pct":        round(basis, 4),
-                    "chainlink_div":    cl_div,
-                    "chainlink_age":    round(cl_age, 1) if cl_age else 30.0,
-                    "up_mid":           round(prices.get("up_mid", 0.5), 4),
-                    "spread":           round(prices.get("spread", 0.1), 4),
-                    "volume_buy_ratio": buy_ratio,
-                    "long_liq_usd":     long_liq,
-                    "short_liq_usd":    short_liq,
-                    "liq_total_usd":    round(long_liq + short_liq, 2),
-                    "vol_range_pct":    round(_vol_cache.get("range_pct", 0.0), 4),
-                    "secs_left":        round(secs_left),
-                    "market_question":  current_market.question if current_market else "",
-                    "condition_id":     current_market.condition_id if current_market else "",
-                })
-                last_snapshot = time.time()
-
-            # Run all 6 strategies
+            # Run all 7 strategies
             positions["chainlink"]   = strategy_chainlink_arb(
                 current_market, secs_left, trackers["chainlink"],
                 positions["chainlink"], cl_history)
