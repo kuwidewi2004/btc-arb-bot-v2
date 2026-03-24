@@ -211,17 +211,72 @@ class StrategyTrade:
     entry_time:  datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# --------------------------------------------------------- SHARED PORTFOLIO ---
+# One capital pool shared across all strategies.
+# Each strategy draws from and returns to the same balance,
+# so combined exposure is visible and capped in one place.
+
+class SharedPortfolio:
+    """
+    Single capital pool for all strategies.
+    Thread-safe via a lock — strategies run sequentially in the main loop
+    but the lock guards against any future concurrency.
+    """
+    def __init__(self, balance: float):
+        self._lock      = threading.Lock()
+        self.balance    = balance
+        self.start_bal  = balance
+        # Per-strategy win/loss counters (diagnostic only — ground truth in Supabase)
+        self._wins:   dict = {}
+        self._losses: dict = {}
+
+    def available(self) -> float:
+        with self._lock:
+            return self.balance
+
+    def debit(self, size: float, fee: float):
+        with self._lock:
+            self.balance -= (size + fee)
+
+    def credit(self, amount: float):
+        with self._lock:
+            self.balance += amount
+
+    def record_win(self, strategy: str):
+        self._wins[strategy]   = self._wins.get(strategy, 0) + 1
+
+    def record_loss(self, strategy: str):
+        self._losses[strategy] = self._losses.get(strategy, 0) + 1
+
+    def summary_lines(self) -> list:
+        lines = [f"Portfolio balance: ${self.balance:.2f} | "
+                 f"PnL={self.balance - self.start_bal:+.2f}"]
+        for name in sorted(set(list(self._wins) + list(self._losses))):
+            w = self._wins.get(name, 0)
+            l = self._losses.get(name, 0)
+            total = w + l
+            wr    = (w / total * 100) if total else 0
+            lines.append(f"  {name}: WR={wr:.0f}% ({w}W/{l}L) — ground truth in Supabase")
+        return lines
+
+
+# Singleton — instantiated once in run(), passed to all trackers
+_portfolio: Optional["SharedPortfolio"] = None
+
+
 # --------------------------------------------------------- STRATEGY TRACKER --
 
 class StrategyTracker:
-    def __init__(self, name: str):
+    def __init__(self, name: str, portfolio: "SharedPortfolio"):
         self.name      = name
-        self.balance   = STARTING_BALANCE
-        self.start_bal = STARTING_BALANCE
-        self.wins      = 0
-        self.losses    = 0
+        self.portfolio = portfolio
         self.trades    = []
         self.logfile   = f"strategy_{name.lower().replace(' ', '_')}.jsonl"
+
+    # Convenience: delegate balance reads to the shared pool
+    @property
+    def balance(self) -> float:
+        return self.portfolio.available()
 
     def open(self, side: str, price: float, size: float,
              signal_data: dict, market: Market) -> str:
@@ -231,7 +286,7 @@ class StrategyTracker:
         The resolver will later patch this row with the real outcome.
         """
         fee = size * TAKER_FEE
-        self.balance -= (size + fee)
+        self.portfolio.debit(size, fee)
         trade_id = str(uuid.uuid4())
 
         entry = {
@@ -268,14 +323,14 @@ class StrategyTracker:
             "signal_data":    signal_data,
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
-                 f"balance=${self.balance:.2f} | trade_id={trade_id[:8]}... | "
+                 f"portfolio=${self.portfolio.available():.2f} | trade_id={trade_id[:8]}... | "
                  f"{json.dumps(signal_data)}")
         return trade_id
 
     def close(self, side: str, entry_price: float, exit_price: float,
               size: float, market: Market, reason: str = "RESOLVED"):
         """
-        Updates local balance and win/loss counters only.
+        Updates shared portfolio balance and per-strategy win/loss counters only.
         Does NOT write to Supabase — resolver.py owns all outcome writes.
         """
         if side == "UP":
@@ -284,24 +339,29 @@ class StrategyTracker:
             pnl = (entry_price - exit_price) * size / entry_price
         fee = size * TAKER_FEE
         pnl -= fee
-        self.balance += size + pnl
+        self.portfolio.credit(size + pnl)
         if pnl > 0:
-            self.wins   += 1
+            self.portfolio.record_win(self.name)
         else:
-            self.losses += 1
+            self.portfolio.record_loss(self.name)
+
+        w     = self.portfolio._wins.get(self.name, 0)
+        l     = self.portfolio._losses.get(self.name, 0)
+        total = w + l
+        wr    = (w / total * 100) if total else 0
 
         entry = {
-            "timestamp":   datetime.now(timezone.utc).isoformat(),
-            "action":      "CLOSE_LOCAL",
-            "strategy":    self.name,
-            "reason":      reason,
-            "side":        side,
-            "entry_price": entry_price,
-            "exit_price":  exit_price,
-            "size":        size,
-            "pnl":         round(pnl, 4),
-            "fee":         round(fee, 4),
-            "balance":     round(self.balance, 2),
+            "timestamp":    datetime.now(timezone.utc).isoformat(),
+            "action":       "CLOSE_LOCAL",
+            "strategy":     self.name,
+            "reason":       reason,
+            "side":         side,
+            "entry_price":  entry_price,
+            "exit_price":   exit_price,
+            "size":         size,
+            "pnl":          round(pnl, 4),
+            "fee":          round(fee, 4),
+            "portfolio":    round(self.portfolio.available(), 2),
             "condition_id": market.condition_id,
         }
         self.trades.append(entry)
@@ -309,11 +369,9 @@ class StrategyTracker:
             f.write(json.dumps(entry) + "\n")
 
         # No supabase_insert here — resolver writes the real outcome to the OPEN row.
-        total = self.wins + self.losses
-        wr    = (self.wins / total * 100) if total else 0
         log.info(f"[{self.name}] CLOSE_LOCAL {side} ({reason}) | exit={exit_price:.2f} | "
-                 f"PnL={pnl:+.3f} | balance=${self.balance:.2f} | "
-                 f"WR={wr:.0f}% ({self.wins}W/{self.losses}L)")
+                 f"PnL={pnl:+.3f} | portfolio=${self.portfolio.available():.2f} | "
+                 f"WR={wr:.0f}% ({w}W/{l}L)")
 
     def void(self, pos: "StrategyTrade", market: Market):
         """
@@ -321,7 +379,7 @@ class StrategyTracker:
         Does not count as win or loss. Does not write to Supabase —
         resolver.py will mark the row VOID when it confirms the market outcome.
         """
-        self.balance += pos.size  # refund stake, fees are lost
+        self.portfolio.credit(pos.size)  # refund stake, fees are lost
         entry = {
             "timestamp":    datetime.now(timezone.utc).isoformat(),
             "action":       "VOID_LOCAL",
@@ -330,21 +388,21 @@ class StrategyTracker:
             "entry_price":  pos.entry_price,
             "size":         pos.size,
             "pnl":          0.0,
-            "balance":      round(self.balance, 2),
+            "portfolio":    round(self.portfolio.available(), 2),
             "condition_id": market.condition_id,
         }
         self.trades.append(entry)
         with open(self.logfile, "a") as f:
             f.write(json.dumps(entry) + "\n")
         log.info(f"[{self.name}] VOID_LOCAL {pos.side} | size refunded={pos.size:.2f} | "
-                 f"balance=${self.balance:.2f}")
+                 f"portfolio=${self.portfolio.available():.2f}")
 
     def summary(self) -> str:
-        total = self.wins + self.losses
-        wr    = (self.wins / total * 100) if total else 0
-        pnl   = self.balance - self.start_bal
-        return (f"{self.name}: ${self.balance:.2f} | PnL={pnl:+.2f} | "
-                f"WR={wr:.0f}% | {total} trades (local estimate — "
+        w     = self.portfolio._wins.get(self.name, 0)
+        l     = self.portfolio._losses.get(self.name, 0)
+        total = w + l
+        wr    = (w / total * 100) if total else 0
+        return (f"{self.name}: WR={wr:.0f}% | {total} trades (local estimate — "
                 f"ground truth in Supabase via resolver)")
 
 
@@ -784,10 +842,24 @@ def fetch_current_market() -> Optional[Market]:
                 if end_time <= now:
                     continue
                 token_ids = json.loads(m["clobTokenIds"])
+                outcomes  = m.get("outcomes")
+                if isinstance(outcomes, str):
+                    outcomes = json.loads(outcomes)
+                if outcomes and len(outcomes) == len(token_ids):
+                    outcome_map   = {o.upper(): tid for o, tid in zip(outcomes, token_ids)}
+                    up_token_id   = outcome_map.get("UP")
+                    down_token_id = outcome_map.get("DOWN")
+                else:
+                    log.warning("No outcomes field in market response — falling back to index order")
+                    up_token_id   = token_ids[0]
+                    down_token_id = token_ids[1]
+                if not up_token_id or not down_token_id:
+                    log.warning(f"Could not map UP/DOWN tokens for {m['conditionId'][:12]}... — skipping")
+                    continue
                 return Market(
                     condition_id  = m["conditionId"],
-                    up_token_id   = token_ids[0],
-                    down_token_id = token_ids[1],
+                    up_token_id   = up_token_id,
+                    down_token_id = down_token_id,
                     question      = m["question"],
                     end_time      = end_time,
                 )
@@ -799,23 +871,89 @@ def fetch_current_market() -> Optional[Market]:
         return None
 
 
-def fetch_poly_prices(market: Market) -> dict:
+def _book_fill_price(book: dict, size_usdc: float) -> tuple:
+    """
+    Walk the ask ladder to estimate a size-weighted taker fill price.
+    Returns (fill_price, slippage_vs_best_ask).
+    """
+    asks = sorted(book.get("asks", []), key=lambda x: float(x["price"]))
+    bids = sorted(book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)
+
+    if not asks:
+        return 0.5, 0.0
+
+    best_ask = float(asks[0]["price"])
+
+    remaining  = size_usdc
+    total_cost = 0.0
+    total_qty  = 0.0
+    for level in asks:
+        px       = float(level["price"])
+        qty      = float(level["size"])
+        fill_qty = min(qty, remaining / px)
+        total_cost += fill_qty * px
+        total_qty  += fill_qty
+        remaining  -= fill_qty * px
+        if remaining <= 0:
+            break
+
+    if total_qty == 0:
+        return best_ask, 0.0
+
+    fill_price = total_cost / total_qty
+    slippage   = fill_price - best_ask
+    return round(fill_price, 6), round(slippage, 6)
+
+
+def fetch_poly_prices(market: Market, size_usdc: float = MAX_BET) -> dict:
+    """
+    Returns executable fill prices (ask-side) for both tokens, plus spread.
+    fill_up / fill_down are estimated taker prices for a buy of size_usdc.
+    up_mid / down_mid are kept for reference/logging (e.g. snapshots) only —
+    do not use as entry price.
+    """
     try:
-        up_mid   = float(requests.get(f"{POLYMARKET_HOST}/midpoint",
-                         params={"token_id": market.up_token_id},
-                         timeout=8).json().get("mid", 0.5))
-        down_mid = float(requests.get(f"{POLYMARKET_HOST}/midpoint",
-                         params={"token_id": market.down_token_id},
-                         timeout=8).json().get("mid", 0.5))
-        book     = requests.get(f"{POLYMARKET_HOST}/book",
-                                params={"token_id": market.up_token_id},
-                                timeout=8).json()
-        bids     = sorted(book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)
-        asks     = sorted(book.get("asks", []), key=lambda x: float(x["price"]))
-        spread   = (float(asks[0]["price"]) - float(bids[0]["price"])) if bids and asks else 0.1
-        return {"up_mid": up_mid, "down_mid": down_mid, "spread": spread}
-    except Exception:
-        return {"up_mid": 0.5, "down_mid": 0.5, "spread": 0.1}
+        up_book   = requests.get(f"{POLYMARKET_HOST}/book",
+                                 params={"token_id": market.up_token_id},   timeout=8).json()
+        down_book = requests.get(f"{POLYMARKET_HOST}/book",
+                                 params={"token_id": market.down_token_id}, timeout=8).json()
+
+        up_asks   = sorted(up_book.get("asks",   []), key=lambda x: float(x["price"]))
+        up_bids   = sorted(up_book.get("bids",   []), key=lambda x: float(x["price"]), reverse=True)
+        down_asks = sorted(down_book.get("asks", []), key=lambda x: float(x["price"]))
+        down_bids = sorted(down_book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)
+
+        spread = (float(up_asks[0]["price"]) - float(up_bids[0]["price"])
+                  ) if up_asks and up_bids else 0.1
+
+        fill_up,   slip_up   = _book_fill_price(up_book,   size_usdc)
+        fill_down, slip_down = _book_fill_price(down_book, size_usdc)
+
+        up_mid   = (float(up_asks[0]["price"])   + float(up_bids[0]["price"]))   / 2 \
+                   if up_asks and up_bids else 0.5
+        down_mid = (float(down_asks[0]["price"]) + float(down_bids[0]["price"])) / 2 \
+                   if down_asks and down_bids else 0.5
+
+        if slip_up > 0.005 or slip_down > 0.005:
+            log.warning(f"High slippage estimate: UP +{slip_up:.4f} DOWN +{slip_down:.4f}")
+
+        return {
+            "up_mid":    up_mid,
+            "down_mid":  down_mid,
+            "fill_up":   fill_up,
+            "fill_down": fill_down,
+            "slip_up":   slip_up,
+            "slip_down": slip_down,
+            "spread":    spread,
+        }
+    except Exception as e:
+        log.warning(f"fetch_poly_prices failed: {e}")
+        return {
+            "up_mid": 0.5, "down_mid": 0.5,
+            "fill_up": 0.5, "fill_down": 0.5,
+            "slip_up": 0.0, "slip_down": 0.0,
+            "spread": 0.1,
+        }
 
 
 # --------------------------------------------------------- RESOLUTION --------
@@ -1020,7 +1158,7 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
                         reason="spread_too_wide")
             return position
 
-        price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
+        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         # Size scales with divergence strength — stronger divergence = bigger bet
         intensity = min(abs(divergence) / 0.30, 1.0)
         size      = min(MAX_BET * intensity, tracker.balance * 0.4)
@@ -1083,7 +1221,7 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
                         reason="spread_too_wide")
             return position
 
-        price     = prices["up_mid"] if direction == "UP" else prices["down_mid"]
+        price     = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         intensity = min(abs(avg_rate) / 0.001, 1.0)
         size      = min(MAX_BET * intensity, tracker.balance * 0.3)
         size      = max(size, MIN_BET)
@@ -1166,7 +1304,7 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
                         reason="spread_too_wide")
             return position
 
-        price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
+        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         size  = min(MAX_BET * adjusted_intensity, tracker.balance * 0.3)
         size  = max(size, MIN_BET)
 
@@ -1226,7 +1364,7 @@ def strategy_basis_arb(market, secs_left, tracker, position):
                         reason="spread_too_wide")
             return position
 
-        price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
+        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         size  = min(MAX_BET * intensity, tracker.balance * 0.3)
         size  = max(size, MIN_BET)
 
@@ -1283,7 +1421,7 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
 
         direction = "DOWN" if deviation > 0 else "UP"
         intensity = min(abs(deviation) / 0.15, 1.0)
-        price     = prices["up_mid"] if direction == "UP" else prices["down_mid"]
+        price     = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         size      = min(MAX_BET * intensity, tracker.balance * 0.3)
         size      = max(size, MIN_BET)
 
@@ -1357,7 +1495,7 @@ def strategy_volume_clock(market, secs_left, tracker, position):
                         reason="spread_too_wide")
             return position
 
-        price = prices["up_mid"] if direction == "UP" else prices["down_mid"]
+        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         size  = min(MAX_BET * intensity, tracker.balance * 0.3)
         size  = max(size, MIN_BET)
 
@@ -1387,13 +1525,14 @@ def run():
     log.info("Waiting 3s for WebSocket connections to establish...")
     time.sleep(3)
 
+    portfolio = SharedPortfolio(STARTING_BALANCE)
     trackers = {
-        "chainlink":   StrategyTracker("Chainlink Arb"),
-        "funding":     StrategyTracker("Funding Reversion"),
-        "liquidation": StrategyTracker("Liquidation Cascade"),
-        "basis":       StrategyTracker("Basis Arb"),
-        "odds":        StrategyTracker("Odds Mispricing"),
-        "volume":      StrategyTracker("Volume Clock"),
+        "chainlink":   StrategyTracker("Chainlink Arb",        portfolio),
+        "funding":     StrategyTracker("Funding Reversion",    portfolio),
+        "liquidation": StrategyTracker("Liquidation Cascade",  portfolio),
+        "basis":       StrategyTracker("Basis Arb",            portfolio),
+        "odds":        StrategyTracker("Odds Mispricing",      portfolio),
+        "volume":      StrategyTracker("Volume Clock",         portfolio),
     }
 
     positions         = {k: None for k in trackers}
@@ -1514,6 +1653,8 @@ def run():
                 log.info("=" * 60)
                 log.info("STRATEGY PERFORMANCE SUMMARY (local estimates)")
                 log.info("Ground truth win rates available via resolver.py")
+                for line in portfolio.summary_lines():
+                    log.info(line)
                 for t in trackers.values():
                     log.info(t.summary())
                 log.info("=" * 60)
@@ -1524,6 +1665,8 @@ def run():
         except KeyboardInterrupt:
             log.info("Stopped.")
             log.info("FINAL LOCAL SUMMARY:")
+            for line in portfolio.summary_lines():
+                log.info(line)
             for t in trackers.values():
                 log.info(t.summary())
             break
