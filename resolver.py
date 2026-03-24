@@ -90,26 +90,27 @@ def fetch_pending_trades() -> list:
 def fetch_unresolved_condition_ids() -> set:
     """
     Collect all distinct condition_ids that have unresolved rows in
-    signal_log — regardless of whether a trade exists.
+    signal_log or market_snapshots — regardless of whether a trade exists.
     """
     condition_ids = set()
-    try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/signal_log",
-            headers={**sb_headers(), "Range": "0-999"},
-            params={
-                "resolved_outcome": "is.null",
-                "select":           "condition_id",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        for row in resp.json():
-            cid = row.get("condition_id")
-            if cid:
-                condition_ids.add(cid)
-    except Exception as e:
-        log.warning(f"Failed to fetch unresolved condition_ids from signal_log: {e}")
+    for table in ("signal_log", "market_snapshots"):
+        try:
+            resp = requests.get(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers={**sb_headers(), "Range": "0-999"},
+                params={
+                    "resolved_outcome": "is.null",
+                    "select":           "condition_id",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            for row in resp.json():
+                cid = row.get("condition_id")
+                if cid:
+                    condition_ids.add(cid)
+        except Exception as e:
+            log.warning(f"Failed to fetch unresolved condition_ids from {table}: {e}")
     return condition_ids
 
 
@@ -136,9 +137,6 @@ def patch_trade(row_id: int, trade_id: str, outcome_data: dict) -> bool:
 def resolve_signal_logs(outcome: str, condition_id: str):
     """
     Patch all signal_log rows for this condition_id with the resolved outcome.
-    Allows win-rate analysis on signals that did NOT fire (fired=False),
-    showing whether the signal direction was correct even when it didn't trade.
-    Requires: ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS resolved_outcome text;
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
@@ -155,6 +153,28 @@ def resolve_signal_logs(outcome: str, condition_id: str):
             log.info(f"Updated {len(updated)} signal_log row(s) for {condition_id[:12]}... → {outcome}")
     except Exception as e:
         log.warning(f"Signal log resolution failed: {e}")
+
+
+def resolve_market_snapshots(outcome: str, condition_id: str):
+    """
+    Patch all market_snapshots rows for this condition_id with the resolved outcome.
+    This is the primary ML training label — without it the snapshot rows are unlabelled.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/market_snapshots",
+            headers={**sb_headers(), "Prefer": "return=representation"},
+            params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
+            json={"resolved_outcome": outcome},
+            timeout=10,
+        )
+        updated = resp.json() if resp.content else []
+        if updated:
+            log.info(f"Updated {len(updated)} market_snapshot(s) for {condition_id[:12]}... → {outcome}")
+    except Exception as e:
+        log.warning(f"Market snapshot resolution failed: {e}")
 
 
 def fetch_strategy_summary() -> list:
@@ -348,6 +368,7 @@ def resolve_pending_trades(outcome_cache: dict) -> int:
                      f"age={age_secs:.0f}s | {trade.get('strategy','')} | "
                      f"{trade.get('question','')[:50]}")
             resolve_signal_logs(outcome, condition_id)
+            resolve_market_snapshots(outcome, condition_id)
             resolved_count += 1
 
     if skipped_young:
@@ -383,6 +404,7 @@ def resolve_independent_signals(outcome_cache: dict):
         if result.get("resolved") is True:
             outcome = result["outcome"]
             resolve_signal_logs(outcome, condition_id)
+            resolve_market_snapshots(outcome, condition_id)
         elif result.get("resolved") == "ZERO_PRICES":
             log.debug(f"condition_id={condition_id[:12]}... closed but no winner yet — will retry")
         else:

@@ -286,6 +286,30 @@ def supabase_signal_log(entry: dict):
         log.warning(f"Supabase signal_log insert failed: {e}")
 
 
+def supabase_market_snapshot(snapshot: dict):
+    """
+    Insert one row per poll cycle capturing ALL signal values simultaneously.
+    This is the primary ML training table — one row = one moment in time,
+    all features observed together, label = resolved_outcome (patched later).
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/market_snapshots",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            json=snapshot,
+            timeout=5,
+        )
+    except Exception as e:
+        log.warning(f"market_snapshot insert failed: {e}")
+
+
 def _log_signal(strategy: str, market, secs_left: float,
                 signal_value: float, threshold: float, reason: str):
     """Helper — builds and sends a signal log entry for a non-firing evaluation."""
@@ -2290,7 +2314,64 @@ def run():
                 current_market, secs_left, trackers["ob_pressure"],
                 positions["ob_pressure"])
 
-            # Refresh win rates every 30 minutes so Kelly sizing
+            # ── ML TRAINING SNAPSHOT ──────────────────────────────────────────
+            # Write one row per poll cycle with ALL signal values simultaneously.
+            # resolved_outcome patched later by resolver.py — same as signal_log.
+            # This is the primary feature matrix for future ML training.
+            try:
+                cl_price, cl_age = fetch_chainlink_price()
+                cl_div = round((spot - cl_price) / cl_price * 100, 6) if cl_price else 0.0
+
+                binance_liq     = get_binance_liq_2min()
+                liq_long        = _liq_cache["long"]  + binance_liq["long"]
+                liq_short       = _liq_cache["short"] + binance_liq["short"]
+                liq_total       = liq_long + liq_short
+                liq_imbalance   = round((liq_long - liq_short) / liq_total, 4) if liq_total > 0 else 0.0
+
+                candles     = list(_volume_history)
+                recent      = candles[-3:] if len(candles) >= 3 else []
+                total_vol   = sum(c["volume"] for c in recent)
+                buy_vol     = sum(c["buy_vol"] for c in recent)
+                buy_ratio   = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
+
+                supabase_market_snapshot({
+                    "condition_id":       current_market.condition_id,
+                    "market_question":    current_market.question,
+                    "market_end_time":    current_market.end_time.isoformat(),
+                    "secs_left":          round(secs_left, 1),
+                    # Price and macro
+                    "btc_price":          round(spot, 2),
+                    "basis_pct":          round(basis, 6),
+                    "funding_rate":       round(_funding_cache["rate"], 6),
+                    "okx_funding":        round(_funding_cache["okx"], 6),
+                    "gate_funding":       round(_funding_cache["binance"], 6),
+                    # Chainlink signal
+                    "cl_divergence":      round(cl_div, 6),
+                    "cl_age":             round(cl_age, 1) if cl_age else 0.0,
+                    # Liquidation signal
+                    "liq_total":          round(liq_total, 2),
+                    "liq_long":           round(liq_long, 2),
+                    "liq_short":          round(liq_short, 2),
+                    "liq_imbalance":      liq_imbalance,
+                    "vol_range_pct":      round(_vol_cache.get("range_pct", 0.0), 6),
+                    # Order book signal
+                    "ob_imbalance":       round(_ob_cache.get("imbalance", 0.0), 4),
+                    "ob_spread_pct":      round(_ob_cache.get("spread_pct", 0.0), 6),
+                    # Volume signal
+                    "volume_buy_ratio":   buy_ratio,
+                    # Regime
+                    "regime":             _regime["composite"],
+                    "momentum_label":     _regime["momentum_label"],
+                    "volatility_label":   _regime["volatility_label"],
+                    "flow_label":         _regime["flow_label"],
+                    "session":            _regime["session"],
+                    "activity":           _regime["activity"],
+                    "day_type":           _regime["day_type"],
+                    # Label — patched by resolver when market settles
+                    "resolved_outcome":   None,
+                })
+            except Exception as e:
+                log.debug(f"market_snapshot write failed: {e}")
             # automatically improves as more trades resolve
             if time.time() - last_winrate_fetch > 1800:
                 new_rates = fetch_win_rates()
