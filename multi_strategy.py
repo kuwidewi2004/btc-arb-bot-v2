@@ -1211,7 +1211,7 @@ def _book_fill_price(book: dict, size_usdc: float) -> tuple:
     return round(fill_price, 6), round(slippage, 6)
 
 
-def fetch_poly_prices(market: Market, size_usdc: float = MAX_BET) -> dict:
+def fetch_poly_prices(market: Market, size_usdc: float = 50.0) -> dict:
     """
     Returns executable fill prices (ask-side) for both tokens, plus spread.
     fill_up / fill_down are estimated taker prices for a buy of size_usdc.
@@ -2003,7 +2003,7 @@ def strategy_ob_pressure(market, secs_left, tracker, position):
                         reason="momentum_direction_conflict")
             return position
 
-        prices = fetch_poly_prices(market, MAX_BET)
+        prices = fetch_poly_prices(market, 50.0)
         if prices["spread"] > 0.06:
             _log_signal("OB Pressure", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
