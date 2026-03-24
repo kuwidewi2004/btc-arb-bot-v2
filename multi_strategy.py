@@ -1,7 +1,7 @@
 """
-Multi-Strategy Mechanical Edge Simulator v3.2
+Multi-Strategy Mechanical Edge Simulator v3.3
 ==============================================
-Runs 7 independent mechanical edge strategies simultaneously in dry run.
+Runs 8 independent mechanical edge strategies simultaneously in dry run.
 
 Strategies:
   1. Chainlink lag arb     — Coinbase (real-time) vs Chainlink (lagging oracle)
@@ -11,6 +11,7 @@ Strategies:
   5. Odds mispricing       — Polymarket odds deviating from 50/50
   6. Volume clock          — aggressive order flow before resolution
   7. OB pressure           — Binance futures order book imbalance
+  8. Price anchor          — BTC displacement from market open vs time remaining
 
 Data sources (all work on Railway US servers):
   - Spot prices:    Coinbase + Kraken fallback
@@ -37,19 +38,15 @@ CHANGES (v3.1):
   - Background thread maintains WebSocket connection with auto-reconnect
   - fetch_chainlink_price() now reads from shared in-memory cache
 
-CHANGES (v3.2):
-  - All HTTP calls use a shared requests.Session with retry + exponential
-    backoff (3 retries, 0.5s backoff, retries on 429/5xx)
-  - StrategyTracker.close() PnL formula corrected to binary options payoff:
-      WIN:  size * (1/entry_price - 1) - round_trip_fees
-      LOSS: -size - round_trip_fees
-    Previously used CFD-style formula which was wrong for non-0/1 exit prices
-  - kelly_size() returns 0.0 (not MIN_BET) when entry_price is 0 or 1
-  - _binance_liq_buffer switched from list to deque; pop(0) → popleft() O(1)
-  - SharedPortfolio._wins/_losses mutations moved inside _lock
-  - fetch_win_rates() and restore_state_from_supabase() use paginated
-    Supabase fetches via _sb_fetch_all() — no more silent 1000-row truncation
-  - import math moved to top-level (was inside compute_regime() every cycle)
+CHANGES (v3.3):
+  - Strategy 8: Price Anchor added
+    Directly models the resolution condition: BTC must close above its
+    opening price for UP to win. Fires when displacement from open is
+    large enough and time remaining is short enough that reversal is
+    unlikely. Intensity scales with both displacement magnitude and
+    market progress (how far through the 5-minute window we are).
+    New columns added to trades, signal_log, market_snapshots:
+      price_anchor_pct, price_anchor_score, anchor_market_progress
 """
 
 import os
@@ -2238,6 +2235,117 @@ def strategy_ob_pressure(market, secs_left, tracker, position):
     return position
 
 
+def strategy_price_anchor(market, secs_left, tracker, position,
+                          market_open_price: float, market_progress: float):
+    """
+    Strategy 8: Price anchor.
+
+    Polymarket resolves UP if BTC closes above its price at market open,
+    DOWN if below. The opening price is therefore the single most important
+    reference point for resolution — more so than any external signal.
+
+    This strategy directly models that resolution condition:
+      - If BTC is sufficiently above open with limited time left → bet UP
+      - If BTC is sufficiently below open with limited time left → bet DOWN
+
+    The core insight is that reversal probability decreases as time runs out.
+    A 0.20% displacement with 30 seconds left is far more predictive than the
+    same displacement with 240 seconds left. We model this by requiring both:
+      1. displacement >= threshold (price has moved enough to matter)
+      2. market_progress >= 0.50 (at least halfway through — reduces false early fires)
+
+    Intensity scales with both displacement magnitude AND market progress,
+    so late-market large displacements get the largest Kelly allocation.
+
+    Conditions to fire:
+      1. market_open_price > 0 (opening price captured)
+      2. market_progress >= 0.50 (at least 150s elapsed in a 300s market)
+      3. |price_vs_open_pct| >= DISPLACEMENT_THRESHOLD (0.10%)
+      4. 20 <= secs_left <= 200 (not too early, not too late to fill)
+      5. Polymarket spread <= 0.06
+      6. No existing position
+    """
+    try:
+        if market_open_price <= 0:
+            return position
+
+        if market_progress < 0.50:
+            _log_signal("Price Anchor", market, secs_left,
+                        signal_value=market_progress, threshold=0.50,
+                        reason="too_early_in_market")
+            return position
+
+        if secs_left > 200:
+            _log_signal("Price Anchor", market, secs_left,
+                        signal_value=secs_left, threshold=200,
+                        reason="secs_left_too_high")
+            return position
+
+        if secs_left < 20:
+            _log_signal("Price Anchor", market, secs_left,
+                        signal_value=secs_left, threshold=20,
+                        reason="too_close_to_resolution")
+            return position
+
+        spot = _price_cache["btc"]
+        if spot <= 0:
+            return position
+
+        price_vs_open_pct = (spot - market_open_price) / market_open_price * 100
+
+        DISPLACEMENT_THRESHOLD = 0.10   # % move from open required to fire
+        if abs(price_vs_open_pct) < DISPLACEMENT_THRESHOLD:
+            _log_signal("Price Anchor", market, secs_left,
+                        signal_value=abs(price_vs_open_pct),
+                        threshold=DISPLACEMENT_THRESHOLD,
+                        reason="displacement_too_small")
+            return position
+
+        direction = "UP" if price_vs_open_pct > 0 else "DOWN"
+
+        if position:
+            return position
+
+        prices = fetch_poly_prices(market)
+        if prices["spread"] > 0.06:
+            _log_signal("Price Anchor", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="spread_too_wide")
+            return position
+
+        # Intensity = displacement strength × market progress
+        # Both must be high for full Kelly allocation.
+        # displacement_score: 0.10% → 0.33, 0.20% → 0.67, 0.30%+ → 1.0
+        displacement_score = min(abs(price_vs_open_pct) / 0.30, 1.0)
+        # progress_score: 0.50 → 0.0, 0.75 → 0.5, 1.0 → 1.0 (linear above 0.50)
+        progress_score     = min((market_progress - 0.50) / 0.50, 1.0)
+        intensity          = round(displacement_score * progress_score, 4)
+
+        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
+        size  = kelly_size(intensity, price, tracker.balance, "Price Anchor")
+        if size == 0.0:
+            return position
+
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"price_vs_open_pct":    round(price_vs_open_pct, 6),
+                         "market_open_price":    round(market_open_price, 2),
+                         "market_progress":      round(market_progress, 4),
+                         "displacement_score":   round(displacement_score, 4),
+                         "progress_score":       round(progress_score, 4),
+                         "intensity":            intensity,
+                         "secs_left":            round(secs_left)},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("price_anchor", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
+    except Exception as e:
+        log.warning(f"[Price anchor] error: {e}")
+    return position
+
+
 def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
     """
     On startup, query Supabase for any OPEN trades that are not yet resolved.
@@ -2280,6 +2388,7 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
         "Odds Mispricing":     "odds",
         "Volume Clock":        "volume",
         "OB Pressure":         "ob_pressure",
+        "Price Anchor":        "price_anchor",
     }
 
     now = datetime.now(timezone.utc)
@@ -2354,7 +2463,7 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
 
 def run():
     log.info("Multi-Strategy Mechanical Edge Simulator v3.2")
-    log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume | OB Pressure")
+    log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume | OB Pressure | Price Anchor")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
 
@@ -2366,13 +2475,14 @@ def run():
 
     portfolio = SharedPortfolio(STARTING_BALANCE)
     trackers = {
-        "chainlink":   StrategyTracker("Chainlink Arb",        portfolio),
-        "funding":     StrategyTracker("Funding Reversion",    portfolio),
-        "liquidation": StrategyTracker("Liquidation Cascade",  portfolio),
-        "basis":       StrategyTracker("Basis Arb",            portfolio),
-        "odds":        StrategyTracker("Odds Mispricing",      portfolio),
-        "volume":      StrategyTracker("Volume Clock",         portfolio),
-        "ob_pressure": StrategyTracker("OB Pressure",         portfolio),
+        "chainlink":     StrategyTracker("Chainlink Arb",        portfolio),
+        "funding":       StrategyTracker("Funding Reversion",    portfolio),
+        "liquidation":   StrategyTracker("Liquidation Cascade",  portfolio),
+        "basis":         StrategyTracker("Basis Arb",            portfolio),
+        "odds":          StrategyTracker("Odds Mispricing",      portfolio),
+        "volume":        StrategyTracker("Volume Clock",         portfolio),
+        "ob_pressure":   StrategyTracker("OB Pressure",         portfolio),
+        "price_anchor":  StrategyTracker("Price Anchor",        portfolio),
     }
 
     # Restore open positions and exposure from Supabase before first poll cycle.
@@ -2466,7 +2576,17 @@ def run():
                      f"regime={_regime['composite']} | session={_regime['session']} | "
                      f"activity={_regime['activity']}")
 
-            # Run all 7 strategies
+            # Capture opening price on first poll of each market.
+            # Must happen before strategy calls so price_anchor sees it.
+            if market_open_price == 0.0 and spot > 0:
+                market_open_price = spot
+                log.info(f"Market open price captured: ${market_open_price:.2f}")
+
+            # Track max secs_left to infer true market duration for progress calc.
+            # Must happen before strategy calls so price_anchor gets correct progress.
+            max_secs_left = max(max_secs_left, secs_left)
+
+            # Run all 8 strategies
             positions["chainlink"]   = strategy_chainlink_arb(
                 current_market, secs_left, trackers["chainlink"],
                 positions["chainlink"], cl_history)
@@ -2495,6 +2615,18 @@ def run():
                 current_market, secs_left, trackers["ob_pressure"],
                 positions["ob_pressure"])
 
+            # Compute market_progress here so price_anchor can use it.
+            # market_open_price is captured on first poll each market (below in snapshot block).
+            # We compute progress from the same max_secs_left tracker used in snapshots.
+            _anchor_progress = round(
+                max(0.0, min(1.0, 1.0 - secs_left / max_secs_left))
+                if max_secs_left > 0 else 0.0, 4)
+
+            positions["price_anchor"] = strategy_price_anchor(
+                current_market, secs_left, trackers["price_anchor"],
+                positions["price_anchor"],
+                market_open_price, _anchor_progress)
+
             # ── ML TRAINING SNAPSHOT ──────────────────────────────────────────
             # Write one row per poll cycle with ALL signal values simultaneously.
             # resolved_outcome patched later by resolver.py.
@@ -2514,9 +2646,7 @@ def run():
                 buy_vol   = sum(c["buy_vol"] for c in recent)
                 buy_ratio = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
 
-                # Capture opening prices on first poll of each market
-                if market_open_price == 0.0 and spot > 0:
-                    market_open_price = spot
+                # Chainlink opening price — still captured in snapshot block
                 if cl_open_price == 0.0 and cl_price:
                     cl_open_price = cl_price
 
@@ -2529,9 +2659,7 @@ def run():
                 cl_vs_open_pct = round((cl_price - cl_open_price) / cl_open_price * 100, 6) \
                                  if cl_price and cl_open_price > 0 else 0.0
 
-                # Market progress 0→1 (open→close)
-                # Track max secs_left seen this market to infer true duration
-                max_secs_left = max(max_secs_left, secs_left)
+                # market_progress — max_secs_left already updated before strategies
                 effective_duration = max_secs_left if max_secs_left > 0 else 300.0
                 market_progress = round(max(0.0, min(1.0, 1.0 - secs_left / effective_duration)), 4)
 
@@ -2629,6 +2757,11 @@ def run():
                     "hour_cos":            _regime["hour_cos"],
                     "dow_sin":             _regime["dow_sin"],
                     "dow_cos":             _regime["dow_cos"],
+                    # Price anchor signal — same values used by strategy_price_anchor
+                    "anchor_open_price":   round(market_open_price, 2),
+                    "anchor_pct":          price_vs_open_pct,
+                    "anchor_score":        price_vs_open_score,
+                    "anchor_progress":     market_progress,
                     # Label — patched by resolver when market settles
                     "resolved_outcome":    None,
                 })
