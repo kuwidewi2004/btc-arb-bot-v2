@@ -192,31 +192,64 @@ class StrategyTrade:
 # Each strategy draws from and returns to the same balance,
 # so combined exposure is visible and capped in one place.
 
+# Maximum fraction of portfolio that can be committed in one direction
+# on a single 5-minute market across all strategies combined.
+MAX_DIRECTIONAL_EXPOSURE = 0.40   # 40% of portfolio per direction per market
+
+
 class SharedPortfolio:
     """
     Single capital pool for all strategies.
-    Thread-safe via a lock — strategies run sequentially in the main loop
-    but the lock guards against any future concurrency.
+    Also tracks per-market directional exposure so correlated bets
+    across strategies cannot silently stack beyond the cap.
     """
     def __init__(self, balance: float):
         self._lock      = threading.Lock()
         self.balance    = balance
         self.start_bal  = balance
-        # Per-strategy win/loss counters (diagnostic only — ground truth in Supabase)
         self._wins:   dict = {}
         self._losses: dict = {}
+        # exposure[condition_id][direction] = total size committed
+        self._exposure: dict = {}
 
     def available(self) -> float:
         with self._lock:
             return self.balance
 
-    def debit(self, size: float, fee: float):
+    def directional_exposure(self, condition_id: str, direction: str) -> float:
+        """Return total size already committed in this direction on this market."""
+        with self._lock:
+            return self._exposure.get(condition_id, {}).get(direction, 0.0)
+
+    def exposure_cap_remaining(self, condition_id: str, direction: str) -> float:
+        """How much more size is allowed in this direction before hitting the cap."""
+        with self._lock:
+            cap       = self.balance * MAX_DIRECTIONAL_EXPOSURE
+            committed = self._exposure.get(condition_id, {}).get(direction, 0.0)
+            return max(0.0, cap - committed)
+
+    def debit(self, size: float, fee: float,
+              condition_id: str = "", direction: str = ""):
         with self._lock:
             self.balance -= (size + fee)
+            if condition_id and direction:
+                if condition_id not in self._exposure:
+                    self._exposure[condition_id] = {}
+                prev = self._exposure[condition_id].get(direction, 0.0)
+                self._exposure[condition_id][direction] = prev + size
 
-    def credit(self, amount: float):
+    def credit(self, amount: float,
+               condition_id: str = "", direction: str = "", size: float = 0.0):
         with self._lock:
             self.balance += amount
+            if condition_id and direction and size > 0:
+                prev = self._exposure.get(condition_id, {}).get(direction, 0.0)
+                self._exposure.setdefault(condition_id, {})[direction] = max(0.0, prev - size)
+
+    def clear_exposure(self, condition_id: str):
+        """Called when a market expires — clears all exposure tracking for it."""
+        with self._lock:
+            self._exposure.pop(condition_id, None)
 
     def record_win(self, strategy: str):
         self._wins[strategy]   = self._wins.get(strategy, 0) + 1
@@ -258,11 +291,22 @@ class StrategyTracker:
              signal_data: dict, market: Market) -> str:
         """
         Records an open position locally and writes ONE row to Supabase.
+        Enforces per-market directional exposure cap before opening.
         Returns the trade_id so the caller can store it on StrategyTrade.
-        The resolver will later patch this row with the real outcome.
         """
+        # Enforce directional exposure cap — cap size to whatever room remains
+        cap_remaining = self.portfolio.exposure_cap_remaining(market.condition_id, side)
+        if cap_remaining <= 0:
+            log.info(f"[{self.name}] Exposure cap reached for {side} on "
+                     f"{market.condition_id[:12]}... — skipping")
+            return ""
+        size = min(size, cap_remaining)
+        if size < MIN_BET:
+            log.info(f"[{self.name}] Remaining cap ${cap_remaining:.2f} below MIN_BET — skipping")
+            return ""
+
         fee = size * TAKER_FEE
-        self.portfolio.debit(size, fee)
+        self.portfolio.debit(size, fee, market.condition_id, side)
         trade_id = str(uuid.uuid4())
 
         entry = {
@@ -313,9 +357,10 @@ class StrategyTracker:
             pnl = (exit_price - entry_price) * size / entry_price
         else:
             pnl = (entry_price - exit_price) * size / entry_price
-        fee = size * TAKER_FEE
+        # Round-trip fee: open taker + close taker — matches resolver.py accounting
+        fee = size * TAKER_FEE * 2
         pnl -= fee
-        self.portfolio.credit(size + pnl)
+        self.portfolio.credit(size + pnl, market.condition_id, side, size)
         if pnl > 0:
             self.portfolio.record_win(self.name)
         else:
@@ -336,7 +381,7 @@ class StrategyTracker:
             "exit_price":   exit_price,
             "size":         size,
             "pnl":          round(pnl, 4),
-            "fee":          round(fee, 4),
+            "fee":          round(fee, 4),   # round-trip: open + close taker
             "portfolio":    round(self.portfolio.available(), 2),
             "condition_id": market.condition_id,
         }
@@ -355,7 +400,7 @@ class StrategyTracker:
         Does not count as win or loss. Does not write to Supabase —
         resolver.py will mark the row VOID when it confirms the market outcome.
         """
-        self.portfolio.credit(pos.size)  # refund stake, fees are lost
+        self.portfolio.credit(pos.size, market.condition_id, pos.side, pos.size)  # refund stake, fees are lost
         entry = {
             "timestamp":    datetime.now(timezone.utc).isoformat(),
             "action":       "VOID_LOCAL",
@@ -479,7 +524,9 @@ def refresh_shared_data():
         except Exception as e:
             log.warning(f"Basis fetch failed: {e}")
 
-    # Liquidations via OKX
+    # Liquidations via OKX — 2-minute window, refreshed every 60s
+    # _liq_cache holds OKX-only values. Binance WebSocket data is combined
+    # inside strategy_liquidation_cascade() with a matching 2-minute window.
     if now - _liq_cache["fetched_at"] >= 60:
         try:
             r = requests.get(
@@ -489,7 +536,7 @@ def refresh_shared_data():
                 timeout=5)
             r.raise_for_status()
             orders    = r.json().get("data", [{}])[0].get("details", [])
-            cutoff_ms = (now - 300) * 1000
+            cutoff_ms = (now - 120) * 1000   # 2-minute window matches Binance
             long_liqs = short_liqs = 0.0
             for o in orders:
                 if float(o.get("ts", 0)) < cutoff_ms:
@@ -502,18 +549,6 @@ def refresh_shared_data():
             _liq_cache["fetched_at"] = now
         except Exception as e:
             log.warning(f"Liquidation fetch failed: {e}")
-
-        # Merge Binance liquidations (WebSocket feed) into cache
-        # Binance handles 3-5x more BTC liq volume than OKX
-        try:
-            bnb = get_binance_liq_5min()
-            _liq_cache["long"]  += bnb["long"]
-            _liq_cache["short"] += bnb["short"]
-            if bnb["long"] + bnb["short"] > 0:
-                log.info(f"Liquidations — OKX+Binance combined | "
-                         f"long=${_liq_cache['long']:,.0f} short=${_liq_cache['short']:,.0f}")
-        except Exception as e:
-            log.warning(f"Binance liq merge failed: {e}")
 
     # 5-minute BTC price range for volatility-adjusted liquidation signal
     # Uses OKX 1m klines — high/low over last 5 candles
@@ -1034,14 +1069,17 @@ def fetch_market_winner(condition_id: str) -> Optional[str]:
         time.sleep(POLL_INTERVAL)
 
 
-def resolve_positions(positions: dict, trackers: dict, market: Market) -> dict:
+def resolve_positions(positions: dict, trackers: dict,
+                      market: Market, portfolio: "SharedPortfolio") -> dict:
     """
     Resolves all open positions for an expired market.
     Updates local balance/win-loss counters only.
+    Clears directional exposure tracking for this market.
     Supabase outcome writes happen in resolver.py using trade_id.
     """
     any_open = any(p is not None for p in positions.values())
     if not any_open:
+        portfolio.clear_exposure(market.condition_id)
         return {k: None for k in positions}
 
     log.info(f"Resolving market locally: {market.question}")
@@ -1064,6 +1102,7 @@ def resolve_positions(positions: dict, trackers: dict, market: Market) -> dict:
         else:
             log.error(f"Unexpected outcome value: {outcome} — skipping close for {key}")
 
+    portfolio.clear_exposure(market.condition_id)
     return {k: None for k in positions}
 
 
@@ -1175,6 +1214,8 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
                          "cl_age":      round(cl_age, 1),
                          "momentum":    round(momentum, 4)},
                         market)
+            if not trade_id:
+                return position
             t = StrategyTrade("chainlink_arb", direction, size, price, market)
             t.trade_id = trade_id
             return t
@@ -1238,6 +1279,8 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
                          "avg_rate":  round(avg_rate, 6),
                          "intensity": round(intensity, 3)},
                         market)
+            if not trade_id:
+                return position
             t = StrategyTrade("funding_reversion", direction, size, price, market)
             t.trade_id = trade_id
             return t
@@ -1251,19 +1294,17 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
     Strategy 3: Liquidation cascade.
     Large long liquidations = forced selling = bet DOWN.
     Large short liquidations = short squeeze = bet UP.
-    Data from OKX (REST poll) + Binance (WebSocket) — combined for full market picture.
 
-    Improvements:
-    - 2-minute lookback (was 5min) — more recent signal, price hasn't already moved
-    - Volatility-adjusted intensity — $50M in calm market != $50M in volatile market
-    - Minimum imbalance ratio required — filters balanced liquidation events
+    Data sources:
+      - OKX REST poll: 2-minute window, stored in _liq_cache (OKX-only)
+      - Binance WebSocket: 2-minute window, fetched fresh here via get_binance_liq_2min()
+    Both use identical 2-minute lookback — no double-counting, no window mismatch.
     """
     try:
+        # OKX 2min (from cache) + Binance 2min (from WebSocket buffer) — same window
         binance    = get_binance_liq_2min()
-        okx_long   = _liq_cache["long"]
-        okx_short  = _liq_cache["short"]
-        long_liqs  = okx_long  + binance["long"]
-        short_liqs = okx_short + binance["short"]
+        long_liqs  = _liq_cache["long"]  + binance["long"]
+        short_liqs = _liq_cache["short"] + binance["short"]
         total      = long_liqs + short_liqs
 
         if total < 300_000:
@@ -1321,6 +1362,8 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
                          "intensity":   round(adjusted_intensity, 3),
                          "source":      "OKX+Binance"},
                         market)
+            if not trade_id:
+                return position
             t = StrategyTrade("liquidation_cascade", direction, size, price, market)
             t.trade_id = trade_id
             return t
@@ -1378,6 +1421,8 @@ def strategy_basis_arb(market, secs_left, tracker, position):
                         {"basis_pct": round(basis_pct, 4),
                          "spot": round(spot, 2), "futures": round(futures, 2)},
                         market)
+            if not trade_id:
+                return position
             t = StrategyTrade("basis_arb", direction, size, price, market)
             t.trade_id = trade_id
             return t
@@ -1435,6 +1480,8 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
                         {"up_mid": round(up_mid, 4), "deviation": round(deviation, 4),
                          "secs_left": round(secs_left)},
                         market)
+            if not trade_id:
+                return position
             t = StrategyTrade("odds_mispricing", direction, size, price, market)
             t.trade_id = trade_id
             return t
@@ -1508,6 +1555,8 @@ def strategy_volume_clock(market, secs_left, tracker, position):
             trade_id = tracker.open(direction, price, size,
                         {"buy_ratio": round(buy_ratio, 4), "secs_left": round(secs_left)},
                         market)
+            if not trade_id:
+                return position
             t = StrategyTrade("volume_clock", direction, size, price, market)
             t.trade_id = trade_id
             return t
@@ -1628,6 +1677,8 @@ def strategy_ob_pressure(market, secs_left, tracker, position):
             log.info(f"[OB Pressure] {direction} | imbalance={imbalance:+.3f} | "
                      f"momentum={momentum:+.3f}% | slip={slip:+.4f} | "
                      f"size={size:.2f} @ {price:.4f}")
+            if not trade_id:
+                return position
             t = StrategyTrade("ob_pressure", direction, size, price, market)
             t.trade_id = trade_id
             return t
@@ -1686,6 +1737,8 @@ def run():
                 if market and (not current_market or
                                market.condition_id != current_market.condition_id):
                     log.info(f"New market: {market.question}")
+                    if current_market:
+                        portfolio.clear_exposure(current_market.condition_id)
                     current_market = market
                     positions      = {k: None for k in trackers}
                     cl_history.clear()
@@ -1701,7 +1754,7 @@ def run():
             # Market expired — resolve all open positions locally
             if secs_left <= 0:
                 log.info(f"Market expired: {current_market.question} — resolving positions locally")
-                positions         = resolve_positions(positions, trackers, current_market)
+                positions         = resolve_positions(positions, trackers, current_market, portfolio)
                 current_market    = None
                 last_market_fetch = 0
                 time.sleep(5)
