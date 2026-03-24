@@ -1,4 +1,4 @@
-"""
+git add multi_strategy.py; git commit -m "feat: add OB pressure strategy"; git push origin main"""
 Multi-Strategy Mechanical Edge Simulator v3
 =============================================
 Runs 6 independent mechanical edge strategies simultaneously in dry run.
@@ -413,6 +413,8 @@ _funding_cache:  dict  = {"okx": 0.0, "binance": 0.0, "rate": 0.0, "fetched_at":
 _basis_cache:    dict  = {"spot": 0.0, "futures": 0.0, "fetched_at": 0.0}
 _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
+_ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
+                           "spread_pct": 0.0, "fetched_at": 0.0}
 _btc_history:    deque = deque(maxlen=12)  # last 60s of BTC prices (5s poll = 12 readings)
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
@@ -584,8 +586,36 @@ def refresh_shared_data():
         except Exception as e:
             log.warning(f"Volume fetch failed: {e}")
 
-
-# ------------------------------------------------- CHAINLINK WEBSOCKET CACHE --
+    # Binance futures order book imbalance — refreshed every 5s (every poll cycle)
+    # Uses top 10 levels on each side, depth weighted by size not just count
+    try:
+        BINANCE_FUTURES = "https://fapi.binance.com"
+        r = requests.get(
+            f"{BINANCE_FUTURES}/fapi/v1/depth",
+            params={"symbol": "BTCUSDT", "limit": 20},
+            timeout=4,
+        )
+        r.raise_for_status()
+        book      = r.json()
+        bid_depth = sum(float(b[1]) for b in book.get("bids", []))
+        ask_depth = sum(float(a[1]) for a in book.get("asks", []))
+        total     = bid_depth + ask_depth
+        imbalance = (bid_depth - ask_depth) / total if total > 0 else 0.0
+        bids      = book.get("bids", [])
+        asks      = book.get("asks", [])
+        best_bid  = float(bids[0][0]) if bids else 0.0
+        best_ask  = float(asks[0][0]) if asks else 0.0
+        mid       = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
+        spread_pct = (best_ask - best_bid) / mid * 100 if mid > 0 else 0.0
+        _ob_cache["imbalance"]  = round(imbalance, 4)
+        _ob_cache["bid_depth"]  = round(bid_depth, 2)
+        _ob_cache["ask_depth"]  = round(ask_depth, 2)
+        _ob_cache["spread_pct"] = round(spread_pct, 4)
+        _ob_cache["fetched_at"] = now
+        log.debug(f"OB imbalance={imbalance:+.3f} bid={bid_depth:.0f} ask={ask_depth:.0f} "
+                  f"spread={spread_pct:.4f}%")
+    except Exception as e:
+        log.warning(f"OB pressure fetch failed: {e}")
 # Polymarket broadcasts the exact Chainlink price it uses for resolution
 # via wss://ws-subscriptions-clob.polymarket.com/ws/ on topic
 # crypto_prices_chainlink. We subscribe in a background thread and keep
@@ -1511,11 +1541,132 @@ def strategy_volume_clock(market, secs_left, tracker, position):
     return position
 
 
+def strategy_ob_pressure(market, secs_left, tracker, position):
+    """
+    Strategy 7: Binance futures order book pressure.
+
+    Short-term BTC direction is often determined by who is more aggressive
+    right now — buyers lifting asks or sellers hitting bids. We measure this
+    using depth-weighted imbalance across the top 20 levels of the Binance
+    USDM futures book, which reflects real directional conviction unlike
+    Polymarket's market-maker-dominated book.
+
+    Signal is only meaningful in the last 90 seconds because:
+      - Earlier, the market has time to revert before resolution
+      - In the final 90s, BTC's current trajectory is the strongest predictor
+        of whether it closes UP or DOWN from its opening price
+
+    Conditions to fire:
+      1. 20 <= secs_left <= 90 (final window, not too close to wire)
+      2. |imbalance| >= 0.15  (meaningful directional skew, not noise)
+      3. BTC momentum (last 30s) confirms imbalance direction
+      4. Binance futures spread <= 0.003% (book is healthy, not dislocated)
+      5. Polymarket spread <= 0.06 (executable fill available)
+      6. No existing position
+    """
+    try:
+        if secs_left > 90:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=secs_left, threshold=90,
+                        reason="not_in_ob_window_yet")
+            return position
+
+        if secs_left < 20:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=secs_left, threshold=20,
+                        reason="too_close_to_resolution")
+            return position
+
+        if position:
+            return position
+
+        imbalance  = _ob_cache.get("imbalance", 0.0)
+        spread_pct = _ob_cache.get("spread_pct", 1.0)
+        fetched_at = _ob_cache.get("fetched_at", 0.0)
+
+        # Reject stale cache — OB data must be fresh (within 2 poll cycles)
+        if time.time() - fetched_at > POLL_SEC * 2:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=0.0, threshold=0.15,
+                        reason="ob_cache_stale")
+            return position
+
+        IMBALANCE_THRESHOLD = 0.15
+        if abs(imbalance) < IMBALANCE_THRESHOLD:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=abs(imbalance), threshold=IMBALANCE_THRESHOLD,
+                        reason="imbalance_too_weak")
+            return position
+
+        # Binance spread must be healthy — wide spread means dislocation not pressure
+        SPREAD_THRESHOLD = 0.003
+        if spread_pct > SPREAD_THRESHOLD:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=spread_pct, threshold=SPREAD_THRESHOLD,
+                        reason="binance_spread_too_wide")
+            return position
+
+        # BTC momentum must confirm — imbalance without price movement is noise
+        momentum = btc_momentum_pct(lookback_secs=30)
+        if momentum is None:
+            return position
+
+        MOMENTUM_THRESHOLD = 0.03
+        if abs(momentum) < MOMENTUM_THRESHOLD:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=abs(momentum), threshold=MOMENTUM_THRESHOLD,
+                        reason="momentum_too_weak")
+            return position
+
+        # Direction from imbalance; momentum must agree
+        direction    = "UP" if imbalance > 0 else "DOWN"
+        momentum_dir = "UP" if momentum > 0 else "DOWN"
+        if direction != momentum_dir:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=abs(imbalance), threshold=IMBALANCE_THRESHOLD,
+                        reason="momentum_direction_conflict")
+            return position
+
+        prices = fetch_poly_prices(market, MAX_BET)
+        if prices["spread"] > 0.06:
+            _log_signal("OB Pressure", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="polymarket_spread_too_wide")
+            return position
+
+        # Size scales with imbalance strength
+        intensity = min(abs(imbalance) / 0.40, 1.0)
+        size      = min(MAX_BET * intensity, tracker.balance * 0.3)
+        size      = max(size, MIN_BET)
+
+        price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
+        slip  = prices["slip_up"] if direction == "UP" else prices["slip_down"]
+
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"imbalance":   round(imbalance, 4),
+                         "momentum":    round(momentum, 4),
+                         "spread_pct":  round(spread_pct, 4),
+                         "slip":        round(slip, 4),
+                         "secs_left":   round(secs_left)},
+                        market)
+            log.info(f"[OB Pressure] {direction} | imbalance={imbalance:+.3f} | "
+                     f"momentum={momentum:+.3f}% | slip={slip:+.4f} | "
+                     f"size={size:.2f} @ {price:.4f}")
+            t = StrategyTrade("ob_pressure", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
+
+    except Exception as e:
+        log.warning(f"[OB Pressure] error: {e}")
+    return position
+
+
 # ------------------------------------------------------------------ MAIN -----
 
 def run():
-    log.info("Multi-Strategy Mechanical Edge Simulator v3.1")
-    log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume")
+    log.info("Multi-Strategy Mechanical Edge Simulator v3.2")
+    log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume | OB Pressure")
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
 
@@ -1533,6 +1684,7 @@ def run():
         "basis":       StrategyTracker("Basis Arb",            portfolio),
         "odds":        StrategyTracker("Odds Mispricing",      portfolio),
         "volume":      StrategyTracker("Volume Clock",         portfolio),
+        "ob_pressure": StrategyTracker("OB Pressure",         portfolio),
     }
 
     positions         = {k: None for k in trackers}
@@ -1647,6 +1799,10 @@ def run():
             positions["volume"]      = strategy_volume_clock(
                 current_market, secs_left, trackers["volume"],
                 positions["volume"])
+
+            positions["ob_pressure"] = strategy_ob_pressure(
+                current_market, secs_left, trackers["ob_pressure"],
+                positions["ob_pressure"])
 
             # Print summary every 30 minutes
             if time.time() - last_summary > 1800:
