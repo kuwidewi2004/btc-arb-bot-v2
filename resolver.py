@@ -1,5 +1,5 @@
 """
-Resolution Tracker v3.2
+Resolution Tracker v3.3
 ========================
 Runs alongside multi_strategy.py on Railway.
 
@@ -19,7 +19,7 @@ Every 60 seconds it:
   4. If not yet resolved: skips — will retry next cycle
   5. If market_end_time > 1 hour ago and still unresolved: marks VOID + gave_up_at
 
-INDEPENDENT RESOLUTION (v3.2):
+INDEPENDENT RESOLUTION (v3.2+):
   - signal_snapshots and signal_log are resolved independently of trades.
   - Any condition_id with unresolved rows in either table is checked against
     the CLOB API and patched, even if no trade was placed on that market.
@@ -31,12 +31,19 @@ trade_id is still stored on every row for reference and traceability.
 
 Summary queries only OPEN rows where resolved_outcome IS NOT NULL,
 so all win-rate stats are 100% ground truth from Polymarket.
+
+Fixes applied (v3.3):
+  - Supabase pagination: checks Content-Range header and fetches all pages (issue #8)
+  - CLOB requests use Session with retry + backoff (issue #7)
+  - ZERO_PRICES double-VOID race condition resolved (issue #6)
 """
 
 import os
 import time
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 from collections import defaultdict
 
@@ -55,6 +62,29 @@ TAKER_FEE      = 0.0025
 MIN_AGE_SECS   = 60
 MAX_AGE_SECS   = 3600
 
+# Supabase page size for paginated fetches
+_SB_PAGE_SIZE  = 1000
+
+
+# --------------------------------------------------------- HTTP SESSION ------
+
+def _make_session() -> requests.Session:
+    """Return a Session with automatic retry + exponential backoff."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET", "POST", "PATCH"},
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://",  adapter)
+    return session
+
+_session = _make_session()
+
 
 # ---------------------------------------------------------------- SUPABASE ---
 
@@ -66,25 +96,61 @@ def sb_headers() -> dict:
     }
 
 
+def _sb_fetch_all(table: str, params: dict) -> list:
+    """
+    FIX (#8): Paginate through Supabase results using Content-Range header.
+    Supabase returns 'Content-Range: 0-999/2345' — we iterate until we
+    have fetched all rows rather than silently truncating at page size.
+    """
+    rows   = []
+    offset = 0
+
+    while True:
+        range_header = f"{offset}-{offset + _SB_PAGE_SIZE - 1}"
+        try:
+            resp = _session.get(
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers={**sb_headers(), "Range": range_header},
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            page = resp.json()
+            if not page:
+                break
+            rows.extend(page)
+
+            # Parse Content-Range: "0-999/2345"
+            content_range = resp.headers.get("Content-Range", "")
+            if "/" in content_range:
+                try:
+                    total = int(content_range.split("/")[1])
+                    if offset + _SB_PAGE_SIZE >= total:
+                        break   # fetched everything
+                except ValueError:
+                    break
+            else:
+                # No total available — if page was full, try next page
+                if len(page) < _SB_PAGE_SIZE:
+                    break
+
+            offset += _SB_PAGE_SIZE
+
+        except Exception as e:
+            log.warning(f"Supabase paginated fetch failed ({table}, offset={offset}): {e}")
+            break
+
+    return rows
+
+
 def fetch_pending_trades() -> list:
-    try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/trades",
-            headers={**sb_headers(), "Range": "0-999"},
-            params={
-                "action":           "eq.OPEN",
-                "resolved_outcome": "is.null",
-                "market_end_time":  "not.is.null",
-                "select":           "id,trade_id,strategy,side,price,size,fee,"
-                                    "condition_id,question,market_end_time,created_at",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        log.warning(f"Failed to fetch pending trades: {e}")
-        return []
+    return _sb_fetch_all("trades", {
+        "action":           "eq.OPEN",
+        "resolved_outcome": "is.null",
+        "market_end_time":  "not.is.null",
+        "select":           "id,trade_id,strategy,side,price,size,fee,"
+                            "condition_id,question,market_end_time,created_at",
+    })
 
 
 def fetch_unresolved_condition_ids() -> set:
@@ -95,17 +161,11 @@ def fetch_unresolved_condition_ids() -> set:
     condition_ids = set()
     for table in ("signal_log", "market_snapshots"):
         try:
-            resp = requests.get(
-                f"{SUPABASE_URL}/rest/v1/{table}",
-                headers={**sb_headers(), "Range": "0-999"},
-                params={
-                    "resolved_outcome": "is.null",
-                    "select":           "condition_id",
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            for row in resp.json():
+            rows = _sb_fetch_all(table, {
+                "resolved_outcome": "is.null",
+                "select":           "condition_id",
+            })
+            for row in rows:
                 cid = row.get("condition_id")
                 if cid:
                     condition_ids.add(cid)
@@ -116,7 +176,7 @@ def fetch_unresolved_condition_ids() -> set:
 
 def patch_trade(row_id: int, trade_id: str, outcome_data: dict) -> bool:
     try:
-        resp = requests.patch(
+        resp = _session.patch(
             f"{SUPABASE_URL}/rest/v1/trades",
             headers={**sb_headers(), "Prefer": "return=representation"},
             params={"id": f"eq.{row_id}"},
@@ -135,13 +195,11 @@ def patch_trade(row_id: int, trade_id: str, outcome_data: dict) -> bool:
 
 
 def resolve_signal_logs(outcome: str, condition_id: str):
-    """
-    Patch all signal_log rows for this condition_id with the resolved outcome.
-    """
+    """Patch all signal_log rows for this condition_id with the resolved outcome."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        resp = requests.patch(
+        resp = _session.patch(
             f"{SUPABASE_URL}/rest/v1/signal_log",
             headers={**sb_headers(), "Prefer": "return=representation"},
             params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
@@ -163,7 +221,7 @@ def resolve_market_snapshots(outcome: str, condition_id: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        resp = requests.patch(
+        resp = _session.patch(
             f"{SUPABASE_URL}/rest/v1/market_snapshots",
             headers={**sb_headers(), "Prefer": "return=representation"},
             params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
@@ -178,22 +236,11 @@ def resolve_market_snapshots(outcome: str, condition_id: str):
 
 
 def fetch_strategy_summary() -> list:
-    try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/trades",
-            headers={**sb_headers(), "Range": "0-9999"},
-            params={
-                "action":           "eq.OPEN",
-                "resolved_outcome": "not.is.null",
-                "select":           "strategy,actual_win,pnl,flat_pnl,resolved_outcome",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        log.warning(f"Failed to fetch summary: {e}")
-        return []
+    return _sb_fetch_all("trades", {
+        "action":           "eq.OPEN",
+        "resolved_outcome": "not.is.null",
+        "select":           "strategy,actual_win,pnl,flat_pnl,resolved_outcome",
+    })
 
 
 # --------------------------------------------------------- POLYMARKET --------
@@ -204,7 +251,7 @@ def fetch_market_outcome(condition_id: str) -> dict:
     Checks tokens[].winner — when resolved, one token has winner=true.
     """
     try:
-        resp = requests.get(
+        resp = _session.get(
             f"{CLOB_API}/markets/{condition_id}",
             timeout=10,
         )
@@ -239,6 +286,19 @@ def fetch_market_outcome(condition_id: str) -> dict:
 
 
 # --------------------------------------------------------- MAIN LOOP ---------
+
+def _build_void_payload(size: float, now: datetime) -> dict:
+    void_fee = size * TAKER_FEE
+    return {
+        "resolved_outcome": "VOID",
+        "actual_win":       None,
+        "resolved_at":      now.isoformat(),
+        "gave_up_at":       now.isoformat(),
+        "pnl":              round(-void_fee, 4),
+        "flat_pnl":         round(-void_fee, 4),
+        "edge":             0.0,
+    }
+
 
 def resolve_pending_trades(outcome_cache: dict) -> int:
     trades = fetch_pending_trades()
@@ -285,91 +345,74 @@ def resolve_pending_trades(outcome_cache: dict) -> int:
             skipped_young += 1
             continue
 
-        if age_secs > MAX_AGE_SECS:
-            log.warning(f"Trade id={row_id} ({trade_id[:8]}...) market {age_secs:.0f}s old — marking VOID")
-            void_fee = float(trade.get("size", 0)) * TAKER_FEE
-            patch_trade(row_id, trade_id, {
-                "resolved_outcome": "VOID",
-                "actual_win":       None,
-                "resolved_at":      now.isoformat(),
-                "gave_up_at":       now.isoformat(),
-                "pnl":              round(-void_fee, 4),
-                "flat_pnl":         round(-void_fee, 4),
-                "edge":             0.0,
-            })
-            gave_up_count += 1
-            time.sleep(0.1)
-            continue
-
+        # --- Fetch outcome before age-based decisions so we don't double-VOID ---
+        # FIX (#6): Always fetch the outcome first, then decide what to do.
+        # This prevents the ZERO_PRICES branch from double-VOIDing a trade that
+        # the early age check already handled.
         if condition_id not in outcome_cache:
             outcome_cache[condition_id] = fetch_market_outcome(condition_id)
             time.sleep(0.3)
 
         result = outcome_cache[condition_id]
 
-        if result["resolved"] is False:
-            waiting_count += 1
-            log.debug(f"Trade id={row_id} not resolved yet (age={age_secs:.0f}s)")
-            continue
+        # If we have a clean resolution, handle it immediately regardless of age
+        if result.get("resolved") is True:
+            outcome    = result["outcome"]
+            up_price   = result["up_price"]
+            down_price = result["down_price"]
+            side       = trade.get("side", "")
+            won        = (side == outcome)
+            size       = float(trade.get("size", 0))
+            entry_px   = float(trade.get("price", 0.5))
+            fee        = size * TAKER_FEE * 2
 
-        if result["resolved"] == "ZERO_PRICES":
-            if age_secs > MAX_AGE_SECS:
-                log.warning(f"Trade id={row_id} no winner after {age_secs:.0f}s — marking VOID")
-                void_fee = float(trade.get("size", 0)) * TAKER_FEE
-                patch_trade(row_id, trade_id, {
-                    "resolved_outcome": "VOID",
-                    "actual_win":       None,
-                    "resolved_at":      now.isoformat(),
-                    "gave_up_at":       now.isoformat(),
-                    "pnl":              round(-void_fee, 4),
-                    "flat_pnl":         round(-void_fee, 4),
-                    "edge":             0.0,
-                })
-                gave_up_count += 1
+            edge = round(1 / entry_px - 1, 4)
+
+            if won:
+                actual_pnl = size * (1 / entry_px - 1) - fee
+                flat_pnl   = (size * (1 / entry_px - 1)) - (size * TAKER_FEE * 2)
             else:
-                waiting_count += 1
-                log.info(f"Trade id={row_id} ({trade_id[:8]}...) closed, no winner yet "
-                         f"(age={age_secs:.0f}s) — waiting")
+                actual_pnl = -size - fee
+                flat_pnl   = -size - (size * TAKER_FEE * 2)
+
+            final_price  = up_price if side == "UP" else down_price
+            outcome_data = {
+                "resolved_outcome":       outcome,
+                "actual_win":             won,
+                "polymarket_final_price": final_price,
+                "resolved_at":            now.isoformat(),
+                "pnl":                    round(actual_pnl, 4),
+                "flat_pnl":               round(flat_pnl, 4),
+                "edge":                   edge,
+            }
+
+            if patch_trade(row_id, trade_id, outcome_data):
+                status = "WIN " if won else "LOSS"
+                log.info(f"Resolved: {status} | id={row_id} trade_id={trade_id[:8]}... | "
+                         f"{side} vs {outcome} | PnL={actual_pnl:+.3f} | "
+                         f"age={age_secs:.0f}s | {trade.get('strategy','')} | "
+                         f"{trade.get('question','')[:50]}")
+                resolve_signal_logs(outcome, condition_id)
+                resolve_market_snapshots(outcome, condition_id)
+                resolved_count += 1
             continue
 
-        outcome    = result["outcome"]
-        up_price   = result["up_price"]
-        down_price = result["down_price"]
-        side       = trade.get("side", "")
-        won        = (side == outcome)
-        size       = float(trade.get("size", 0))
-        entry_px   = float(trade.get("price", 0.5))
-        fee        = size * TAKER_FEE * 2
+        # Not resolved yet — check if we should give up
+        if age_secs > MAX_AGE_SECS:
+            log.warning(f"Trade id={row_id} ({trade_id[:8]}...) market {age_secs:.0f}s old — marking VOID")
+            size = float(trade.get("size", 0))
+            patch_trade(row_id, trade_id, _build_void_payload(size, now))
+            gave_up_count += 1
+            time.sleep(0.1)
+            continue
 
-        edge = round(1 / entry_px - 1, 4)
-
-        if won:
-            actual_pnl = size * (1 / entry_px - 1) - fee
-            flat_pnl   = (size * (1 / entry_px - 1)) - (size * TAKER_FEE * 2)
+        # Still within patience window — wait
+        if result.get("resolved") == "ZERO_PRICES":
+            log.info(f"Trade id={row_id} ({trade_id[:8]}...) closed, no winner yet "
+                     f"(age={age_secs:.0f}s) — waiting")
         else:
-            actual_pnl = -size - fee
-            flat_pnl   = -size - (size * TAKER_FEE * 2)
-
-        final_price  = up_price if side == "UP" else down_price
-        outcome_data = {
-            "resolved_outcome":       outcome,
-            "actual_win":             won,
-            "polymarket_final_price": final_price,
-            "resolved_at":            now.isoformat(),
-            "pnl":                    round(actual_pnl, 4),
-            "flat_pnl":               round(flat_pnl, 4),
-            "edge":                   edge,
-        }
-
-        if patch_trade(row_id, trade_id, outcome_data):
-            status = "WIN " if won else "LOSS"
-            log.info(f"Resolved: {status} | id={row_id} trade_id={trade_id[:8]}... | "
-                     f"{side} vs {outcome} | PnL={actual_pnl:+.3f} | "
-                     f"age={age_secs:.0f}s | {trade.get('strategy','')} | "
-                     f"{trade.get('question','')[:50]}")
-            resolve_signal_logs(outcome, condition_id)
-            resolve_market_snapshots(outcome, condition_id)
-            resolved_count += 1
+            log.debug(f"Trade id={row_id} not resolved yet (age={age_secs:.0f}s)")
+        waiting_count += 1
 
     if skipped_young:
         log.info(f"Skipped {skipped_young} trade(s) — markets too recent")
@@ -453,7 +496,7 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3.2 — CLOB API, patching by integer id")
+    log.info("Resolution Tracker v3.3 — CLOB API, patching by integer id")
     log.info("Resolves: trades + signal_snapshots + signal_log (independent of trades)")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Checking every {CHECK_INTERVAL}s")
