@@ -181,6 +181,10 @@ def kelly_size(intensity: float, entry_price: float, bankroll: float,
 
     Returns fractional Kelly * bankroll, capped at MAX_BET_PCT of bankroll.
     Returns 0.0 if Kelly is zero or negative (no edge at this price).
+
+    MIN_BET floor is only applied when Kelly is positive (real edge exists).
+    It is NOT applied to override a zero/negative Kelly — that would enter
+    trades with no edge just because of the minimum bet threshold.
     """
     if entry_price <= 0 or entry_price >= 1:
         return 0.0
@@ -207,6 +211,7 @@ def kelly_size(intensity: float, entry_price: float, bankroll: float,
 
     if kelly_f <= 0:
         # Negative Kelly = no edge at this price — skip
+        # Do NOT fall through to MIN_BET; that would enter trades with no edge.
         return 0.0
 
     # Fractional Kelly
@@ -221,8 +226,16 @@ def kelly_size(intensity: float, entry_price: float, bankroll: float,
     # Hard cap: never exceed MAX_BET_PCT of bankroll regardless of Kelly
     size = min(size, bankroll * MAX_BET_PCT)
 
-    # Floor
-    size = max(size, MIN_BET)
+    # Floor: only reached here when Kelly is positive (real edge confirmed above).
+    # If the Kelly-sized bet is smaller than MIN_BET, bump up to MIN_BET and log
+    # so it's visible — this is a conscious override, not a silent one.
+    if size < MIN_BET:
+        log.debug(
+            f"kelly_size [{strategy_name}]: Kelly size ${size:.4f} below MIN_BET "
+            f"${MIN_BET} — bumping up. kelly_f={kelly_f:.4f} intensity={intensity:.2f} "
+            f"entry={entry_price:.4f}"
+        )
+        size = MIN_BET
 
     return round(size, 4)
 
@@ -749,7 +762,9 @@ _regime:         dict  = {
 # Rolling 24h histories for percentile / z-score computation (~288 samples at 5min intervals)
 _vol_history_pct:     deque = deque(maxlen=288)
 _funding_history_pct: deque = deque(maxlen=288)
-_btc_history:    deque = deque(maxlen=12)  # last 60s of BTC prices (5s poll = 12 readings)
+_btc_history:    deque = deque(maxlen=30)  # last 150s of BTC prices (5s poll = 30 readings)
+                                           # 30 entries needed for momentum_120s lookback;
+                                           # previous maxlen=12 silently corrupted 120s values
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
 
@@ -1332,13 +1347,23 @@ def btc_momentum_pct(lookback_secs: float = 30.0) -> Optional[float]:
     Uses the rolling _btc_history deque (sampled every POLL_SEC).
     Returns None if not enough history.
     Positive = BTC moved up, Negative = BTC moved down.
+
+    Guard: if the oldest available sample is younger than `lookback_secs`,
+    returns None rather than silently computing a shorter window. This
+    prevents momentum_120s from reading as if it were momentum_60s when
+    the deque hasn't filled yet (e.g., on startup or after a restart).
     """
     now = time.time()
     cutoff = now - lookback_secs
     history = list(_btc_history)
+    if not history:
+        return None
+    # Reject if our oldest sample doesn't reach back far enough
+    if history[0]["ts"] > cutoff:
+        return None
     old = next((h for h in history if h["ts"] >= cutoff), None)
-    current = history[-1] if history else None
-    if not old or not current or old["price"] == 0:
+    current = history[-1]
+    if not old or old["price"] == 0:
         return None
     return (current["price"] - old["price"]) / old["price"] * 100
 
