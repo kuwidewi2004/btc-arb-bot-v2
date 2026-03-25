@@ -220,6 +220,21 @@ def kelly_size(intensity: float, entry_price: float, bankroll: float,
     # Scale by signal intensity within the Kelly allocation
     frac_kelly *= intensity
 
+    # Longshot penalty — scale back Kelly when entering at extreme prices.
+    # Data shows entries below 0.40 have historically underperformed across
+    # multiple strategies (Volume Clock, Odds Mispricing win rates ~15-23%
+    # at these prices vs 55%+ near fair value). We don't block these entries
+    # so the ML training data captures the full price distribution, but we
+    # reduce real dollar exposure until the ML can confirm edge at these prices.
+    if entry_price < 0.40:
+        frac_kelly *= 0.25   # quarter Kelly — preserve data, limit bleed
+        log.debug(f"kelly_size [{strategy_name}]: longshot penalty applied "
+                  f"(entry={entry_price:.4f} < 0.40) — Kelly reduced to 25%")
+    elif entry_price < 0.45:
+        frac_kelly *= 0.50   # half Kelly on moderate underdogs
+        log.debug(f"kelly_size [{strategy_name}]: underdog penalty applied "
+                  f"(entry={entry_price:.4f} < 0.45) — Kelly reduced to 50%")
+
     # Bet size in dollars
     size = frac_kelly * bankroll
 
@@ -945,12 +960,10 @@ def refresh_shared_data():
         _ob_cache["imbalance"]  = round(imbalance, 4)
         _ob_cache["bid_depth"]  = round(bid_depth, 2)
         _ob_cache["ask_depth"]  = round(ask_depth, 2)
-        _ob_cache["spread_pct"] = round(spread_pct, 6)
+        _ob_cache["spread_pct"] = round(spread_pct, 4)
         _ob_cache["fetched_at"] = now
         log.debug(f"OB imbalance={imbalance:+.3f} bid={bid_depth:.0f} ask={ask_depth:.0f} "
                   f"spread={spread_pct:.4f}%")
-        log.info(f"OB raw — bid={best_bid:.2f} ask={best_ask:.2f} "
-                 f"spread_raw={best_ask - best_bid:.4f} spread_pct={spread_pct:.6f}%")
     except Exception as e:
         log.warning(f"OB pressure fetch failed: {e}")
 def compute_regime():
@@ -2804,6 +2817,18 @@ def run():
                 interact_liq_x_price_pos     = round(liq_imbalance * price_vs_open_pct, 6)
                 interact_momentum_x_progress = round(momentum_30s * market_progress, 6)
 
+                # Price bucket — captures the market's current confidence level.
+                # Used as a categorical feature at training time so the ML can learn
+                # that signal behaviour differs by price regime (e.g. contrarian signals
+                # work near fair value but not at extreme longshot prices).
+                # Also used post-hoc to diagnose per-bucket strategy performance.
+                price_bucket = (
+                    "longshot"   if poly_up_mid < 0.40 else
+                    "underdog"   if poly_up_mid < 0.50 else
+                    "favourite"  if poly_up_mid < 0.60 else
+                    "heavy_fav"
+                )
+
                 supabase_market_snapshot({
                     "condition_id":        mkt.condition_id,
                     "market_question":     mkt.question,
@@ -2850,6 +2875,7 @@ def run():
                     "poly_fill_up":        poly_fill_up,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
+                    "price_bucket":        price_bucket,
                     "interact_momentum_x_vol":      interact_momentum_x_vol,
                     "interact_ob_x_spread":         interact_ob_x_spread,
                     "interact_liq_x_price_pos":     interact_liq_x_price_pos,
