@@ -2047,7 +2047,7 @@ def strategy_up_bias(market, secs_left, tracker, position):
       - Always bets UP
     """
     try:
-        prices = get_poly_prices(market)
+        prices = fetch_poly_prices(market)
         pm     = prices.get("up_mid", 0.5)
 
         # Condition 1: p_market in sweet spot
