@@ -583,16 +583,6 @@ class StrategyTracker:
             log.info(f"[{self.name}] Remaining cap ${cap_remaining:.2f} below MIN_BET — skipping")
             return ""
 
-        # Balance check moved inside open() and placed immediately before debit
-        # so it is evaluated against the same balance the debit will act on.
-        # Previously each strategy checked `tracker.balance >= MIN_BET` outside
-        # this method; by the time open() ran, earlier strategies in the same
-        # cycle had already reduced the balance, allowing a debit into negative.
-        if self.portfolio.available() < MIN_BET:
-            log.info(f"[{self.name}] Insufficient balance "
-                     f"(${self.portfolio.available():.2f} < MIN_BET ${MIN_BET}) — skipping")
-            return ""
-
         fee = size * TAKER_FEE
         # Debit stake + open fee immediately. Close will debit only the exit fee.
         # This way open + close each pay one taker fee, totalling one round-trip.
@@ -760,14 +750,6 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
-# Per-cycle Polymarket price cache — fetched ONCE per poll cycle and shared
-# across all strategies and the ML snapshot. Prevents up to 9 duplicate
-# HTTP round-trips per cycle and ensures strategies/snapshot see identical prices.
-_poly_cache:     dict  = {"market_id": "", "fetched_at": 0.0,
-                          "up_mid": 0.5, "down_mid": 0.5,
-                          "fill_up": 0.5, "fill_down": 0.5,
-                          "slip_up": 0.0, "slip_down": 0.0,
-                          "spread": 0.1}
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
     "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
@@ -793,9 +775,8 @@ _regime:         dict  = {
 # Rolling 24h histories for percentile / z-score computation (~288 samples at 5min intervals)
 _vol_history_pct:     deque = deque(maxlen=288)
 _funding_history_pct: deque = deque(maxlen=288)
-_btc_history:    deque = deque(maxlen=60)  # last 300s of BTC prices (5s poll = 60 readings)
-                                           # 60 entries covers full momentum_120s lookback
-                                           # with headroom for startup warm-up
+_btc_history:    deque = deque(maxlen=30)  # last 150s of BTC prices (5s poll = 30 readings)
+                                           # 30 entries needed for momentum_120s lookback
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
 
@@ -956,12 +937,9 @@ def refresh_shared_data():
         except Exception as e:
             log.warning(f"Volume fetch failed: {e}")
 
-    # OKX futures order book imbalance — refreshed every POLL_SEC seconds.
-    # Guard added: without this the fetch ran unconditionally on every cycle
-    # with a 4s timeout, blocking the loop and starving ob_pressure /
-    # volume_clock of their entry window in the final 90s.
-    if now - _ob_cache.get("fetched_at", 0) >= POLL_SEC:
-      try:
+    # OKX futures order book imbalance — refreshed every poll cycle
+    # Uses top 20 levels on each side, depth weighted by size
+    try:
         r = _session.get(
             f"{OKX_BASE}/api/v5/market/books",
             params={"instId": OKX_BTC, "sz": "20"},
@@ -986,9 +964,8 @@ def refresh_shared_data():
         _ob_cache["fetched_at"] = now
         log.debug(f"OB imbalance={imbalance:+.3f} bid={bid_depth:.0f} ask={ask_depth:.0f} "
                   f"spread={spread_pct:.4f}%")
-      except Exception as e:
+    except Exception as e:
         log.warning(f"OB pressure fetch failed: {e}")
-
 def compute_regime():
     """
     Compute market regime labels once per poll cycle.
@@ -1547,46 +1524,6 @@ def fetch_poly_prices(market: Market, size_usdc: float = 50.0) -> dict:
         }
 
 
-def refresh_poly_prices(market: Market, size_usdc: float = 20.0):
-    """
-    Fetch Polymarket prices ONCE per poll cycle and write into _poly_cache.
-    All 8 strategies and the ML snapshot read from this cache instead of
-    making independent HTTP calls. This eliminates up to 9 duplicate round-
-    trips per 5s cycle and guarantees that every strategy and the snapshot
-    row see identical prices for the same moment.
-
-    Call this at the top of the normal-poll section in run(), before
-    the strategy calls. The cache is keyed by market condition_id so a
-    stale read on a market switch is impossible.
-    """
-    global _poly_cache
-    result = fetch_poly_prices(market, size_usdc)
-    _poly_cache.update({
-        "market_id":  market.condition_id,
-        "fetched_at": time.time(),
-        "up_mid":     result["up_mid"],
-        "down_mid":   result["down_mid"],
-        "fill_up":    result["fill_up"],
-        "fill_down":  result["fill_down"],
-        "slip_up":    result["slip_up"],
-        "slip_down":  result["slip_down"],
-        "spread":     result["spread"],
-    })
-
-
-def get_poly_prices(market: Market, size_usdc: float = 20.0) -> dict:
-    """
-    Return the per-cycle cached Polymarket prices.
-    Falls back to a live fetch if the cache is for a different market
-    (market switch edge case) or is older than 2 × POLL_SEC.
-    """
-    age = time.time() - _poly_cache.get("fetched_at", 0)
-    if _poly_cache.get("market_id") != market.condition_id or age > POLL_SEC * 2:
-        log.debug("get_poly_prices: cache miss — fetching live")
-        refresh_poly_prices(market, size_usdc)
-    return dict(_poly_cache)
-
-
 # --------------------------------------------------------- RESOLUTION --------
 
 def fetch_market_winner(condition_id: str) -> Optional[str]:
@@ -1660,23 +1597,30 @@ def fetch_market_winner(condition_id: str) -> Optional[str]:
         time.sleep(POLL_INTERVAL)
 
 
-def _do_resolve(positions: dict, trackers: dict,
-                market: Market, portfolio: "SharedPortfolio"):
+def resolve_positions(positions: dict, trackers: dict,
+                      market: Market, portfolio: "SharedPortfolio") -> dict:
     """
-    Worker run in a daemon thread by resolve_positions_async().
-    Polls fetch_market_winner() (up to 10 minutes) then closes positions
-    and clears exposure. Runs off the main loop so snapshotting continues
-    uninterrupted into the next market while resolution is pending.
+    Resolves all open positions for an expired market.
+    Updates local balance/win-loss counters only.
+    Clears directional exposure tracking for this market.
+    Supabase outcome writes happen in resolver.py using trade_id.
     """
-    log.info(f"[Resolver thread] Starting for: {market.question}")
+    any_open = any(p is not None for p in positions.values())
+    if not any_open:
+        portfolio.clear_exposure(market.condition_id)
+        return {k: None for k in positions}
+
+    log.info(f"Resolving market locally: {market.question}")
     outcome = fetch_market_winner(market.condition_id)
 
     for key, pos in positions.items():
         if not pos:
             continue
+
         if outcome == "VOID":
             log.warning(f"[{trackers[key].name}] Market voided locally — refunding position")
             trackers[key].void(pos, market)
+
         elif outcome in ("UP", "DOWN"):
             exit_price = 1.0 if pos.side == outcome else 0.0
             reason     = "RESOLVED_WIN" if pos.side == outcome else "RESOLVED_LOSS"
@@ -1684,44 +1628,9 @@ def _do_resolve(positions: dict, trackers: dict,
                 pos.side, pos.entry_price, exit_price, pos.size, market, reason
             )
         else:
-            log.error(f"[Resolver thread] Unexpected outcome '{outcome}' — skipping {key}")
+            log.error(f"Unexpected outcome value: {outcome} — skipping close for {key}")
 
     portfolio.clear_exposure(market.condition_id)
-    log.info(f"[Resolver thread] Done: {market.question} → {outcome}")
-
-
-def resolve_positions(positions: dict, trackers: dict,
-                      market: Market, portfolio: "SharedPortfolio") -> dict:
-    """
-    Dispatches local resolution to a daemon background thread so the main
-    loop is never blocked by fetch_market_winner()'s polling (up to 600s).
-
-    Positions are cleared immediately in the main loop (returned as all-None)
-    so no strategy will attempt to re-enter the expired market. The background
-    thread handles balance/win-loss accounting and exposure cleanup once the
-    outcome is known.
-
-    If no positions are open, clears exposure synchronously and returns.
-    """
-    any_open = any(p is not None for p in positions.values())
-    if not any_open:
-        portfolio.clear_exposure(market.condition_id)
-        return {k: None for k in positions}
-
-    # Snapshot a copy of open positions for the thread — the main loop
-    # will overwrite cur["positions"] immediately after this returns.
-    open_positions = {k: v for k, v in positions.items() if v is not None}
-    t = threading.Thread(
-        target=_do_resolve,
-        args=(open_positions, trackers, market, portfolio),
-        daemon=True,
-        name=f"resolve-{market.condition_id[:8]}",
-    )
-    t.start()
-    log.info(f"Resolution thread started for: {market.question} "
-             f"({len(open_positions)} open position(s))")
-
-    # Return cleared positions immediately — main loop proceeds to next market
     return {k: None for k in positions}
 
 
@@ -1814,7 +1723,7 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
         if position:
             return position
 
-        prices = get_poly_prices(market)
+        prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Chainlink Arb", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -1827,16 +1736,17 @@ def strategy_chainlink_arb(market, secs_left, tracker, position, cl_history):
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"divergence":  round(divergence, 4),
-                     "cl_age":      round(cl_age, 1),
-                     "momentum":    round(momentum, 4)},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("chainlink_arb", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"divergence":  round(divergence, 4),
+                         "cl_age":      round(cl_age, 1),
+                         "momentum":    round(momentum, 4)},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("chainlink_arb", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Chainlink arb] error: {e}")
     return position
@@ -1910,7 +1820,7 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
             return position
 
         direction = "DOWN" if avg_rate > 0 else "UP"
-        prices    = get_poly_prices(market)
+        prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Funding Reversion", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -1923,18 +1833,19 @@ def strategy_funding_reversion(market, secs_left, tracker, position):
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"okx_rate":  round(okx_rate, 6),
-                     "bnb_rate":  round(bnb_rate, 6),
-                     "avg_rate":  round(avg_rate, 6),
-                     "momentum":  round(momentum, 4),
-                     "intensity": round(intensity, 3)},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("funding_reversion", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"okx_rate":  round(okx_rate, 6),
+                         "bnb_rate":  round(bnb_rate, 6),
+                         "avg_rate":  round(avg_rate, 6),
+                         "momentum":  round(momentum, 4),
+                         "intensity": round(intensity, 3)},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("funding_reversion", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Funding reversion] error: {e}")
     return position
@@ -1950,6 +1861,16 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
       - OKX REST poll: 2-minute window, stored in _liq_cache (OKX-only)
       - Binance WebSocket: 2-minute window, fetched fresh here via get_binance_liq_2min()
     Both use identical 2-minute lookback — no double-counting, no window mismatch.
+
+    FILTERS (data-driven from 98-trade analysis, 2026-03-26):
+      - Minimum total liq raised $10k -> $150k
+        (sub-$150k WR: 40-52%, above $300k: 72%+)
+      - CALM regime blocked unless total > $500k
+        (CALM WR=48.9% vs VOLATILE/TREND WR=61-67%)
+      - OFFPEAK session blocked
+        (OFFPEAK WR=40.0% actively losing)
+      - Minimum intensity raised to 0.20
+        (intensity 0.10-0.20 WR=25%, above 0.20: 62-73%)
     """
     try:
         # OKX 2min (from cache) + Binance 2min (from WebSocket buffer) — same window
@@ -1958,10 +1879,30 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         short_liqs = _liq_cache["short"] + binance["short"]
         total      = long_liqs + short_liqs
 
-        if total < 10_000:
+        # Filter 1: minimum size raised from $10k to $150k
+        # Data: sub-$150k WR 40-52%, above $300k WR 72%+
+        if total < 150_000:
             _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=10_000,
+                        signal_value=total, threshold=150_000,
                         reason="liquidation_volume_too_low")
+            return position
+
+        # Filter 2: skip CALM regime unless very large liquidation event
+        # Data: CALM WR=48.9% (47 trades) — essentially coin flip
+        # Exception: $500k+ is meaningful in any regime
+        composite = _regime.get("composite", "CALM")
+        if composite == "CALM" and total < 500_000:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=total, threshold=500_000,
+                        reason="calm_regime_insufficient_size")
+            return position
+
+        # Filter 3: skip OFFPEAK session
+        # Data: OFFPEAK WR=40.0% (15 trades) — actively losing
+        if _regime.get("session") == "OFFPEAK":
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=total, threshold=150_000,
+                        reason="offpeak_session_filtered")
             return position
 
         # Require meaningful imbalance — at least 65/35 split
@@ -1993,6 +1934,15 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         raw_intensity    = min(total / 500_000, 1.0)
         vol_scalar       = max(0.3, min(1.0, 0.15 / vol_range))  # inverse vol
         adjusted_intensity = min(raw_intensity * vol_scalar, 1.0)
+
+        # Filter 4: minimum intensity 0.20
+        # Data: intensity 0.10-0.20 WR=25% (8 trades) — danger zone
+        # Above 0.20: WR=62-73% consistently
+        if adjusted_intensity < 0.20:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=adjusted_intensity, threshold=0.20,
+                        reason="intensity_too_low")
+            return position
 
         prices = get_poly_prices(market)
         if prices["spread"] > 0.06:
@@ -2078,7 +2028,7 @@ def strategy_basis_arb(market, secs_left, tracker, position):
 
         direction = "DOWN" if basis_pct > 0 else "UP"
         intensity = min(abs(basis_pct) / 0.3, 1.0)
-        prices    = get_poly_prices(market)
+        prices    = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Basis Arb", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -2090,17 +2040,18 @@ def strategy_basis_arb(market, secs_left, tracker, position):
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"basis_pct": round(basis_pct, 4),
-                     "momentum":  round(momentum, 4) if momentum is not None else 0.0,
-                     "spot":      round(spot, 2),
-                     "futures":   round(futures, 2)},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("basis_arb", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"basis_pct": round(basis_pct, 4),
+                         "momentum":  round(momentum, 4) if momentum is not None else 0.0,
+                         "spot":      round(spot, 2),
+                         "futures":   round(futures, 2)},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("basis_arb", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Basis arb] error: {e}")
     return position
@@ -2134,7 +2085,7 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         if position:
             return position
 
-        prices    = get_poly_prices(market)
+        prices    = fetch_poly_prices(market)
         up_mid    = prices["up_mid"]
         deviation = up_mid - 0.50
 
@@ -2173,17 +2124,18 @@ def strategy_odds_mispricing(market, secs_left, tracker, position):
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"up_mid":    round(up_mid, 4),
-                     "deviation": round(deviation, 4),
-                     "momentum":  round(momentum, 4) if momentum is not None else 0.0,
-                     "secs_left": round(secs_left)},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("odds_mispricing", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"up_mid":    round(up_mid, 4),
+                         "deviation": round(deviation, 4),
+                         "momentum":  round(momentum, 4) if momentum is not None else 0.0,
+                         "secs_left": round(secs_left)},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("odds_mispricing", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Odds mispricing] error: {e}")
     return position
@@ -2239,7 +2191,7 @@ def strategy_volume_clock(market, secs_left, tracker, position):
                         reason="buy_ratio_neutral")
             return position
 
-        prices = get_poly_prices(market)
+        prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Volume Clock", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -2251,14 +2203,15 @@ def strategy_volume_clock(market, secs_left, tracker, position):
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"buy_ratio": round(buy_ratio, 4), "secs_left": round(secs_left)},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("volume_clock", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"buy_ratio": round(buy_ratio, 4), "secs_left": round(secs_left)},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("volume_clock", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Volume clock] error: {e}")
     return position
@@ -2350,7 +2303,7 @@ def strategy_ob_pressure(market, secs_left, tracker, position):
                         reason="momentum_direction_conflict")
             return position
 
-        prices = get_poly_prices(market, 50.0)
+        prices = fetch_poly_prices(market, 50.0)
         if prices["spread"] > 0.06:
             _log_signal("OB Pressure", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -2365,21 +2318,22 @@ def strategy_ob_pressure(market, secs_left, tracker, position):
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"imbalance":   round(imbalance, 4),
-                     "momentum":    round(momentum, 4),
-                     "spread_pct":  round(spread_pct, 4),
-                     "slip":        round(slip, 4),
-                     "secs_left":   round(secs_left)},
-                    market)
-        log.info(f"[OB Pressure] {direction} | imbalance={imbalance:+.3f} | "
-                 f"momentum={momentum:+.3f}% | slip={slip:+.4f} | "
-                 f"size={size:.2f} @ {price:.4f}")
-        if not trade_id:
-            return position
-        t = StrategyTrade("ob_pressure", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"imbalance":   round(imbalance, 4),
+                         "momentum":    round(momentum, 4),
+                         "spread_pct":  round(spread_pct, 4),
+                         "slip":        round(slip, 4),
+                         "secs_left":   round(secs_left)},
+                        market)
+            log.info(f"[OB Pressure] {direction} | imbalance={imbalance:+.3f} | "
+                     f"momentum={momentum:+.3f}% | slip={slip:+.4f} | "
+                     f"size={size:.2f} @ {price:.4f}")
+            if not trade_id:
+                return position
+            t = StrategyTrade("ob_pressure", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
 
     except Exception as e:
         log.warning(f"[OB Pressure] error: {e}")
@@ -2442,12 +2396,6 @@ def strategy_price_anchor(market, secs_left, tracker, position,
         if spot <= 0:
             return position
 
-        # Position check moved here — consistent with all other strategies.
-        # Previously fired after direction was calculated, wasting two comparisons
-        # and a spot-price read on every cycle when already positioned.
-        if position:
-            return position
-
         price_vs_open_pct = (spot - market_open_price) / market_open_price * 100
 
         DISPLACEMENT_THRESHOLD = 0.10   # % move from open required to fire
@@ -2460,7 +2408,10 @@ def strategy_price_anchor(market, secs_left, tracker, position,
 
         direction = "UP" if price_vs_open_pct > 0 else "DOWN"
 
-        prices = get_poly_prices(market)
+        if position:
+            return position
+
+        prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Price Anchor", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -2480,20 +2431,21 @@ def strategy_price_anchor(market, secs_left, tracker, position,
         if size == 0.0:
             return position
 
-        trade_id = tracker.open(direction, price, size,
-                    {"price_vs_open_pct":    round(price_vs_open_pct, 6),
-                     "market_open_price":    round(market_open_price, 2),
-                     "market_progress":      round(market_progress, 4),
-                     "displacement_score":   round(displacement_score, 4),
-                     "progress_score":       round(progress_score, 4),
-                     "intensity":            intensity,
-                     "secs_left":            round(secs_left)},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("price_anchor", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"price_vs_open_pct":    round(price_vs_open_pct, 6),
+                         "market_open_price":    round(market_open_price, 2),
+                         "market_progress":      round(market_progress, 4),
+                         "displacement_score":   round(displacement_score, 4),
+                         "progress_score":       round(progress_score, 4),
+                         "intensity":            intensity,
+                         "secs_left":            round(secs_left)},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("price_anchor", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Price anchor] error: {e}")
     return position
@@ -2509,39 +2461,10 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
     knows which strategies already have an open position on the current market.
 
     Returns: {condition_id: {strategy_name: StrategyTrade}} for open positions.
-
-    Fix (issue #6): the query already filters resolved_outcome IS NULL, which
-    prevents re-debiting trades that resolver.py patched between a crash and
-    this restart. However, the local balance starts from STARTING_BALANCE
-    (hardcoded), so after losses a restart always over-states available capital.
-    We now derive the effective starting balance from Supabase resolved PnL so
-    the local balance reflects real equity from the first cycle after restart.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         log.warning("No Supabase credentials — skipping state restore")
         return {}
-
-    # ── Derive real starting balance from resolved trade history ──────────────
-    # Sum all resolved PnL to get actual equity, then add back any still-open
-    # committed capital that we're about to re-debit. This prevents the
-    # hardcoded STARTING_BALANCE from diverging from reality after losses/gains.
-    try:
-        resolved = _sb_fetch_all("trades", {
-            "action":           "eq.OPEN",
-            "resolved_outcome": "not.is.null",
-            "select":           "pnl",
-        })
-        total_pnl = sum(float(r.get("pnl") or 0) for r in resolved)
-        derived_balance = STARTING_BALANCE + total_pnl
-        if abs(derived_balance - STARTING_BALANCE) > 0.01:
-            log.info(f"State restore: derived balance ${derived_balance:.2f} "
-                     f"(STARTING_BALANCE ${STARTING_BALANCE:.2f} + PnL {total_pnl:+.2f})")
-            with portfolio._lock:
-                portfolio.balance = derived_balance
-        else:
-            log.info(f"State restore: balance unchanged at ${STARTING_BALANCE:.2f}")
-    except Exception as e:
-        log.warning(f"State restore: could not derive balance from PnL — {e}")
 
     try:
         open_trades = _sb_fetch_all("trades", {
@@ -2822,11 +2745,8 @@ def run():
 
             cur["max_secs_left"] = max(cur["max_secs_left"], secs_left)
 
-            # ── Fetch Polymarket prices once — shared by all strategies + snapshot ──
-            mkt = cur["market"]
-            refresh_poly_prices(mkt, 20.0)
-
             # ── Run all 8 strategies ──────────────────────────────────────────
+            mkt = cur["market"]
             pos = cur["positions"]
 
             pos["chainlink"]   = strategy_chainlink_arb(
@@ -2898,17 +2818,10 @@ def run():
                 effective_duration = cur["max_secs_left"] if cur["max_secs_left"] > 0 else 300.0
                 market_progress    = round(max(0.0, min(1.0, 1.0 - secs_left / effective_duration)), 4)
 
-                _m10  = btc_momentum_pct(lookback_secs=10)
-                _m30  = btc_momentum_pct(lookback_secs=30)
-                _m60  = btc_momentum_pct(lookback_secs=60)
-                _m120 = btc_momentum_pct(lookback_secs=120)
-                # Keep None when history is genuinely absent — distinguishes
-                # "flat market" (0.0) from "not enough data yet" (None).
-                # Strategies use `or 0.0` fallbacks; snapshot stores true nulls.
-                momentum_10s  = round(_m10,  6) if _m10  is not None else None
-                momentum_30s  = round(_m30,  6) if _m30  is not None else None
-                momentum_60s  = round(_m60,  6) if _m60  is not None else None
-                momentum_120s = round(_m120, 6) if _m120 is not None else None
+                momentum_10s  = round(btc_momentum_pct(lookback_secs=10)  or 0.0, 6)
+                momentum_30s  = round(btc_momentum_pct(lookback_secs=30)  or 0.0, 6)
+                momentum_60s  = round(btc_momentum_pct(lookback_secs=60)  or 0.0, 6)
+                momentum_120s = round(btc_momentum_pct(lookback_secs=120) or 0.0, 6)
 
                 phase_early = 1 if secs_left > 200 else 0
                 phase_mid   = 1 if 100 < secs_left <= 200 else 0
