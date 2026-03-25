@@ -418,7 +418,10 @@ def _log_signal(strategy: str, market, secs_left: float,
     Writes snapshot context columns directly so signal_log is self-contained
     for ML training without needing a join to market_snapshots.
     """
-    thr = threshold if threshold > 0 else 1.0
+    thr  = threshold if threshold and threshold > 0 else 1.0
+    liq_long  = _liq_cache.get("long", 0.0)
+    liq_short = _liq_cache.get("short", 0.0)
+    liq_tot   = liq_long + liq_short
     entry = {
         "strategy":        strategy,
         "condition_id":    market.condition_id if market else "",
@@ -430,21 +433,18 @@ def _log_signal(strategy: str, market, secs_left: float,
         "reason":          reason,
         # Regime labels
         "regime":          _regime.get("composite", "UNKNOWN"),
-        "session":         _regime.get("session", "UNKNOWN"),
-        "activity":        _regime.get("activity", "UNKNOWN"),
-        "day_type":        _regime.get("day_type", "UNKNOWN"),
-        # Signal ratio — signal / threshold (>1.0 = would have fired)
+        "session":         _regime.get("session",   "UNKNOWN"),
+        "activity":        _regime.get("activity",  "UNKNOWN"),
+        "day_type":        _regime.get("day_type",  "UNKNOWN"),
+        # Signal ratio — >1.0 means would have fired
         "signal_ratio":    round(signal_value / thr, 6),
         "above_threshold": signal_value >= threshold,
-        # Snapshot context — written inline so no join needed at training time
+        # Snapshot context written inline — no join needed at training time
         "p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
         "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
         "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
-        "liq_total":       round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
-        "liq_imbalance":   round(
-            (_liq_cache.get("long", 0.0) - _liq_cache.get("short", 0.0)) /
-            max(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 1.0), 4
-        ),
+        "liq_total":       round(liq_tot, 2),
+        "liq_imbalance":   round((liq_long - liq_short) / max(liq_tot, 1.0), 4),
         "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
         "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
         "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
@@ -631,9 +631,6 @@ class StrategyTracker:
         # Write to Supabase — this is the ONLY row we write per trade.
         # Outcome fields (actual_win, resolved_outcome, pnl, etc.) will be
         # patched later by resolver.py using trade_id as the key.
-        # Unpack signal_data fields into typed columns so trades table
-        # is self-contained for ML training without JSON parsing at runtime.
-        # signal_data is still stored as JSON for reference and backwards compat.
         _sd = signal_data or {}
         def _sd_f(k):
             v = _sd.get(k)
@@ -660,7 +657,7 @@ class StrategyTracker:
             "day_type":        _regime.get("day_type",  "UNKNOWN"),
             "kelly_fraction":  round(KELLY_FRACTION, 4),
             "max_bet_pct":     round(MAX_BET_PCT, 4),
-            # Unpacked signal_data fields — typed columns for ML training
+            # Unpacked signal_data — typed columns, no JSON parsing at training time
             "liq_long_liqs":         _sd_f("long_liqs"),
             "liq_short_liqs":        _sd_f("short_liqs"),
             "liq_vol_range":         _sd_f("vol_range"),
@@ -678,14 +675,14 @@ class StrategyTracker:
             "fund_avg_rate":         _sd_f("avg_rate"),
             "basis_pct_entry":       _sd_f("basis_pct"),
             "secs_left_entry":       _sd_f("secs_left"),
-            # Snapshot context at entry
-            "snap_p_market":         round(_poly_cache.get("up_mid", 0.5), 4),
-            "snap_ob_imbalance":     round(_ob_cache.get("imbalance", 0.0), 4),
-            "snap_liq_total":        round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
-            "snap_vol_range_pct":    round(_vol_cache.get("range_pct", 0.0), 6),
-            "snap_momentum_30s":     round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
-            "snap_funding_zscore":   round(_regime.get("funding_zscore", 0.0), 4),
-            "snap_volatility_pct":   round(_regime.get("volatility_pct", 0.5), 4),
+            # Snapshot context at entry — from live caches
+            "snap_p_market":       round(_poly_cache.get("up_mid", 0.5), 4),
+            "snap_ob_imbalance":   round(_ob_cache.get("imbalance", 0.0), 4),
+            "snap_liq_total":      round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
+            "snap_vol_range_pct":  round(_vol_cache.get("range_pct", 0.0), 6),
+            "snap_momentum_30s":   round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
+            "snap_funding_zscore": round(_regime.get("funding_zscore", 0.0), 4),
+            "snap_volatility_pct": round(_regime.get("volatility_pct", 0.5), 4),
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
                  f"portfolio=${self.portfolio.available():.2f} | trade_id={trade_id[:8]}... | "
@@ -809,6 +806,14 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
+# Per-cycle Polymarket price cache — populated by refresh_poly_prices() once
+# per poll cycle before any strategy or signal_log call reads from it.
+# Initialised here so _log_signal never hits NameError on startup.
+_poly_cache:     dict  = {"market_id": "", "fetched_at": 0.0,
+                          "up_mid": 0.5, "down_mid": 0.5,
+                          "fill_up": 0.5, "fill_down": 0.5,
+                          "slip_up": 0.0, "slip_down": 0.0,
+                          "spread": 0.1}
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
     "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
