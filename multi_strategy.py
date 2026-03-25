@@ -2815,13 +2815,11 @@ def run():
                 mkt, secs_left, trackers["basis"],
                 pos["basis"])
 
-            pos["odds"]        = strategy_odds_mispricing(
-                mkt, secs_left, trackers["odds"],
-                pos["odds"])
+            # Odds Mispricing disabled — WR=20.3%, PnL=-$110, no edge
+            # pos["odds"] = strategy_odds_mispricing(...)
 
-            pos["volume"]      = strategy_volume_clock(
-                mkt, secs_left, trackers["volume"],
-                pos["volume"])
+            # Volume Clock disabled — WR=10.6%, PnL=-$70, no edge
+            # pos["volume"] = strategy_volume_clock(...)
 
             pos["ob_pressure"] = strategy_ob_pressure(
                 mkt, secs_left, trackers["ob_pressure"],
