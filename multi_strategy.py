@@ -945,7 +945,7 @@ def refresh_shared_data():
         _ob_cache["imbalance"]  = round(imbalance, 4)
         _ob_cache["bid_depth"]  = round(bid_depth, 2)
         _ob_cache["ask_depth"]  = round(ask_depth, 2)
-        _ob_cache["spread_pct"] = round(spread_pct, 4)
+        _ob_cache["spread_pct"] = round(spread_pct, 6)
         _ob_cache["fetched_at"] = now
         log.debug(f"OB imbalance={imbalance:+.3f} bid={bid_depth:.0f} ask={ask_depth:.0f} "
                   f"spread={spread_pct:.4f}%")
