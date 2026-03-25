@@ -413,7 +413,12 @@ def supabase_market_snapshot(snapshot: dict):
 
 def _log_signal(strategy: str, market, secs_left: float,
                 signal_value: float, threshold: float, reason: str):
-    """Helper — builds and sends a signal log entry for a non-firing evaluation."""
+    """
+    Helper — builds and sends a signal log entry for a non-firing evaluation.
+    Writes snapshot context columns directly so signal_log is self-contained
+    for ML training without needing a join to market_snapshots.
+    """
+    thr = threshold if threshold > 0 else 1.0
     entry = {
         "strategy":        strategy,
         "condition_id":    market.condition_id if market else "",
@@ -423,11 +428,28 @@ def _log_signal(strategy: str, market, secs_left: float,
         "threshold":       round(threshold, 6),
         "fired":           False,
         "reason":          reason,
-        # Regime labels — allows slicing win rates by market condition
+        # Regime labels
         "regime":          _regime.get("composite", "UNKNOWN"),
         "session":         _regime.get("session", "UNKNOWN"),
         "activity":        _regime.get("activity", "UNKNOWN"),
         "day_type":        _regime.get("day_type", "UNKNOWN"),
+        # Signal ratio — signal / threshold (>1.0 = would have fired)
+        "signal_ratio":    round(signal_value / thr, 6),
+        "above_threshold": signal_value >= threshold,
+        # Snapshot context — written inline so no join needed at training time
+        "p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
+        "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
+        "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
+        "liq_total":       round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
+        "liq_imbalance":   round(
+            (_liq_cache.get("long", 0.0) - _liq_cache.get("short", 0.0)) /
+            max(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 1.0), 4
+        ),
+        "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
+        "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
+        "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
+        "momentum_30s":    round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
+        "momentum_60s":    round(btc_momentum_pct(lookback_secs=60) or 0.0, 6),
     }
     log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
               f"| regime={entry['regime']} session={entry['session']}")
@@ -609,6 +631,17 @@ class StrategyTracker:
         # Write to Supabase — this is the ONLY row we write per trade.
         # Outcome fields (actual_win, resolved_outcome, pnl, etc.) will be
         # patched later by resolver.py using trade_id as the key.
+        # Unpack signal_data fields into typed columns so trades table
+        # is self-contained for ML training without JSON parsing at runtime.
+        # signal_data is still stored as JSON for reference and backwards compat.
+        _sd = signal_data or {}
+        def _sd_f(k):
+            v = _sd.get(k)
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
         supabase_insert({
             "trade_id":        trade_id,
             "strategy":        self.name,
@@ -627,6 +660,32 @@ class StrategyTracker:
             "day_type":        _regime.get("day_type",  "UNKNOWN"),
             "kelly_fraction":  round(KELLY_FRACTION, 4),
             "max_bet_pct":     round(MAX_BET_PCT, 4),
+            # Unpacked signal_data fields — typed columns for ML training
+            "liq_long_liqs":         _sd_f("long_liqs"),
+            "liq_short_liqs":        _sd_f("short_liqs"),
+            "liq_vol_range":         _sd_f("vol_range"),
+            "liq_intensity":         _sd_f("intensity"),
+            "ob_imbalance_entry":    _sd_f("imbalance"),
+            "momentum_entry":        _sd_f("momentum"),
+            "pa_price_vs_open_pct":  _sd_f("price_vs_open_pct"),
+            "pa_market_progress":    _sd_f("market_progress"),
+            "pa_displacement_score": _sd_f("displacement_score"),
+            "pa_progress_score":     _sd_f("progress_score"),
+            "odds_up_mid":           _sd_f("up_mid"),
+            "odds_deviation":        _sd_f("deviation"),
+            "vol_buy_ratio":         _sd_f("buy_ratio"),
+            "cl_divergence_entry":   _sd_f("divergence"),
+            "fund_avg_rate":         _sd_f("avg_rate"),
+            "basis_pct_entry":       _sd_f("basis_pct"),
+            "secs_left_entry":       _sd_f("secs_left"),
+            # Snapshot context at entry
+            "snap_p_market":         round(_poly_cache.get("up_mid", 0.5), 4),
+            "snap_ob_imbalance":     round(_ob_cache.get("imbalance", 0.0), 4),
+            "snap_liq_total":        round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
+            "snap_vol_range_pct":    round(_vol_cache.get("range_pct", 0.0), 6),
+            "snap_momentum_30s":     round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
+            "snap_funding_zscore":   round(_regime.get("funding_zscore", 0.0), 4),
+            "snap_volatility_pct":   round(_regime.get("volatility_pct", 0.5), 4),
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
                  f"portfolio=${self.portfolio.available():.2f} | trade_id={trade_id[:8]}... | "
@@ -2546,11 +2605,6 @@ def _make_market_state() -> dict:
         "prev_ob_ask_depth": 0.0,
         "max_secs_left":     0.0,
         "liq_total_history": deque(maxlen=6),
-        # p_market rolling history — captures how much odds have moved
-        # within the market. Used to compute p_market_std and
-        # p_market_vs_open_delta as ML features (top features in market model).
-        "p_market_history":  deque(maxlen=60),  # up to 5 min at 5s poll
-        "p_market_open":     None,              # first observed p_market
     }
 
 
@@ -2817,29 +2871,6 @@ def run():
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
 
-                # ── p_market rolling stats ───────────────────────────────────────
-                # Track how much odds have moved since market open.
-                # p_market_std and p_market_vs_open_delta are the top features
-                # in the market-level model — they capture whether the crowd
-                # has already made up its mind or is still uncertain.
-                cur["p_market_history"].append(poly_up_mid)
-                if cur["p_market_open"] is None:
-                    cur["p_market_open"] = poly_up_mid
-
-                pm_hist = list(cur["p_market_history"])
-                pm_open = cur["p_market_open"]
-
-                # Delta from opening odds — how much has the market moved?
-                p_market_vs_open_delta = round(poly_up_mid - pm_open, 4)                                          if pm_open is not None else 0.0
-
-                # Rolling std of p_market — how volatile have the odds been?
-                if len(pm_hist) >= 3:
-                    pm_mean = sum(pm_hist) / len(pm_hist)
-                    pm_var  = sum((x - pm_mean) ** 2 for x in pm_hist) / len(pm_hist)
-                    p_market_std = round(pm_var ** 0.5, 6)
-                else:
-                    p_market_std = 0.0
-
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
                 interact_liq_x_price_pos     = round(liq_imbalance * price_vs_open_pct, 6)
@@ -2903,9 +2934,6 @@ def run():
                     "poly_fill_up":        poly_fill_up,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
-                    "p_market_open":       round(pm_open, 4) if pm_open is not None else None,
-                    "p_market_vs_open_delta": p_market_vs_open_delta,
-                    "p_market_std":        p_market_std,
                     "price_bucket":        price_bucket,
                     "interact_momentum_x_vol":      interact_momentum_x_vol,
                     "interact_ob_x_spread":         interact_ob_x_spread,
