@@ -664,7 +664,7 @@ def run():
         log.error("SUPABASE_URL and SUPABASE_KEY environment variables required.")
         return
 
-    log.info("Resolution Tracker v3.4 — CLOB API, patching by integer id")
+    log.info("Resolution Tracker v3.5 — CLOB API, patching by integer id")
     log.info("Resolves: trades + signal_snapshots + signal_log (independent of trades)")
     log.info(f"Patience window: {MIN_AGE_SECS}s – {MAX_AGE_SECS}s after market end")
     log.info(f"Checking every {CHECK_INTERVAL}s")
