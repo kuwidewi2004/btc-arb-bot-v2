@@ -418,10 +418,10 @@ def _log_signal(strategy: str, market, secs_left: float,
     Writes snapshot context columns directly so signal_log is self-contained
     for ML training without needing a join to market_snapshots.
     """
-    thr  = threshold if threshold and threshold > 0 else 1.0
-    liq_long  = _liq_cache.get("long", 0.0)
-    liq_short = _liq_cache.get("short", 0.0)
-    liq_tot   = liq_long + liq_short
+    thr      = threshold if threshold and threshold > 0 else 1.0
+    liq_long = _liq_cache.get("long", 0.0)
+    liq_short= _liq_cache.get("short", 0.0)
+    liq_tot  = liq_long + liq_short
     entry = {
         "strategy":        strategy,
         "condition_id":    market.condition_id if market else "",
@@ -431,15 +431,12 @@ def _log_signal(strategy: str, market, secs_left: float,
         "threshold":       round(threshold, 6),
         "fired":           False,
         "reason":          reason,
-        # Regime labels
         "regime":          _regime.get("composite", "UNKNOWN"),
         "session":         _regime.get("session",   "UNKNOWN"),
         "activity":        _regime.get("activity",  "UNKNOWN"),
         "day_type":        _regime.get("day_type",  "UNKNOWN"),
-        # Signal ratio — >1.0 means would have fired
         "signal_ratio":    round(signal_value / thr, 6),
         "above_threshold": signal_value >= threshold,
-        # Snapshot context written inline — no join needed at training time
         "p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
         "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
         "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
@@ -639,6 +636,10 @@ class StrategyTracker:
             except (TypeError, ValueError):
                 return None
 
+        _liq_long  = _liq_cache.get("long", 0.0)
+        _liq_short = _liq_cache.get("short", 0.0)
+        _liq_tot   = _liq_long + _liq_short
+
         supabase_insert({
             "trade_id":        trade_id,
             "strategy":        self.name,
@@ -675,14 +676,20 @@ class StrategyTracker:
             "fund_avg_rate":         _sd_f("avg_rate"),
             "basis_pct_entry":       _sd_f("basis_pct"),
             "secs_left_entry":       _sd_f("secs_left"),
-            # Snapshot context at entry — from live caches
-            "snap_p_market":       round(_poly_cache.get("up_mid", 0.5), 4),
-            "snap_ob_imbalance":   round(_ob_cache.get("imbalance", 0.0), 4),
-            "snap_liq_total":      round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
-            "snap_vol_range_pct":  round(_vol_cache.get("range_pct", 0.0), 6),
-            "snap_momentum_30s":   round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
-            "snap_funding_zscore": round(_regime.get("funding_zscore", 0.0), 4),
-            "snap_volatility_pct": round(_regime.get("volatility_pct", 0.5), 4),
+            # Full snapshot context at entry — from live caches
+            "snap_p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
+            "snap_ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
+            "snap_liq_total":       round(_liq_tot, 2),
+            "snap_liq_imbalance":   round((_liq_long - _liq_short) / max(_liq_tot, 1.0), 4),
+            "snap_vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
+            "snap_momentum_30s":    round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
+            "snap_momentum_60s":    round(btc_momentum_pct(lookback_secs=60) or 0.0, 6),
+            "snap_funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
+            "snap_funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
+            "snap_volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
+            "snap_btc_price":       round(_price_cache.get("btc", 0.0), 2),
+            "snap_poly_spread":     round(_poly_cache.get("spread", 0.1), 4),
+            "snap_price_vs_open":   round(_poly_cache.get("up_mid", 0.5) - 0.5, 4),
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
                  f"portfolio=${self.portfolio.available():.2f} | trade_id={trade_id[:8]}... | "
@@ -806,9 +813,6 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
-# Per-cycle Polymarket price cache — populated by refresh_poly_prices() once
-# per poll cycle before any strategy or signal_log call reads from it.
-# Initialised here so _log_signal never hits NameError on startup.
 _poly_cache:     dict  = {"market_id": "", "fetched_at": 0.0,
                           "up_mid": 0.5, "down_mid": 0.5,
                           "fill_up": 0.5, "fill_down": 0.5,
@@ -1933,10 +1937,26 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         short_liqs = _liq_cache["short"] + binance["short"]
         total      = long_liqs + short_liqs
 
-        if total < 10_000:
+        # Filter 1: minimum size $150k (sub-$150k WR 40-52%)
+        if total < 150_000:
             _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=10_000,
+                        signal_value=total, threshold=150_000,
                         reason="liquidation_volume_too_low")
+            return position
+
+        # Filter 2: skip CALM regime unless very large
+        composite = _regime.get("composite", "CALM")
+        if composite == "CALM" and total < 500_000:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=total, threshold=500_000,
+                        reason="calm_regime_insufficient_size")
+            return position
+
+        # Filter 3: skip OFFPEAK (WR=40%)
+        if _regime.get("session") == "OFFPEAK":
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=total, threshold=150_000,
+                        reason="offpeak_session_filtered")
             return position
 
         # Require meaningful imbalance — at least 65/35 split
@@ -1959,17 +1979,20 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
 
         direction = "DOWN" if long_liqs > short_liqs else "UP"
 
-        # Volatility-adjusted intensity:
-        # Normalize liquidation size by current 5-min BTC price range
-        # High volatility = liquidations are expected = weaker signal
-        # Low volatility = liquidations are surprising = stronger signal
         vol_range = _vol_cache.get("range_pct", 0.1)
-        vol_range = max(vol_range, 0.05)  # floor to avoid division by zero
-        raw_intensity    = min(total / 500_000, 1.0)
-        vol_scalar       = max(0.3, min(1.0, 0.15 / vol_range))  # inverse vol
+        vol_range = max(vol_range, 0.05)
+        raw_intensity      = min(total / 500_000, 1.0)
+        vol_scalar         = max(0.3, min(1.0, 0.15 / vol_range))
         adjusted_intensity = min(raw_intensity * vol_scalar, 1.0)
 
-        prices = fetch_poly_prices(market)
+        # Filter 4: minimum intensity 0.20 (0.10-0.20 band WR=25%)
+        if adjusted_intensity < 0.20:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=adjusted_intensity, threshold=0.20,
+                        reason="intensity_too_low")
+            return position
+
+        prices = get_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Liquidation Cascade", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -1979,21 +2002,20 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         size  = kelly_size(adjusted_intensity, price, tracker.balance, "Liquidation Cascade")
         if size == 0.0:
-            return position  # Kelly says no edge at this price
+            return position
 
-        if tracker.balance >= MIN_BET:
-            trade_id = tracker.open(direction, price, size,
-                        {"long_liqs":   round(long_liqs),
-                         "short_liqs":  round(short_liqs),
-                         "vol_range":   round(vol_range, 4),
-                         "intensity":   round(adjusted_intensity, 3),
-                         "source":      "OKX+Binance"},
-                        market)
-            if not trade_id:
-                return position
-            t = StrategyTrade("liquidation_cascade", direction, size, price, market)
-            t.trade_id = trade_id
-            return t
+        trade_id = tracker.open(direction, price, size,
+                    {"long_liqs":   round(long_liqs),
+                     "short_liqs":  round(short_liqs),
+                     "vol_range":   round(vol_range, 4),
+                     "intensity":   round(adjusted_intensity, 3),
+                     "source":      "OKX+Binance"},
+                    market)
+        if not trade_id:
+            return position
+        t = StrategyTrade("liquidation_cascade", direction, size, price, market)
+        t.trade_id = trade_id
+        return t
     except Exception as e:
         log.warning(f"[Liquidation cascade] error: {e}")
     return position
@@ -2610,6 +2632,8 @@ def _make_market_state() -> dict:
         "prev_ob_ask_depth": 0.0,
         "max_secs_left":     0.0,
         "liq_total_history": deque(maxlen=6),
+        "p_market_history":  deque(maxlen=60),
+        "p_market_open":     None,
     }
 
 
@@ -2876,6 +2900,20 @@ def run():
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
 
+                # p_market rolling stats
+                cur["p_market_history"].append(poly_up_mid)
+                if cur["p_market_open"] is None:
+                    cur["p_market_open"] = poly_up_mid
+                pm_hist = list(cur["p_market_history"])
+                pm_open = cur["p_market_open"]
+                p_market_vs_open_delta = round(poly_up_mid - pm_open, 4)                                          if pm_open is not None else 0.0
+                if len(pm_hist) >= 3:
+                    pm_mean = sum(pm_hist) / len(pm_hist)
+                    pm_var  = sum((x - pm_mean) ** 2 for x in pm_hist) / len(pm_hist)
+                    p_market_std = round(pm_var ** 0.5, 6)
+                else:
+                    p_market_std = 0.0
+
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
                 interact_liq_x_price_pos     = round(liq_imbalance * price_vs_open_pct, 6)
@@ -2939,6 +2977,9 @@ def run():
                     "poly_fill_up":        poly_fill_up,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
+                    "p_market_open":       round(pm_open, 4) if pm_open is not None else None,
+                    "p_market_vs_open_delta": p_market_vs_open_delta,
+                    "p_market_std":        p_market_std,
                     "price_bucket":        price_bucket,
                     "interact_momentum_x_vol":      interact_momentum_x_vol,
                     "interact_ob_x_spread":         interact_ob_x_spread,
