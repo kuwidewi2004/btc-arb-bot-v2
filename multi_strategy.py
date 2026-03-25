@@ -814,7 +814,6 @@ def refresh_shared_data():
         eth = fetch_spot(ETH_SYMBOL)
         if btc:
             _price_cache["btc"] = btc
-            _price_cache["btc_updated_at"] = now 
             _btc_history.append({"price": btc, "ts": now})
         if eth: _price_cache["eth"] = eth
         _price_cache["fetched_at"] = now
@@ -2704,10 +2703,7 @@ def run():
             # Capture opening price on first poll of each market
             if cur["market_open_price"] == 0.0 and spot > 0:
                 cur["market_open_price"] = spot
-
-            cache_age = now - _price_cache.get("btc_updated_at", 0)
-            if cur["market_open_price"] == 0.0 and spot > 0 and cache_age < 10:
-                cur["market_open_price"] = spot
+                log.info(f"Market open price captured: ${spot:.2f}")
 
             cur["max_secs_left"] = max(cur["max_secs_left"], secs_left)
 
