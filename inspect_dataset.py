@@ -24,10 +24,14 @@ import os
 import sys
 import math
 import logging
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from collections import defaultdict
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    print("ERROR: run  python -m pip install psycopg2-binary  then try again")
+    sys.exit(1)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,9 +42,9 @@ log = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ CONFIG ---
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-_SB_PAGE_SIZE = 1000
+# Set via environment variable or replace directly below:
+#   $env:DB_URL="postgresql://postgres:YOUR_PASSWORD@db.kcluwyzyetmkxhvszpxi.supabase.co:5432/postgres"
+DB_URL = os.environ.get("DB_URL", "")
 
 # Columns we care about for the ML feature set
 FEATURE_COLS = [
@@ -116,76 +120,60 @@ LEAKAGE_SECS = 60
 CORRUPT_MOMENTUM_SECS = 120
 
 
-# ---------------------------------------------------------------- SUPABASE ---
+# ---------------------------------------------------------------- POSTGRES ---
 
-def _make_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.5,
-        status_forcelist={429, 500, 502, 503, 504},
-        allowed_methods={"GET", "POST", "PATCH"},
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://",  adapter)
-    return session
-
-_session = _make_session()
-
-
-def _sb_headers() -> dict:
-    return {
-        "apikey":        SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-    }
-
-
-def _sb_fetch_all(table: str, params: dict) -> list:
-    """Paginated Supabase fetch — identical pattern to resolver.py."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        log.error("SUPABASE_URL and SUPABASE_KEY must be set")
+def fetch_all_snapshots() -> list:
+    """
+    Pull all resolved market_snapshots directly via Postgres.
+    No row limits, no API caps, no pagination needed.
+    """
+    if not DB_URL:
+        log.error("DB_URL not set — run:")
+        log.error('  $env:DB_URL="postgresql://postgres:PASSWORD@db.kcluwyzyetmkxhvszpxi.supabase.co:5432/postgres"')
         sys.exit(1)
 
-    rows   = []
-    offset = 0
-    while True:
-        range_header = f"{offset}-{offset + _SB_PAGE_SIZE - 1}"
-        try:
-            resp = _session.get(
-                f"{SUPABASE_URL}/rest/v1/{table}",
-                headers={**_sb_headers(), "Range": range_header},
-                params=params,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            page = resp.json()
-            if not page:
-                break
-            rows.extend(page)
-            log.info(f"  fetched {len(rows)} rows so far...")
+    log.info("  Connecting to Postgres...")
+    try:
+        conn = psycopg2.connect(DB_URL, connect_timeout=15)
+    except Exception as e:
+        log.error(f"Connection failed: {e}")
+        sys.exit(1)
 
-            content_range = resp.headers.get("Content-Range", "")
-            if "/" in content_range:
-                try:
-                    total = int(content_range.split("/")[1])
-                    if offset + _SB_PAGE_SIZE >= total:
-                        break
-                except ValueError:
-                    break
-            else:
-                if len(page) < _SB_PAGE_SIZE:
-                    break
-
-            offset += _SB_PAGE_SIZE
-
-        except Exception as e:
-            log.warning(f"Fetch failed (offset={offset}): {e}")
-            break
-
-    return rows
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        log.info("  Querying market_snapshots...")
+        cur.execute("""
+            SELECT
+                id, condition_id, created_at, market_end_time,
+                resolved_outcome, outcome_binary, edge_realized,
+                price_vs_resolution_pct, btc_resolution_price,
+                secs_left, secs_to_resolution, market_progress,
+                phase_early, phase_mid, phase_late, phase_final,
+                price_bucket, regime, session, activity, day_type,
+                p_market, poly_spread, poly_slip_up, poly_deviation,
+                price_vs_open_pct, price_vs_open_score,
+                momentum_10s, momentum_30s, momentum_60s, momentum_120s,
+                momentum_score, volatility_pct, flow_score,
+                liquidity_score, funding_zscore,
+                cl_divergence, cl_age, cl_vs_open_pct,
+                liq_imbalance, liq_delta, liq_accel, liq_total,
+                ob_imbalance, ob_spread_pct, ob_bid_delta, ob_ask_delta,
+                vol_range_pct, volume_buy_ratio,
+                basis_pct, funding_rate,
+                interact_momentum_x_vol, interact_ob_x_spread,
+                interact_liq_x_price_pos, interact_momentum_x_progress
+            FROM market_snapshots
+            WHERE resolved_outcome IS NOT NULL
+            ORDER BY created_at ASC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        log.info(f"  Fetch complete: {len(rows):,} rows total")
+        return rows
+    except Exception as e:
+        log.error(f"Query failed: {e}")
+        sys.exit(1)
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ HELPERS ---
@@ -279,42 +267,19 @@ def _sep(char="─", width=72):
 def main():
     _sep("═")
     print("  ML DATASET INSPECTOR")
-    print(f"  Supabase: {SUPABASE_URL[:40]}..." if SUPABASE_URL else "  !! NO SUPABASE_URL SET !!")
+    print(f"  DB: {DB_URL[:60]}...")
     _sep("═")
 
     # ── 1. Pull data ──────────────────────────────────────────────────────────
     print("\n[1/7] Pulling resolved market_snapshots from Supabase...")
 
-    all_cols = ",".join(["id", "condition_id", "created_at", "market_end_time",
-                         "resolved_outcome", "outcome_binary", "edge_realized",
-                         "price_vs_resolution_pct", "btc_resolution_price",
-                         "secs_left", "secs_to_resolution", "market_progress",
-                         "phase_early", "phase_mid", "phase_late", "phase_final",
-                         "price_bucket", "regime", "session", "activity", "day_type",
-                         "p_market", "poly_spread", "poly_slip_up", "poly_deviation",
-                         "price_vs_open_pct", "price_vs_open_score",
-                         "momentum_10s", "momentum_30s", "momentum_60s", "momentum_120s",
-                         "momentum_score", "volatility_pct", "flow_score",
-                         "liquidity_score", "funding_zscore",
-                         "cl_divergence", "cl_age", "cl_vs_open_pct",
-                         "liq_imbalance", "liq_delta", "liq_accel", "liq_total",
-                         "ob_imbalance", "ob_spread_pct", "ob_bid_delta", "ob_ask_delta",
-                         "vol_range_pct", "volume_buy_ratio",
-                         "basis_pct", "funding_rate",
-                         "interact_momentum_x_vol", "interact_ob_x_spread",
-                         "interact_liq_x_price_pos", "interact_momentum_x_progress"])
-
-    rows = _sb_fetch_all("market_snapshots", {
-        "resolved_outcome": "not.is.null",
-        "select":           all_cols,
-        "order":            "created_at.asc",
-    })
+    rows = fetch_all_snapshots()
 
     if not rows:
         log.error("No resolved rows returned — check credentials and schema")
         sys.exit(1)
 
-    print(f"  → {len(rows)} rows fetched")
+    print(f"  → {len(rows):,} rows fetched")
 
     # ── 2. Clean ──────────────────────────────────────────────────────────────
     print("\n[2/7] Applying cleaning rules...")
@@ -369,7 +334,7 @@ def main():
           f"{len(training_rows) / max(len(train_markets), 1):.1f}")
 
     # Date range
-    dates = sorted(r["created_at"] for r in rows if r.get("created_at"))
+    dates = sorted(str(r["created_at"]) for r in rows if r.get("created_at"))
     if dates:
         print(f"  Date range                : {dates[0][:19]}  →  {dates[-1][:19]}")
 
@@ -567,7 +532,7 @@ def main():
     sorted_markets = sorted(
         train_markets,
         key=lambda cid: min(
-            r["created_at"] for r in training_rows
+            str(r["created_at"]) for r in training_rows
             if r["condition_id"] == cid and r.get("created_at")
         )
     )
@@ -578,10 +543,12 @@ def main():
     train_data  = [r for r in training_rows if r["condition_id"] in train_set]
     test_data   = [r for r in training_rows if r["condition_id"] in test_set]
 
+    earliest = str(sorted_markets[0])[:12] if sorted_markets else "?"
+    latest   = str(sorted_markets[-1])[:12] if sorted_markets else "?"
     print(f"  Train markets : {len(train_set):>4}  ({len(train_data):,} rows)  "
-          f"earliest {sorted_markets[0][:12] if sorted_markets else '?'}...")
+          f"earliest {earliest}...")
     print(f"  Test  markets : {len(test_set):>4}  ({len(test_data):,} rows)  "
-          f"latest   {sorted_markets[-1][:12] if sorted_markets else '?'}...")
+          f"latest   {latest}...")
     print()
     print(f"  Split rule: all rows from a given condition_id go entirely")
     print(f"  into train OR test — never split across both.")
@@ -601,7 +568,8 @@ def main():
 
 
 if __name__ == "__main__":
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("ERROR: set SUPABASE_URL and SUPABASE_KEY environment variables")
+    if not DB_URL:
+        print("ERROR: set DB_URL environment variable")
+        print('  $env:DB_URL="postgresql://postgres:PASSWORD@db.kcluwyzyetmkxhvszpxi.supabase.co:5432/postgres"')
         sys.exit(1)
     main()
