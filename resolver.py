@@ -1,5 +1,5 @@
 """
-Resolution Tracker v3.3
+Resolution Tracker v3.5
 ========================
 Runs alongside multi_strategy.py on Railway.
 
@@ -32,13 +32,27 @@ trade_id is still stored on every row for reference and traceability.
 Summary queries only OPEN rows where resolved_outcome IS NOT NULL,
 so all win-rate stats are 100% ground truth from Polymarket.
 
-Fixes applied (v3.4):
-  - resolve_market_snapshots() now patches outcome_binary and edge_realized
-    per row at resolution time (FIX 1+2 from ML review):
-      outcome_binary = 1.0 if UP, 0.0 if DOWN
-      edge_realized  = outcome_binary - p_market (profit label for regression)
-    Each row is patched individually so edge_realized reflects the p_market
-    observed at that specific snapshot moment, not a single market-level value.
+Fixes applied (v3.5):
+  - fetch_btc_price() added — Coinbase primary, Kraken fallback.
+    Called once per resolved market to capture BTC price at resolution.
+  - resolve_market_snapshots() now patches three additional fields:
+      btc_resolution_price   — BTC spot price at the moment of resolution
+                               (same value for all rows in a market)
+      price_vs_resolution_pct — per-row: how much BTC moved between the
+                               snapshot and resolution. Critical ML feature
+                               for understanding reversal patterns.
+                               = (btc_resolution - btc_at_snapshot) / btc_at_snapshot * 100
+      secs_to_resolution     — per-row: how many seconds remained between
+                               the snapshot and market resolution.
+                               = (market_end_time - snapshot created_at)
+  - resolve_pending_trades() now fetches BTC price at resolution and passes
+    it to resolve_market_snapshots() and resolve_signal_logs().
+  - resolve_independent_signals() similarly passes btc_resolution_price.
+  - Required new Supabase columns (add before deploying):
+      ALTER TABLE market_snapshots
+        ADD COLUMN IF NOT EXISTS btc_resolution_price   numeric,
+        ADD COLUMN IF NOT EXISTS price_vs_resolution_pct numeric,
+        ADD COLUMN IF NOT EXISTS secs_to_resolution     numeric;
 """
 
 import os
@@ -87,6 +101,35 @@ def _make_session() -> requests.Session:
     return session
 
 _session = _make_session()
+
+
+# --------------------------------------------------------- BTC PRICE ----------
+
+COINBASE_API = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+KRAKEN_API   = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
+
+def fetch_btc_price() -> float:
+    """
+    Fetch current BTC spot price at the moment of market resolution.
+    Coinbase primary, Kraken fallback — same sources as multi_strategy.py.
+    Called once per resolved market so the resolution price is captured
+    as close to the actual resolution moment as possible.
+    Returns 0.0 on failure — callers must handle gracefully.
+    """
+    try:
+        r = _session.get(COINBASE_API, timeout=5)
+        r.raise_for_status()
+        return float(r.json()["data"]["amount"])
+    except Exception:
+        pass
+    try:
+        r = _session.get(KRAKEN_API, timeout=5)
+        r.raise_for_status()
+        res = r.json()["result"]
+        return float(res[list(res.keys())[0]]["c"][0])
+    except Exception:
+        log.warning("fetch_btc_price: both Coinbase and Kraken failed")
+        return 0.0
 
 
 # ---------------------------------------------------------------- SUPABASE ---
@@ -216,58 +259,109 @@ def resolve_signal_logs(outcome: str, condition_id: str):
         log.warning(f"Signal log resolution failed: {e}")
 
 
-def resolve_market_snapshots(outcome: str, condition_id: str):
+def resolve_market_snapshots(outcome: str, condition_id: str,
+                             btc_resolution_price: float = 0.0,
+                             market_end_time: str = ""):
     """
     Patch all market_snapshots rows for this condition_id with the resolved outcome.
     This is the primary ML training table — without it the snapshot rows are unlabelled.
 
-    Patches three fields per row:
-      resolved_outcome  — "UP" or "DOWN" (classification label)
-      outcome_binary    — 1.0 if UP won, 0.0 if DOWN won (numeric classification label)
-      edge_realized     — outcome_binary - p_market (profitability regression label)
-                          p_market is the poly_up_mid stored at snapshot time.
-                          Positive = we had positive edge from UP perspective.
-                          ML should regress on this, not just classify direction.
+    Patches six fields per row:
+      resolved_outcome        — "UP" or "DOWN" (classification label)
+      outcome_binary          — 1.0 if UP won, 0.0 if DOWN won
+      edge_realized           — outcome_binary - p_market (per-row profitability label)
+      btc_resolution_price    — BTC spot price at market resolution (same for all rows)
+      price_vs_resolution_pct — per-row: % BTC moved from snapshot to resolution
+                                = (btc_resolution - btc_at_snapshot) / btc_at_snapshot * 100
+                                Positive = BTC rose between snapshot and resolution.
+                                Critical for learning reversal patterns — a snapshot
+                                where BTC was rising but price_vs_resolution_pct is
+                                negative means BTC reversed before resolution.
+      secs_to_resolution      — per-row: seconds between snapshot and market end.
+                                = market_end_time - snapshot created_at
+                                Gives the model a continuous time-to-resolution signal
+                                complementary to the phase flags.
 
-    edge_realized is computed per-row because p_market varies across the market lifetime
-    (odds move as the market progresses). Patching in bulk with a single value would
-    be wrong — each snapshot observed a different market price.
+    All per-row fields are computed individually to reflect conditions at each
+    specific snapshot moment rather than a single market-level value.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
         outcome_binary = 1.0 if outcome == "UP" else 0.0
 
-        # Fetch all unresolved snapshot rows for this condition_id to compute
-        # per-row edge_realized = outcome_binary - p_market
+        # Parse market end time for secs_to_resolution computation
+        market_end_dt = None
+        if market_end_time:
+            try:
+                market_end_dt = datetime.fromisoformat(
+                    market_end_time.replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+        # Fetch all unresolved snapshot rows — need btc_price and created_at
+        # in addition to p_market for the new per-row computations
         rows = _sb_fetch_all("market_snapshots", {
             "condition_id":     f"eq.{condition_id}",
             "resolved_outcome": "is.null",
-            "select":           "id,p_market",
+            "select":           "id,p_market,btc_price,created_at",
         })
 
         if not rows:
             return
 
-        # Patch each row individually so edge_realized reflects the p_market
-        # that was observed at that specific moment in time
         updated_count = 0
         for row in rows:
-            row_id   = row.get("id")
-            p_market = row.get("p_market")
+            row_id          = row.get("id")
+            p_market        = row.get("p_market")
+            btc_at_snapshot = row.get("btc_price")
+            created_at_str  = row.get("created_at")
+
             if not row_id:
                 continue
-            edge_realized = round(outcome_binary - p_market, 6) if p_market is not None else None
+
+            # edge_realized: how much edge did this snapshot have?
+            # Positive = market underpriced the winning side at this moment
+            edge_realized = round(outcome_binary - p_market, 6) \
+                            if p_market is not None else None
+
+            # price_vs_resolution_pct: did BTC move toward or away from
+            # where it was at snapshot time? Captures reversal dynamics.
+            price_vs_res_pct = None
+            if btc_resolution_price and btc_at_snapshot:
+                try:
+                    price_vs_res_pct = round(
+                        (btc_resolution_price - float(btc_at_snapshot))
+                        / float(btc_at_snapshot) * 100, 6)
+                except Exception:
+                    pass
+
+            # secs_to_resolution: continuous time remaining at snapshot
+            secs_to_res = None
+            if market_end_dt and created_at_str:
+                try:
+                    snap_dt = datetime.fromisoformat(
+                        created_at_str.replace("Z", "+00:00"))
+                    secs_to_res = round(
+                        (market_end_dt - snap_dt).total_seconds(), 1)
+                except Exception:
+                    pass
+
+            patch_payload = {
+                "resolved_outcome":        outcome,
+                "outcome_binary":          outcome_binary,
+                "edge_realized":           edge_realized,
+                "btc_resolution_price":    btc_resolution_price or None,
+                "price_vs_resolution_pct": price_vs_res_pct,
+                "secs_to_resolution":      secs_to_res,
+            }
+
             try:
                 resp = _session.patch(
                     f"{SUPABASE_URL}/rest/v1/market_snapshots",
                     headers={**sb_headers(), "Prefer": "return=minimal"},
                     params={"id": f"eq.{row_id}"},
-                    json={
-                        "resolved_outcome": outcome,
-                        "outcome_binary":   outcome_binary,
-                        "edge_realized":    edge_realized,
-                    },
+                    json=patch_payload,
                     timeout=10,
                 )
                 resp.raise_for_status()
@@ -276,9 +370,12 @@ def resolve_market_snapshots(outcome: str, condition_id: str):
                 log.warning(f"market_snapshot patch failed for id={row_id}: {e}")
 
         if updated_count:
-            log.info(f"Updated {updated_count} market_snapshot(s) for "
+            log.info(f"Patched {updated_count} snapshot(s) for "
                      f"{condition_id[:12]}... → {outcome} "
-                     f"(outcome_binary={outcome_binary})")
+                     f"btc_res=${btc_resolution_price:.2f}"
+                     if btc_resolution_price else
+                     f"Patched {updated_count} snapshot(s) for "
+                     f"{condition_id[:12]}... → {outcome} (no BTC price)")
     except Exception as e:
         log.warning(f"Market snapshot resolution failed: {e}")
 
@@ -440,8 +537,21 @@ def resolve_pending_trades(outcome_cache: dict) -> int:
                          f"{side} vs {outcome} | PnL={actual_pnl:+.3f} | "
                          f"age={age_secs:.0f}s | {trade.get('strategy','')} | "
                          f"{trade.get('question','')[:50]}")
+
+                # Fetch BTC price at resolution moment — used to compute
+                # price_vs_resolution_pct per snapshot row.
+                # Cached in outcome_cache so we don't refetch for same condition_id.
+                btc_res_key = f"btc_{condition_id}"
+                if btc_res_key not in outcome_cache:
+                    outcome_cache[btc_res_key] = fetch_btc_price()
+                btc_res_price = outcome_cache[btc_res_key]
+
                 resolve_signal_logs(outcome, condition_id)
-                resolve_market_snapshots(outcome, condition_id)
+                resolve_market_snapshots(
+                    outcome, condition_id,
+                    btc_resolution_price=btc_res_price,
+                    market_end_time=end_time_str,
+                )
                 resolved_count += 1
             continue
 
@@ -494,8 +604,18 @@ def resolve_independent_signals(outcome_cache: dict):
 
         if result.get("resolved") is True:
             outcome = result["outcome"]
+
+            # Fetch BTC price at resolution — cached per condition_id
+            btc_res_key = f"btc_{condition_id}"
+            if btc_res_key not in outcome_cache:
+                outcome_cache[btc_res_key] = fetch_btc_price()
+            btc_res_price = outcome_cache[btc_res_key]
+
             resolve_signal_logs(outcome, condition_id)
-            resolve_market_snapshots(outcome, condition_id)
+            resolve_market_snapshots(
+                outcome, condition_id,
+                btc_resolution_price=btc_res_price,
+            )
         elif result.get("resolved") == "ZERO_PRICES":
             log.debug(f"condition_id={condition_id[:12]}... closed but no winner yet — will retry")
         else:
