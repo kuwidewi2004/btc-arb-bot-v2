@@ -227,8 +227,6 @@ def kelly_size(intensity: float, entry_price: float, bankroll: float,
     size = min(size, bankroll * MAX_BET_PCT)
 
     # Floor: only reached here when Kelly is positive (real edge confirmed above).
-    # If the Kelly-sized bet is smaller than MIN_BET, bump up to MIN_BET and log
-    # so it's visible — this is a conscious override, not a silent one.
     if size < MIN_BET:
         log.debug(
             f"kelly_size [{strategy_name}]: Kelly size ${size:.4f} below MIN_BET "
@@ -763,8 +761,7 @@ _regime:         dict  = {
 _vol_history_pct:     deque = deque(maxlen=288)
 _funding_history_pct: deque = deque(maxlen=288)
 _btc_history:    deque = deque(maxlen=30)  # last 150s of BTC prices (5s poll = 30 readings)
-                                           # 30 entries needed for momentum_120s lookback;
-                                           # previous maxlen=12 silently corrupted 120s values
+                                           # 30 entries needed for momentum_120s lookback
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
 
@@ -1348,17 +1345,14 @@ def btc_momentum_pct(lookback_secs: float = 30.0) -> Optional[float]:
     Returns None if not enough history.
     Positive = BTC moved up, Negative = BTC moved down.
 
-    Guard: if the oldest available sample is younger than `lookback_secs`,
-    returns None rather than silently computing a shorter window. This
-    prevents momentum_120s from reading as if it were momentum_60s when
-    the deque hasn't filled yet (e.g., on startup or after a restart).
+    Guard: if the oldest available sample is younger than lookback_secs,
+    returns None rather than silently computing a shorter window.
     """
     now = time.time()
     cutoff = now - lookback_secs
     history = list(_btc_history)
     if not history:
         return None
-    # Reject if our oldest sample doesn't reach back far enough
     if history[0]["ts"] > cutoff:
         return None
     old = next((h for h in history if h["ts"] >= cutoff), None)
@@ -1367,7 +1361,17 @@ def btc_momentum_pct(lookback_secs: float = 30.0) -> Optional[float]:
         return None
     return (current["price"] - old["price"]) / old["price"] * 100
 
-def fetch_current_market() -> Optional[Market]:
+def fetch_current_market(exclude: str = "") -> Optional[Market]:
+    """
+    Fetch the next active BTC up/down market from Polymarket.
+
+    exclude: condition_id to skip — used when pre-fetching the next market
+             while the current one is still running. Prevents the function
+             from returning the market we're already tracking.
+
+    Iterates candidate windows in ascending end-time order so we always
+    land on the soonest market that isn't excluded and hasn't expired.
+    """
     try:
         now        = datetime.now(timezone.utc)
         ts         = int(now.timestamp())
@@ -1386,6 +1390,9 @@ def fetch_current_market() -> Optional[Market]:
                     continue
                 end_time = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
                 if end_time <= now:
+                    continue
+                # Skip the market we're already tracking
+                if exclude and m["conditionId"] == exclude:
                     continue
                 token_ids = json.loads(m["clobTokenIds"])
                 outcomes  = m.get("outcomes")
@@ -2507,6 +2514,26 @@ def restore_state_from_supabase(portfolio: "SharedPortfolio") -> dict:
 
 # ------------------------------------------------------------------ MAIN -----
 
+def _make_market_state() -> dict:
+    """
+    Returns a fresh per-market state dict.
+    Called once on startup and once each time we switch to a new market.
+    Keeping state in a dict makes the switch atomic — one assignment replaces all fields.
+    """
+    return {
+        "market":            None,
+        "positions":         {},          # populated after trackers are known
+        "cl_history":        deque(maxlen=6),
+        "market_open_price": 0.0,
+        "cl_open_price":     0.0,
+        "prev_liq_total":    0.0,
+        "prev_ob_bid_depth": 0.0,
+        "prev_ob_ask_depth": 0.0,
+        "max_secs_left":     0.0,
+        "liq_total_history": deque(maxlen=6),
+    }
+
+
 def run():
     log.info("Multi-Strategy Mechanical Edge Simulator v3.5")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume | OB Pressure | Price Anchor")
@@ -2531,30 +2558,40 @@ def run():
         "price_anchor":  StrategyTracker("Price Anchor",        portfolio),
     }
 
-    # Restore open positions and exposure from Supabase before first poll cycle.
-    # This ensures the exposure cap is correct even after a redeploy mid-market.
     restored_state   = restore_state_from_supabase(portfolio)
-
-    # Load real per-strategy win rates for Kelly sizing.
-    # Strategies with < MIN_KELLY_SAMPLES resolved trades fall back to priors.
     _win_rates.update(fetch_win_rates())
 
-    positions        = {k: None for k in trackers}
-    cl_history       = deque(maxlen=6)
-    current_market   = None
-    last_market_fetch  = 0
+    # ── Dual-market state ─────────────────────────────────────────────────────
+    # cur: the market we are actively trading and snapshotting right now.
+    # nxt: pre-fetched next market, ready to swap in the instant cur expires.
+    #
+    # Timeline for a 5-minute market:
+    #   T+0s    cur market starts, nxt = None
+    #   T+240s  secs_left < PRE_FETCH_SECS → start fetching nxt in background
+    #   T+300s  cur expires → swap nxt → cur, reset per-market state, nxt = None
+    #
+    # This gives us complete phase coverage on both markets:
+    #   cur is polled all the way to 0s  (captures phase_late + phase_final)
+    #   nxt is ready at T=0 of new market (captures phase_early from poll 1)
+    #
+    PRE_FETCH_SECS   = 90    # start pre-fetching when this many seconds remain
+    next_fetch_tried = False  # guard: only attempt one pre-fetch per market
+
+    cur = _make_market_state()
+    cur["positions"] = {k: None for k in trackers}
+    nxt: Optional[dict] = None   # pre-fetched next market state (market field only)
+
     last_summary       = 0
     last_winrate_fetch = time.time()
 
-    # Per-market state for delta and opening price computations
-    market_open_price:  float = 0.0
-    cl_open_price:      float = 0.0
-    prev_liq_total:     float = 0.0
-    prev_liq_total_30s: float = 0.0
-    prev_ob_bid_depth:  float = 0.0
-    prev_ob_ask_depth:  float = 0.0
-    max_secs_left:      float = 0.0   # tracks true market duration
-    liq_total_history:  deque = deque(maxlen=6)
+    # Initial market fetch
+    cur["market"] = fetch_current_market()
+    if cur["market"]:
+        log.info(f"Initial market: {cur['market'].question}")
+        if cur["market"].condition_id in restored_state:
+            for sk, st in restored_state[cur["market"].condition_id].items():
+                cur["positions"][sk] = st
+                log.info(f"Restored position: {sk} {st.side} size={st.size:.2f}")
 
     while True:
         try:
@@ -2569,50 +2606,75 @@ def run():
             refresh_shared_data()
             compute_regime()
 
-            # Refresh market every 60s
-            if time.time() - last_market_fetch > 60:
-                market = fetch_current_market()
-                if market and (not current_market or
-                               market.condition_id != current_market.condition_id):
-                    log.info(f"New market: {market.question}")
-                    if current_market:
-                        portfolio.clear_exposure(current_market.condition_id)
-                    current_market = market
-                    positions      = {k: None for k in trackers}
-                    cl_history.clear()
-                    liq_total_history.clear()
-                    # Reset opening prices — captured on first poll of new market
-                    market_open_price  = 0.0
-                    cl_open_price      = 0.0
-                    prev_liq_total     = 0.0
-                    prev_liq_total_30s = 0.0
-                    prev_ob_bid_depth  = 0.0
-                    prev_ob_ask_depth  = 0.0
-                    max_secs_left      = 0.0
-                    # Restore any open positions from pre-restart state
-                    if market.condition_id in restored_state:
-                        for strategy_key, st in restored_state[market.condition_id].items():
-                            positions[strategy_key] = st
-                            log.info(f"Restored position: {strategy_key} {st.side} "
-                                     f"size={st.size:.2f} on current market")
-                last_market_fetch = time.time()
+            # ── No current market — fetch one ─────────────────────────────────
+            if cur["market"] is None:
+                if nxt and nxt["market"]:
+                    # Already have one pre-fetched — use it immediately
+                    cur  = nxt
+                    cur["positions"] = {k: None for k in trackers}
+                    nxt  = None
+                    next_fetch_tried = False
+                    log.info(f"Switched to pre-fetched market: {cur['market'].question}")
+                else:
+                    fetched = fetch_current_market()
+                    if fetched:
+                        cur["market"] = fetched
+                        log.info(f"Fetched market: {fetched.question}")
+                        if fetched.condition_id in restored_state:
+                            for sk, st in restored_state[fetched.condition_id].items():
+                                cur["positions"][sk] = st
+                    else:
+                        log.warning("No market available — retrying in 15s")
+                        time.sleep(15)
+                        continue
 
-            if not current_market:
-                log.warning("No market — retrying in 15s")
-                time.sleep(15)
-                continue
+            secs_left = (cur["market"].end_time - now).total_seconds()
 
-            secs_left = (current_market.end_time - now).total_seconds()
+            # ── Pre-fetch next market when approaching end ────────────────────
+            # Runs once per market (next_fetch_tried guard) so we don't hammer
+            # the API. Fetches in the main thread — the call is fast (<200ms)
+            # and we have POLL_SEC budget anyway.
+            if (not next_fetch_tried
+                    and secs_left <= PRE_FETCH_SECS
+                    and secs_left > 0):
+                next_fetch_tried = True
+                fetched_next = fetch_current_market(exclude=cur["market"].condition_id)
+                if fetched_next:
+                    nxt = _make_market_state()
+                    nxt["market"] = fetched_next
+                    log.info(f"Pre-fetched next market: {fetched_next.question} "
+                             f"(current has {secs_left:.0f}s left)")
+                else:
+                    log.warning(f"Pre-fetch failed with {secs_left:.0f}s left — "
+                                f"will retry at expiry")
 
-            # Market expired — resolve all open positions locally
+            # ── Current market expired — switch ───────────────────────────────
             if secs_left <= 0:
-                log.info(f"Market expired: {current_market.question} — resolving positions locally")
-                positions         = resolve_positions(positions, trackers, current_market, portfolio)
-                current_market    = None
-                last_market_fetch = 0
-                time.sleep(5)
+                log.info(f"Market expired: {cur['market'].question} — resolving locally")
+                cur["positions"] = resolve_positions(
+                    cur["positions"], trackers, cur["market"], portfolio)
+
+                if nxt and nxt["market"]:
+                    cur  = nxt
+                    cur["positions"] = {k: None for k in trackers}
+                    nxt  = None
+                    next_fetch_tried = False
+                    log.info(f"Switched to pre-fetched market: {cur['market'].question}")
+                    # Restore any open positions on the new market
+                    if cur["market"].condition_id in restored_state:
+                        for sk, st in restored_state[cur["market"].condition_id].items():
+                            cur["positions"][sk] = st
+                            log.info(f"Restored position: {sk} {st.side} size={st.size:.2f}")
+                else:
+                    # Pre-fetch failed or wasn't attempted — clear and re-fetch next loop
+                    log.warning("No pre-fetched market ready at expiry — fetching next cycle")
+                    cur = _make_market_state()
+                    cur["positions"] = {k: None for k in trackers}
+                    next_fetch_tried = False
+                time.sleep(2)
                 continue
 
+            # ── Normal poll cycle ─────────────────────────────────────────────
             spot    = _price_cache["btc"]
             futures = _basis_cache["futures"]
             basis   = (futures - spot) / spot * 100 if spot > 0 and futures > 0 else 0.0
@@ -2620,71 +2682,58 @@ def run():
             log.info(f"BTC=${spot:.2f} | {secs_left:.0f}s left | "
                      f"funding={_funding_cache['rate']:+.6f} | basis={basis:+.3f}% | "
                      f"regime={_regime['composite']} | session={_regime['session']} | "
-                     f"activity={_regime['activity']}")
+                     f"activity={_regime['activity']}"
+                     + (f" | next=ready" if nxt else ""))
 
-            # Capture opening price on first poll of each market.
-            # Must happen before strategy calls so price_anchor sees it.
-            if market_open_price == 0.0 and spot > 0:
-                market_open_price = spot
-                log.info(f"Market open price captured: ${market_open_price:.2f}")
+            # Capture opening price on first poll of each market
+            if cur["market_open_price"] == 0.0 and spot > 0:
+                cur["market_open_price"] = spot
+                log.info(f"Market open price captured: ${spot:.2f}")
 
-            # Track max secs_left to infer true market duration for progress calc.
-            # Must happen before strategy calls so price_anchor gets correct progress.
-            max_secs_left = max(max_secs_left, secs_left)
+            cur["max_secs_left"] = max(cur["max_secs_left"], secs_left)
 
-            # Run all 8 strategies
-            positions["chainlink"]   = strategy_chainlink_arb(
-                current_market, secs_left, trackers["chainlink"],
-                positions["chainlink"], cl_history)
+            # ── Run all 8 strategies ──────────────────────────────────────────
+            mkt = cur["market"]
+            pos = cur["positions"]
 
-            positions["funding"]     = strategy_funding_reversion(
-                current_market, secs_left, trackers["funding"],
-                positions["funding"])
+            pos["chainlink"]   = strategy_chainlink_arb(
+                mkt, secs_left, trackers["chainlink"],
+                pos["chainlink"], cur["cl_history"])
 
-            positions["liquidation"] = strategy_liquidation_cascade(
-                current_market, secs_left, trackers["liquidation"],
-                positions["liquidation"])
+            pos["funding"]     = strategy_funding_reversion(
+                mkt, secs_left, trackers["funding"],
+                pos["funding"])
 
-            positions["basis"]       = strategy_basis_arb(
-                current_market, secs_left, trackers["basis"],
-                positions["basis"])
+            pos["liquidation"] = strategy_liquidation_cascade(
+                mkt, secs_left, trackers["liquidation"],
+                pos["liquidation"])
 
-            positions["odds"]        = strategy_odds_mispricing(
-                current_market, secs_left, trackers["odds"],
-                positions["odds"])
+            pos["basis"]       = strategy_basis_arb(
+                mkt, secs_left, trackers["basis"],
+                pos["basis"])
 
-            positions["volume"]      = strategy_volume_clock(
-                current_market, secs_left, trackers["volume"],
-                positions["volume"])
+            pos["odds"]        = strategy_odds_mispricing(
+                mkt, secs_left, trackers["odds"],
+                pos["odds"])
 
-            positions["ob_pressure"] = strategy_ob_pressure(
-                current_market, secs_left, trackers["ob_pressure"],
-                positions["ob_pressure"])
+            pos["volume"]      = strategy_volume_clock(
+                mkt, secs_left, trackers["volume"],
+                pos["volume"])
 
-            # Compute market_progress here so price_anchor can use it.
-            # market_open_price is captured on first poll each market (below in snapshot block).
-            # We compute progress from the same max_secs_left tracker used in snapshots.
+            pos["ob_pressure"] = strategy_ob_pressure(
+                mkt, secs_left, trackers["ob_pressure"],
+                pos["ob_pressure"])
+
             _anchor_progress = round(
-                max(0.0, min(1.0, 1.0 - secs_left / max_secs_left))
-                if max_secs_left > 0 else 0.0, 4)
+                max(0.0, min(1.0, 1.0 - secs_left / cur["max_secs_left"]))
+                if cur["max_secs_left"] > 0 else 0.0, 4)
 
-            positions["price_anchor"] = strategy_price_anchor(
-                current_market, secs_left, trackers["price_anchor"],
-                positions["price_anchor"],
-                market_open_price, _anchor_progress)
+            pos["price_anchor"] = strategy_price_anchor(
+                mkt, secs_left, trackers["price_anchor"],
+                pos["price_anchor"],
+                cur["market_open_price"], _anchor_progress)
 
-            # ── ML TRAINING SNAPSHOT ──────────────────────────────────────────
-            # One row per poll cycle, all signals observed simultaneously.
-            # resolved_outcome patched later by resolver.py.
-            #
-            # ML design notes:
-            #   - p_market (poly_up_mid) is stored explicitly as the market price
-            #     so edge = model_prediction - p_market can be computed at inference
-            #   - edge_realized = outcome_binary - p_market is stored as a label
-            #     enabling profitability regression, not just accuracy classification
-            #   - Raw signals are stored alongside derived scores; prefer raw for ML
-            #   - Time phase flags encode non-linear time effects
-            #   - No condition_id-level features to prevent market ID memorisation
+            # ── ML TRAINING SNAPSHOT ─────────────────────────────────────────
             try:
                 cl_price, cl_age = fetch_chainlink_price()
                 cl_div = round((spot - cl_price) / cl_price * 100, 6) if cl_price else 0.0
@@ -2701,100 +2750,84 @@ def run():
                 buy_vol   = sum(c["buy_vol"] for c in recent)
                 buy_ratio = round(buy_vol / total_vol, 4) if total_vol > 0 else 0.5
 
-                # Chainlink opening price
-                if cl_open_price == 0.0 and cl_price:
-                    cl_open_price = cl_price
+                if cur["cl_open_price"] == 0.0 and cl_price:
+                    cur["cl_open_price"] = cl_price
 
-                # Price vs opening
+                market_open_price   = cur["market_open_price"]
                 price_vs_open_pct   = round((spot - market_open_price) / market_open_price * 100, 6) \
                                       if market_open_price > 0 else 0.0
                 price_vs_open_score = round(math.tanh(price_vs_open_pct / 0.10), 4)
 
-                # Chainlink vs its opening price
+                cl_open_price  = cur["cl_open_price"]
                 cl_vs_open_pct = round((cl_price - cl_open_price) / cl_open_price * 100, 6) \
                                  if cl_price and cl_open_price > 0 else 0.0
 
-                # Market progress
-                effective_duration = max_secs_left if max_secs_left > 0 else 300.0
-                market_progress = round(max(0.0, min(1.0, 1.0 - secs_left / effective_duration)), 4)
+                effective_duration = cur["max_secs_left"] if cur["max_secs_left"] > 0 else 300.0
+                market_progress    = round(max(0.0, min(1.0, 1.0 - secs_left / effective_duration)), 4)
 
-                # Multi-timeframe momentum (raw — preferred for ML over derived score)
                 momentum_10s  = round(btc_momentum_pct(lookback_secs=10)  or 0.0, 6)
                 momentum_30s  = round(btc_momentum_pct(lookback_secs=30)  or 0.0, 6)
                 momentum_60s  = round(btc_momentum_pct(lookback_secs=60)  or 0.0, 6)
                 momentum_120s = round(btc_momentum_pct(lookback_secs=120) or 0.0, 6)
 
-                # FIX 6: non-linear time phase flags
-                # Signals behave qualitatively differently across these windows —
-                # a linear secs_left cannot capture this; binary flags let the
-                # model learn separate weights per phase without assuming linearity.
-                phase_early = 1 if secs_left > 200 else 0   # >200s: market just opened
+                phase_early = 1 if secs_left > 200 else 0
                 phase_mid   = 1 if 100 < secs_left <= 200 else 0
                 phase_late  = 1 if 30 < secs_left <= 100 else 0
-                phase_final = 1 if secs_left <= 30 else 0   # <30s: almost resolved
+                phase_final = 1 if secs_left <= 30 else 0
 
-                # Liquidation delta and acceleration
+                liq_total_history = cur["liq_total_history"]
                 liq_total_history.append(liq_total)
-                liq_delta = round(liq_total - prev_liq_total, 2)
-                liq_accel = round(liq_delta - (prev_liq_total - (liq_total_history[0] if len(liq_total_history) >= 3 else prev_liq_total)), 2)
-                prev_liq_total = liq_total
+                prev_liq = cur["prev_liq_total"]
+                liq_delta = round(liq_total - prev_liq, 2)
+                liq_accel = round(liq_delta - (prev_liq - (liq_total_history[0]
+                            if len(liq_total_history) >= 3 else prev_liq)), 2)
+                cur["prev_liq_total"] = liq_total
 
-                # OB depth deltas
                 cur_bid_depth = _ob_cache.get("bid_depth", 0.0)
                 cur_ask_depth = _ob_cache.get("ask_depth", 0.0)
-                ob_bid_delta  = round(cur_bid_depth - prev_ob_bid_depth, 2)
-                ob_ask_delta  = round(cur_ask_depth - prev_ob_ask_depth, 2)
-                prev_ob_bid_depth = cur_bid_depth
-                prev_ob_ask_depth = cur_ask_depth
+                ob_bid_delta  = round(cur_bid_depth - cur["prev_ob_bid_depth"], 2)
+                ob_ask_delta  = round(cur_ask_depth - cur["prev_ob_ask_depth"], 2)
+                cur["prev_ob_bid_depth"] = cur_bid_depth
+                cur["prev_ob_ask_depth"] = cur_ask_depth
 
-                # Polymarket book state
-                poly_prices    = fetch_poly_prices(current_market, 20.0)
+                poly_prices    = fetch_poly_prices(mkt, 20.0)
                 poly_up_mid    = round(poly_prices.get("up_mid", 0.5), 4)
                 poly_spread    = round(poly_prices.get("spread", 0.1), 4)
                 poly_fill_up   = round(poly_prices.get("fill_up", 0.5), 4)
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
 
-                # FIX 5: explicit interaction features
-                # Tree models learn these automatically but storing them explicitly
-                # ensures they survive any feature selection step and are available
-                # to linear/logistic baselines too.
-                interact_momentum_x_vol    = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
-                interact_ob_x_spread       = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
-                interact_liq_x_price_pos   = round(liq_imbalance * price_vs_open_pct, 6)
+                interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
+                interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
+                interact_liq_x_price_pos     = round(liq_imbalance * price_vs_open_pct, 6)
                 interact_momentum_x_progress = round(momentum_30s * market_progress, 6)
 
                 supabase_market_snapshot({
-                    "condition_id":        current_market.condition_id,
-                    "market_question":     current_market.question,
-                    "market_end_time":     current_market.end_time.isoformat(),
+                    "condition_id":        mkt.condition_id,
+                    "market_question":     mkt.question,
+                    "market_end_time":     mkt.end_time.isoformat(),
                     "secs_left":           round(secs_left, 1),
                     "market_progress":     market_progress,
-                    # FIX 6: time phase flags (non-linear time encoding)
                     "phase_early":         phase_early,
                     "phase_mid":           phase_mid,
                     "phase_late":          phase_late,
                     "phase_final":         phase_final,
-                    # Price and macro (raw)
                     "btc_price":           round(spot, 2),
                     "market_open_price":   round(market_open_price, 2),
                     "price_vs_open_pct":   price_vs_open_pct,
-                    "price_vs_open_score": price_vs_open_score,   # derived — keep for reference
+                    "price_vs_open_score": price_vs_open_score,
                     "basis_pct":           round(basis, 6),
                     "funding_rate":        round(_funding_cache["rate"], 6),
                     "okx_funding":         round(_funding_cache["okx"], 6),
                     "gate_funding":        round(_funding_cache["binance"], 6),
-                    # Multi-timeframe momentum (raw signals — FIX 3)
                     "momentum_10s":        momentum_10s,
                     "momentum_30s":        momentum_30s,
                     "momentum_60s":        momentum_60s,
                     "momentum_120s":       momentum_120s,
-                    # Chainlink signal (raw)
                     "cl_divergence":       round(cl_div, 6),
                     "cl_age":              round(cl_age, 1) if cl_age else 0.0,
                     "cl_open_price":       round(cl_open_price, 2),
                     "cl_vs_open_pct":      cl_vs_open_pct,
-                    # Liquidation signal (raw)
                     "liq_total":           round(liq_total, 2),
                     "liq_long":            round(liq_long, 2),
                     "liq_short":           round(liq_short, 2),
@@ -2802,29 +2835,23 @@ def run():
                     "liq_delta":           liq_delta,
                     "liq_accel":           liq_accel,
                     "vol_range_pct":       round(_vol_cache.get("range_pct", 0.0), 6),
-                    # Order book signal (raw)
                     "ob_imbalance":        round(_ob_cache.get("imbalance", 0.0), 4),
                     "ob_spread_pct":       round(_ob_cache.get("spread_pct", 0.0), 6),
                     "ob_bid_depth":        round(cur_bid_depth, 2),
                     "ob_ask_depth":        round(cur_ask_depth, 2),
                     "ob_bid_delta":        ob_bid_delta,
                     "ob_ask_delta":        ob_ask_delta,
-                    # Volume signal (raw)
                     "volume_buy_ratio":    buy_ratio,
-                    # FIX 1: market price stored explicitly as p_market
-                    # edge at inference = model_predicted_prob - p_market
-                    "p_market":            poly_up_mid,   # canonical name for ML
-                    "poly_up_mid":         poly_up_mid,   # kept for backwards compat
+                    "p_market":            poly_up_mid,
+                    "poly_up_mid":         poly_up_mid,
                     "poly_spread":         poly_spread,
                     "poly_fill_up":        poly_fill_up,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
-                    # FIX 5: interaction features
                     "interact_momentum_x_vol":      interact_momentum_x_vol,
                     "interact_ob_x_spread":         interact_ob_x_spread,
                     "interact_liq_x_price_pos":     interact_liq_x_price_pos,
                     "interact_momentum_x_progress": interact_momentum_x_progress,
-                    # Regime labels (categorical — FIX 4: keep but treat as supplementary)
                     "regime":              _regime["composite"],
                     "momentum_label":      _regime["momentum_label"],
                     "volatility_label":    _regime["volatility_label"],
@@ -2832,7 +2859,6 @@ def run():
                     "session":             _regime["session"],
                     "activity":            _regime["activity"],
                     "day_type":            _regime["day_type"],
-                    # Continuous regime scores (derived — FIX 3: use raw signals as primary)
                     "momentum_score":      _regime["momentum_score"],
                     "volatility_pct":      _regime["volatility_pct"],
                     "flow_score":          _regime["flow_score"],
@@ -2842,33 +2868,23 @@ def run():
                     "hour_cos":            _regime["hour_cos"],
                     "dow_sin":             _regime["dow_sin"],
                     "dow_cos":             _regime["dow_cos"],
-                    # Price anchor signal
                     "anchor_open_price":   round(market_open_price, 2),
                     "anchor_pct":          price_vs_open_pct,
                     "anchor_score":        price_vs_open_score,
                     "anchor_progress":     market_progress,
-                    # FIX 2: profitability labels
-                    # edge_realized = outcome_binary - p_market, patched by resolver.
-                    # Enables regression target: predict edge, not just direction.
-                    # outcome_binary: 1.0 if UP wins, 0.0 if DOWN wins (patched by resolver)
-                    # edge_realized:  outcome_binary - p_market  (patched by resolver)
-                    "outcome_binary":      None,   # patched: 1.0=UP won, 0.0=DOWN won
-                    "edge_realized":       None,   # patched: outcome_binary - p_market
-                    # FIX 7: market_id for train/test split boundary (never use as feature)
-                    # Use condition_id to group rows by market when splitting:
-                    #   train on markets[:N], test on markets[N:]  — never shuffle across markets
-                    "resolved_outcome":    None,   # patched by resolver
+                    "outcome_binary":      None,
+                    "edge_realized":       None,
+                    "resolved_outcome":    None,
                 })
             except Exception as e:
                 log.debug(f"market_snapshot write failed: {e}")
-            # automatically improves as more trades resolve
+
             if time.time() - last_winrate_fetch > 1800:
                 new_rates = fetch_win_rates()
                 _win_rates.clear()
                 _win_rates.update(new_rates)
                 last_winrate_fetch = time.time()
 
-            # Print summary every 30 minutes
             if time.time() - last_summary > 1800:
                 log.info("=" * 60)
                 log.info("STRATEGY PERFORMANCE SUMMARY (local estimates)")
