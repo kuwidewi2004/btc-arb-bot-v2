@@ -2021,6 +2021,89 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
     return position
 
 
+def strategy_up_bias(market, secs_left, tracker, position):
+    """
+    Strategy: UP Bias (observation mode — no live betting yet)
+    ============================================================
+    Exploits systematic crowd underpricing of UP outcomes in the
+    mid-market phase (60-200 seconds remaining) when p_market is
+    between 0.50 and 0.70.
+
+    Data-driven finding (2026-03-26, 424 markets):
+      MID phase (120-200s): actual UP rate 63% vs p_market 57% → +6% edge
+      LATE phase (60-120s): actual UP rate 63% vs p_market 57% → +5.8% edge
+      FINAL (<60s):         actual UP rate 36% vs p_market 51% → -15% edge
+      Per-market stddev: ~49% — too high to confirm edge at current sample size
+
+    STATUS: OBSERVATION MODE
+      - Logs every evaluation to signal_log for data collection
+      - Does NOT place real bets until edge confirmed at 200+ mid markets
+      - Re-evaluate after 1 week of data (expected ~200 more markets)
+
+    Entry conditions:
+      - p_market between 0.52 and 0.68 (sweet spot, avoids edge fill costs)
+      - secs_left between 80 and 220 (mid/late phase only)
+      - No microstructure signal required — pure crowd miscalibration
+      - Always bets UP
+    """
+    try:
+        prices = get_poly_prices(market)
+        pm     = prices.get("up_mid", 0.5)
+
+        # Condition 1: p_market in sweet spot
+        if not (0.52 <= pm <= 0.68):
+            _log_signal("UP Bias", market, secs_left,
+                        signal_value=pm, threshold=0.52,
+                        reason="p_market_outside_range")
+            return position
+
+        # Condition 2: mid/late phase only
+        if not (80 <= secs_left <= 220):
+            _log_signal("UP Bias", market, secs_left,
+                        signal_value=secs_left, threshold=80,
+                        reason="wrong_phase")
+            return position
+
+        # Condition 3: spread must be reasonable
+        if prices.get("spread", 1.0) > 0.06:
+            _log_signal("UP Bias", market, secs_left,
+                        signal_value=prices["spread"], threshold=0.06,
+                        reason="spread_too_wide")
+            return position
+
+        # Log the signal — this is the data collection point
+        # Even in observation mode we log fired=False so signal_log
+        # accumulates labeled examples of this strategy evaluating
+        _log_signal("UP Bias", market, secs_left,
+                    signal_value=pm, threshold=0.52,
+                    reason="observation_mode_no_bet")
+
+        # OBSERVATION MODE: return without betting
+        # Remove this block when edge is confirmed at 200+ mid markets
+        return position
+
+        # ── LIVE MODE (uncomment when confirmed) ──────────────────────────
+        # if position:
+        #     return position
+        # intensity = (pm - 0.50) * 2   # 0.0 at pm=0.50, 0.36 at pm=0.68
+        # price = prices["fill_up"]
+        # size  = kelly_size(intensity, price, tracker.balance, "UP Bias")
+        # if size == 0.0:
+        #     return position
+        # trade_id = tracker.open("UP", price, size,
+        #             {"p_market": round(pm, 4), "intensity": round(intensity, 3)},
+        #             market)
+        # if not trade_id:
+        #     return position
+        # t = StrategyTrade("up_bias", "UP", size, price, market)
+        # t.trade_id = trade_id
+        # return t
+
+    except Exception as e:
+        log.warning(f"[UP Bias] error: {e}")
+    return position
+
+
 def strategy_basis_arb(market, secs_left, tracker, position):
     """
     Strategy 4: Basis arbitrage.
@@ -2659,6 +2742,7 @@ def run():
         "volume":        StrategyTracker("Volume Clock",         portfolio),
         "ob_pressure":   StrategyTracker("OB Pressure",         portfolio),
         "price_anchor":  StrategyTracker("Price Anchor",        portfolio),
+        "up_bias":       StrategyTracker("UP Bias",             portfolio),
     }
 
     restored_state   = restore_state_from_supabase(portfolio)
@@ -2820,6 +2904,9 @@ def run():
 
             # Volume Clock disabled — WR=10.6%, PnL=-$70, no edge
             # pos["volume"] = strategy_volume_clock(...)
+
+            # UP Bias — observation mode, logging only, no real bets
+            strategy_up_bias(mkt, secs_left, trackers["up_bias"], pos.get("up_bias"))
 
             pos["ob_pressure"] = strategy_ob_pressure(
                 mkt, secs_left, trackers["ob_pressure"],
