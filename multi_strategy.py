@@ -418,39 +418,55 @@ def _log_signal(strategy: str, market, secs_left: float,
     Writes snapshot context columns directly so signal_log is self-contained
     for ML training without needing a join to market_snapshots.
     """
-    thr      = threshold if threshold and threshold > 0 else 1.0
-    liq_long = _liq_cache.get("long", 0.0)
-    liq_short= _liq_cache.get("short", 0.0)
-    liq_tot  = liq_long + liq_short
-    entry = {
-        "strategy":        strategy,
-        "condition_id":    market.condition_id if market else "",
-        "market_question": market.question if market else "",
-        "secs_left":       round(secs_left, 1),
-        "signal_value":    round(signal_value, 6),
-        "threshold":       round(threshold, 6),
-        "fired":           False,
-        "reason":          reason,
-        "regime":          _regime.get("composite", "UNKNOWN"),
-        "session":         _regime.get("session",   "UNKNOWN"),
-        "activity":        _regime.get("activity",  "UNKNOWN"),
-        "day_type":        _regime.get("day_type",  "UNKNOWN"),
-        "signal_ratio":    round(signal_value / thr, 6),
-        "above_threshold": signal_value >= threshold,
-        "p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
-        "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
-        "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
-        "liq_total":       round(liq_tot, 2),
-        "liq_imbalance":   round((liq_long - liq_short) / max(liq_tot, 1.0), 4),
-        "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
-        "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
-        "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
-        "momentum_30s":    round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
-        "momentum_60s":    round(btc_momentum_pct(lookback_secs=60) or 0.0, 6),
-    }
-    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
-              f"| regime={entry['regime']} session={entry['session']}")
-    supabase_signal_log(entry)
+    try:
+        thr      = threshold if threshold and threshold > 0 else 1.0
+        liq_long = _liq_cache.get("long", 0.0)
+        liq_short= _liq_cache.get("short", 0.0)
+        liq_tot  = liq_long + liq_short
+
+        # Safe momentum reads — use cached values, never call btc_momentum_pct
+        # inside _log_signal to avoid recursion / empty history errors
+        try:
+            m30 = round(btc_momentum_pct(lookback_secs=30) or 0.0, 6)
+        except Exception:
+            m30 = 0.0
+        try:
+            m60 = round(btc_momentum_pct(lookback_secs=60) or 0.0, 6)
+        except Exception:
+            m60 = 0.0
+
+        entry = {
+            "strategy":        strategy,
+            "condition_id":    market.condition_id if market else "",
+            "market_question": market.question if market else "",
+            "secs_left":       round(secs_left, 1),
+            "signal_value":    round(signal_value, 6),
+            "threshold":       round(threshold, 6),
+            "fired":           False,
+            "reason":          reason,
+            "regime":          _regime.get("composite", "UNKNOWN"),
+            "session":         _regime.get("session",   "UNKNOWN"),
+            "activity":        _regime.get("activity",  "UNKNOWN"),
+            "day_type":        _regime.get("day_type",  "UNKNOWN"),
+            "signal_ratio":    round(signal_value / thr, 6),
+            "above_threshold": signal_value >= threshold,
+            "p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
+            "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
+            "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
+            "liq_total":       round(liq_tot, 2),
+            "liq_imbalance":   round((liq_long - liq_short) / max(liq_tot, 1.0), 4),
+            "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
+            "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
+            "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
+            "momentum_30s":    m30,
+            "momentum_60s":    m60,
+        }
+        log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} "
+                  f"threshold={threshold:.6f} | regime={entry['regime']} "
+                  f"session={entry['session']}")
+        supabase_signal_log(entry)
+    except Exception as e:
+        log.warning(f"[_log_signal] failed: {e}")
 
 
 # --------------------------------------------------------------- DATACLASSES --
