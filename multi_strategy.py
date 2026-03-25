@@ -949,6 +949,8 @@ def refresh_shared_data():
         _ob_cache["fetched_at"] = now
         log.debug(f"OB imbalance={imbalance:+.3f} bid={bid_depth:.0f} ask={ask_depth:.0f} "
                   f"spread={spread_pct:.4f}%")
+        log.info(f"OB raw — bid={best_bid:.2f} ask={best_ask:.2f} "
+                 f"spread_raw={best_ask - best_bid:.4f} spread_pct={spread_pct:.6f}%")
     except Exception as e:
         log.warning(f"OB pressure fetch failed: {e}")
 def compute_regime():
