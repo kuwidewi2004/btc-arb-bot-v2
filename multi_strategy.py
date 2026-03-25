@@ -1861,16 +1861,6 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
       - OKX REST poll: 2-minute window, stored in _liq_cache (OKX-only)
       - Binance WebSocket: 2-minute window, fetched fresh here via get_binance_liq_2min()
     Both use identical 2-minute lookback — no double-counting, no window mismatch.
-
-    FILTERS (data-driven from 98-trade analysis, 2026-03-26):
-      - Minimum total liq raised $10k -> $150k
-        (sub-$150k WR: 40-52%, above $300k: 72%+)
-      - CALM regime blocked unless total > $500k
-        (CALM WR=48.9% vs VOLATILE/TREND WR=61-67%)
-      - OFFPEAK session blocked
-        (OFFPEAK WR=40.0% actively losing)
-      - Minimum intensity raised to 0.20
-        (intensity 0.10-0.20 WR=25%, above 0.20: 62-73%)
     """
     try:
         # OKX 2min (from cache) + Binance 2min (from WebSocket buffer) — same window
@@ -1879,30 +1869,10 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         short_liqs = _liq_cache["short"] + binance["short"]
         total      = long_liqs + short_liqs
 
-        # Filter 1: minimum size raised from $10k to $150k
-        # Data: sub-$150k WR 40-52%, above $300k WR 72%+
-        if total < 150_000:
+        if total < 10_000:
             _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=150_000,
+                        signal_value=total, threshold=10_000,
                         reason="liquidation_volume_too_low")
-            return position
-
-        # Filter 2: skip CALM regime unless very large liquidation event
-        # Data: CALM WR=48.9% (47 trades) — essentially coin flip
-        # Exception: $500k+ is meaningful in any regime
-        composite = _regime.get("composite", "CALM")
-        if composite == "CALM" and total < 500_000:
-            _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=500_000,
-                        reason="calm_regime_insufficient_size")
-            return position
-
-        # Filter 3: skip OFFPEAK session
-        # Data: OFFPEAK WR=40.0% (15 trades) — actively losing
-        if _regime.get("session") == "OFFPEAK":
-            _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=150_000,
-                        reason="offpeak_session_filtered")
             return position
 
         # Require meaningful imbalance — at least 65/35 split
@@ -1935,16 +1905,7 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         vol_scalar       = max(0.3, min(1.0, 0.15 / vol_range))  # inverse vol
         adjusted_intensity = min(raw_intensity * vol_scalar, 1.0)
 
-        # Filter 4: minimum intensity 0.20
-        # Data: intensity 0.10-0.20 WR=25% (8 trades) — danger zone
-        # Above 0.20: WR=62-73% consistently
-        if adjusted_intensity < 0.20:
-            _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=adjusted_intensity, threshold=0.20,
-                        reason="intensity_too_low")
-            return position
-
-        prices = get_poly_prices(market)
+        prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Liquidation Cascade", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -1956,18 +1917,19 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"long_liqs":   round(long_liqs),
-                     "short_liqs":  round(short_liqs),
-                     "vol_range":   round(vol_range, 4),
-                     "intensity":   round(adjusted_intensity, 3),
-                     "source":      "OKX+Binance"},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("liquidation_cascade", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"long_liqs":   round(long_liqs),
+                         "short_liqs":  round(short_liqs),
+                         "vol_range":   round(vol_range, 4),
+                         "intensity":   round(adjusted_intensity, 3),
+                         "source":      "OKX+Binance"},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("liquidation_cascade", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Liquidation cascade] error: {e}")
     return position
@@ -2584,6 +2546,11 @@ def _make_market_state() -> dict:
         "prev_ob_ask_depth": 0.0,
         "max_secs_left":     0.0,
         "liq_total_history": deque(maxlen=6),
+        # p_market rolling history — captures how much odds have moved
+        # within the market. Used to compute p_market_std and
+        # p_market_vs_open_delta as ML features (top features in market model).
+        "p_market_history":  deque(maxlen=60),  # up to 5 min at 5s poll
+        "p_market_open":     None,              # first observed p_market
     }
 
 
@@ -2850,6 +2817,29 @@ def run():
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
 
+                # ── p_market rolling stats ───────────────────────────────────────
+                # Track how much odds have moved since market open.
+                # p_market_std and p_market_vs_open_delta are the top features
+                # in the market-level model — they capture whether the crowd
+                # has already made up its mind or is still uncertain.
+                cur["p_market_history"].append(poly_up_mid)
+                if cur["p_market_open"] is None:
+                    cur["p_market_open"] = poly_up_mid
+
+                pm_hist = list(cur["p_market_history"])
+                pm_open = cur["p_market_open"]
+
+                # Delta from opening odds — how much has the market moved?
+                p_market_vs_open_delta = round(poly_up_mid - pm_open, 4)                                          if pm_open is not None else 0.0
+
+                # Rolling std of p_market — how volatile have the odds been?
+                if len(pm_hist) >= 3:
+                    pm_mean = sum(pm_hist) / len(pm_hist)
+                    pm_var  = sum((x - pm_mean) ** 2 for x in pm_hist) / len(pm_hist)
+                    p_market_std = round(pm_var ** 0.5, 6)
+                else:
+                    p_market_std = 0.0
+
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
                 interact_liq_x_price_pos     = round(liq_imbalance * price_vs_open_pct, 6)
@@ -2913,6 +2903,9 @@ def run():
                     "poly_fill_up":        poly_fill_up,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
+                    "p_market_open":       round(pm_open, 4) if pm_open is not None else None,
+                    "p_market_vs_open_delta": p_market_vs_open_delta,
+                    "p_market_std":        p_market_std,
                     "price_bucket":        price_bucket,
                     "interact_momentum_x_vol":      interact_momentum_x_vol,
                     "interact_ob_x_spread":         interact_ob_x_spread,
