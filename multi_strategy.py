@@ -790,6 +790,91 @@ _volume_fetched: float = 0.0
 
 
 def _fetch_deribit_iv():
+    try:
+        btc_price = _price_cache.get("btc", 0.0)
+        if btc_price <= 0:
+            log.warning("[Deribit IV] BTC price not available yet — skipping")
+            return
+
+        r = _session.get(
+            "https://www.deribit.com/api/v2/public/get_instruments",
+            params={"currency": "BTC", "kind": "option", "expired": "false"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        instruments = r.json().get("result", [])
+        log.info(f"[Deribit IV] {len(instruments)} instruments returned")
+
+        if not instruments:
+            log.warning("[Deribit IV] No instruments returned — geo-blocked or API down")
+            return
+
+        now_ts = time.time()
+        expiries = sorted(set(
+            i["expiration_timestamp"] / 1000 for i in instruments))
+        future = [e for e in expiries if e > now_ts + 86400]
+        log.info(f"[Deribit IV] {len(future)} future expiries found: "
+                 f"{[datetime.fromtimestamp(e, tz=timezone.utc).strftime('%Y-%m-%d') for e in future[:3]]}")
+
+        if not future:
+            log.warning("[Deribit IV] No expiry > 24h out — skipping")
+            return
+        exp = future[0]
+
+        calls = [i for i in instruments
+                 if i["expiration_timestamp"] / 1000 == exp
+                 and i["option_type"] == "call"]
+        puts  = [i for i in instruments
+                 if i["expiration_timestamp"] / 1000 == exp
+                 and i["option_type"] == "put"]
+        log.info(f"[Deribit IV] expiry={datetime.fromtimestamp(exp, tz=timezone.utc).date()} "
+                 f"calls={len(calls)} puts={len(puts)}")
+
+        if not calls or not puts:
+            log.warning("[Deribit IV] No calls or puts for selected expiry")
+            return
+
+        atm_call = min(calls, key=lambda x: abs(x["strike"] - btc_price))
+        atm_put  = min(puts,  key=lambda x: abs(x["strike"] - btc_price))
+        c25 = min(calls, key=lambda x: abs(x["strike"] - btc_price * 1.08))
+        p25 = min(puts,  key=lambda x: abs(x["strike"] - btc_price * 0.92))
+
+        log.info(f"[Deribit IV] ATM call={atm_call['instrument_name']} "
+                 f"put={atm_put['instrument_name']} "
+                 f"c25={c25['instrument_name']} p25={p25['instrument_name']}")
+
+        def _mark_iv(name):
+            try:
+                r = _session.get(
+                    "https://www.deribit.com/api/v2/public/ticker",
+                    params={"instrument_name": name}, timeout=5)
+                r.raise_for_status()
+                result = r.json().get("result", {})
+                iv = result.get("mark_iv", None)
+                log.info(f"[Deribit IV] {name} → mark_iv={iv}")
+                if iv is None:
+                    log.warning(f"[Deribit IV] mark_iv missing from ticker response for {name}. "
+                                f"Keys present: {list(result.keys())}")
+                    return 0.0
+                return float(iv)
+            except Exception as e:
+                log.warning(f"[Deribit IV] ticker fetch failed for {name}: {e}")
+                return 0.0
+
+        iv_ac  = _mark_iv(atm_call["instrument_name"])
+        iv_ap  = _mark_iv(atm_put["instrument_name"])
+        iv_c25 = _mark_iv(c25["instrument_name"])
+        iv_p25 = _mark_iv(p25["instrument_name"])
+
+        log.info(f"[Deribit IV] raw IVs — atm_call={iv_ac} atm_put={iv_ap} "
+                 f"c25={iv_c25} p25={iv_p25}")
+
+        if iv_ac == 0 or iv_ap == 0:
+            log.warning(f"[Deribit IV] ATM IV is zero — not updating cache. "
+                        f"atm_call={iv_ac} atm_put={iv_ap}")
+            return
+
+        # rest of function unchanged...
     """
     Fetch BTC implied volatility from Deribit public API.
     No API key required. Runs every 5 minutes inside refresh_shared_data().
