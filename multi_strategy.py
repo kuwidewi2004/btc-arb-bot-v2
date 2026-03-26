@@ -3148,19 +3148,17 @@ def run():
                 mkt, secs_left, trackers["liquidation"],
                 pos["liquidation"])
 
-            pos["basis"]       = strategy_basis_arb(
-                mkt, secs_left, trackers["basis"],
-                pos["basis"])
+            # Basis Arb disabled — WR=23.5%, PnL=-$56, no edge
+            # pos["basis"] = strategy_basis_arb(...)
 
-            # Odds Mispricing disabled — WR=20.4%, PnL=-$105, no edge
+            # Odds Mispricing disabled — WR=20.2%, PnL=-$111, no edge
             # pos["odds"] = strategy_odds_mispricing(...)
 
-            # Volume Clock disabled — WR=10.2%, PnL=-$82, no edge
+            # Volume Clock disabled — WR=10.0%, PnL=-$88, no edge
             # pos["volume"] = strategy_volume_clock(...)
 
-            pos["ob_pressure"] = strategy_ob_pressure(
-                mkt, secs_left, trackers["ob_pressure"],
-                pos["ob_pressure"])
+            # OB Pressure disabled — WR=14.6%, PnL=-$36, no edge
+            # pos["ob_pressure"] = strategy_ob_pressure(...)
 
             _anchor_progress = round(
                 max(0.0, min(1.0, 1.0 - secs_left / cur["max_secs_left"]))
