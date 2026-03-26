@@ -372,7 +372,7 @@ def supabase_signal_log(entry: dict):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        resp = _session.post(
+        _session.post(
             f"{SUPABASE_URL}/rest/v1/signal_log",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -383,9 +383,6 @@ def supabase_signal_log(entry: dict):
             json=entry,
             timeout=5,
         )
-        if resp.status_code not in (200, 201, 204):
-            log.warning(f"signal_log HTTP {resp.status_code}: {resp.text[:300]}")
-            log.warning(f"signal_log payload keys: {list(entry.keys())}")
     except Exception as e:
         log.warning(f"Supabase signal_log insert failed: {e}")
 
@@ -399,7 +396,7 @@ def supabase_market_snapshot(snapshot: dict):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        resp = _session.post(
+        _session.post(
             f"{SUPABASE_URL}/rest/v1/market_snapshots",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -410,8 +407,6 @@ def supabase_market_snapshot(snapshot: dict):
             json=snapshot,
             timeout=5,
         )
-        if resp.status_code not in (200, 201, 204):
-            log.warning(f"market_snapshot HTTP {resp.status_code}: {resp.text[:300]}")
     except Exception as e:
         log.warning(f"market_snapshot insert failed: {e}")
 
@@ -428,30 +423,11 @@ def _log_signal(strategy: str, market, secs_left: float,
         "threshold":       round(threshold, 6),
         "fired":           False,
         "reason":          reason,
-        # Regime labels
+        # Regime labels — allows slicing win rates by market condition
         "regime":          _regime.get("composite", "UNKNOWN"),
         "session":         _regime.get("session", "UNKNOWN"),
         "activity":        _regime.get("activity", "UNKNOWN"),
         "day_type":        _regime.get("day_type", "UNKNOWN"),
-        # Polymarket prices
-        "p_market":        _poly_cache.get("up_mid",    0.5),
-        "poly_spread":     _poly_cache.get("spread",    0.1),
-        "poly_fill_up":    _poly_cache.get("fill_up",   0.5),
-        "poly_fill_down":  _poly_cache.get("fill_down", 0.5),
-        "poly_deviation":  _poly_cache.get("deviation", 0.0),
-        # Market microstructure signals from shared caches
-        "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
-        "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
-        "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
-        "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
-        "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
-        "liq_imbalance":   round(
-            (_liq_cache.get("long", 0.0) - _liq_cache.get("short", 0.0)) /
-            max(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 1.0)
-        , 4),
-        "liq_total":       round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
-        "momentum_30s":    round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
-        "momentum_60s":    round(btc_momentum_pct(lookback_secs=60) or 0.0, 6),
     }
     log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
               f"| regime={entry['regime']} session={entry['session']}")
@@ -782,8 +758,6 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
-_poly_cache:     dict  = {"up_mid": 0.5, "spread": 0.1, "fill_up": 0.5,
-                           "fill_down": 0.5, "slip_up": 0.0, "deviation": 0.0}
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
     "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
@@ -815,104 +789,43 @@ _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
 
 
-# --------------------------------------------------- DERIBIT IV WEBSOCKET -----
-# Subscribes to Deribit's deribit_volatility_index.btc_usd channel for ATM IV
-# and option ticker channels for 25-delta skew.
-#
-# atm_iv   = Deribit DVOL (their official ATM 30-day IV index)
-# skew_25d = put_iv - call_iv at ±8% strikes, fetched via WS ticker on connect
-# iv_rank  = DVOL percentile vs 30d historical range seeded from REST at startup
-#
-# Skew approach: on each WS connect, fetch BTC index price + nearest expiry
-# instruments via REST (2 calls), subscribe to the 2 relevant option tickers,
-# then read mark_iv from those ticker updates. Re-seeds every reconnect so
-# strikes stay current as BTC price moves.
-
-_DERIBIT_WS = "wss://www.deribit.com/ws/api/v2"
-_DERIBIT_REST = "https://www.deribit.com/api/v2/public"
-
-_deribit_iv_lock = threading.Lock()
-_deribit_iv_connected = False
-_deribit_skew_instruments: dict = {"c25": "", "p25": ""}  # current strike names
-_deribit_skew_ivs: dict = {"c25": 0.0, "p25": 0.0}
-
-
-def _seed_iv_rank():
+def _fetch_deribit_iv():
     """
-    Seed iv_30d_high/low from Deribit's historical DVOL data at startup.
-    Uses the last 30 days of daily DVOL candles so iv_rank is meaningful
-    from the first tick rather than waiting hours to build a range.
-    Falls back silently — WS will build the range from live ticks if this fails.
+    Fetch BTC implied volatility from Deribit public API.
+    No API key required. Runs every 5 minutes inside refresh_shared_data().
+
+    Stores in _iv_cache:
+      atm_iv   — ATM IV for nearest weekly expiry (annualised %)
+      skew_25d — 25-delta skew: put_iv - call_iv
+                 negative = puts expensive = market fears downside
+      iv_rank  — IV percentile vs rolling 30d range (0=low IV, 1=high IV)
+
+    High iv_rank → volatile regime likely → Liquidation Cascade fires better
+    Negative skew → sophisticated money pricing downside risk
+    Low iv_rank  → calm market → reduce position sizes
     """
+    global _iv_cache
     try:
+        # BTC index price
         r = _session.get(
-            f"{_DERIBIT_REST}/get_volatility_index_data",
-            params={
-                "currency":   "BTC",
-                "start_timestamp": int((time.time() - 30 * 86400) * 1000),
-                "end_timestamp":   int(time.time() * 1000),
-                "resolution": "3600",  # hourly candles
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        candles = r.json().get("result", {}).get("data", [])
-        if not candles:
-            log.warning("[Deribit IV] Seed: no DVOL candle data returned")
-            return
-        # Each candle: [timestamp_ms, open, high, low, close]
-        highs = [c[2] for c in candles if c[2] > 0]
-        lows  = [c[3] for c in candles if c[3] > 0]
-        if not highs or not lows:
-            return
-        with _deribit_iv_lock:
-            _iv_cache["iv_30d_high"] = max(highs)
-            _iv_cache["iv_30d_low"]  = min(lows)
-        log.info(f"[Deribit IV] Seeded iv_rank range: "
-                 f"low={min(lows):.1f}% high={max(highs):.1f}%")
-    except Exception as e:
-        log.warning(f"[Deribit IV] Seed iv_rank failed — will build from live ticks: {e}")
+            "https://www.deribit.com/api/v2/public/get_index_price",
+            params={"index_name": "btc_usd"}, timeout=5)
+        btc_price = r.json()["result"]["index_price"]
 
+        # All active BTC option instruments
+        r2 = _session.get(
+            "https://www.deribit.com/api/v2/public/get_instruments",
+            params={"currency": "BTC", "kind": "option", "expired": False},
+            timeout=5)
+        instruments = r2.json()["result"]
 
-def _get_skew_instruments() -> tuple:
-    """
-    Fetch nearest expiry BTC option names for ±8% strikes (approx 25-delta).
-    Returns (call_name, put_name) or ("", "") on failure.
-    Uses live _price_cache BTC price (Coinbase/Kraken) for strike selection.
-    Falls back to Deribit index price only if cache not yet populated.
-    One REST call: get_instruments only.
-    """
-    try:
-        # Always fetch fresh from Coinbase/Kraken — do not trust _price_cache
-        # (empty at startup) or Deribit index (known to return stale prices)
-        btc_price = 0.0
-        try:
-            r = _session.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
-            btc_price = float(r.json()["data"]["amount"])
-        except Exception:
-            pass
-        if btc_price <= 0:
-            try:
-                r = _session.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
-                res = r.json()["result"]
-                btc_price = float(res[list(res.keys())[0]]["c"][0])
-            except Exception:
-                pass
-        if btc_price <= 0:
-            log.warning("[Deribit IV] Could not fetch BTC price for skew strikes — skipping")
-            return "", ""
-        log.info(f"[Deribit IV] BTC price for skew strikes: ${btc_price:,.0f}")
-
-        r2 = _session.get(f"{_DERIBIT_REST}/get_instruments",
-                          params={"currency": "BTC", "kind": "option",
-                                  "expired": "false"}, timeout=10)
-        instruments = r2.json().get("result", [])
-
-        now_ts   = time.time()
-        expiries = sorted(set(i["expiration_timestamp"] / 1000 for i in instruments))
-        future   = [e for e in expiries if e > now_ts + 86400]
+        # Nearest expiry at least 24h away
+        now_ts = time.time()
+        expiries = sorted(set(
+            i["expiration_timestamp"] / 1000 for i in instruments))
+        future = [e for e in expiries if e > now_ts + 86400]
         if not future:
-            return "", ""
+            return
         exp = future[0]
 
         calls = [i for i in instruments
@@ -922,152 +835,54 @@ def _get_skew_instruments() -> tuple:
                  if i["expiration_timestamp"] / 1000 == exp
                  and i["option_type"] == "put"]
         if not calls or not puts:
-            return "", ""
+            return
 
+        # ATM strike = closest to spot
+        atm_call = min(calls, key=lambda x: abs(x["strike"] - btc_price))
+        atm_put  = min(puts,  key=lambda x: abs(x["strike"] - btc_price))
+        # 25-delta strikes ≈ ±8% from ATM
         c25 = min(calls, key=lambda x: abs(x["strike"] - btc_price * 1.08))
         p25 = min(puts,  key=lambda x: abs(x["strike"] - btc_price * 0.92))
-        log.info(f"[Deribit IV] Skew instruments: call={c25['instrument_name']} "
-                 f"put={p25['instrument_name']} (BTC={btc_price:.0f})")
-        return c25["instrument_name"], p25["instrument_name"]
-    except Exception as e:
-        log.warning(f"[Deribit IV] _get_skew_instruments failed: {e}")
-        return "", ""
 
+        def _mark_iv(name):
+            try:
+                r = _session.get(
+                    "https://www.deribit.com/api/v2/public/ticker",
+                    params={"instrument_name": name}, timeout=5)
+                return float(r.json()["result"].get("mark_iv", 0.0))
+            except Exception:
+                return 0.0
 
-def _on_deribit_iv_open(ws):
-    global _deribit_iv_connected, _deribit_skew_instruments
-    _deribit_iv_connected = True
-    log.info("[Deribit IV WS] Connected — subscribing to DVOL + skew tickers")
+        iv_ac = _mark_iv(atm_call["instrument_name"])
+        iv_ap = _mark_iv(atm_put["instrument_name"])
+        iv_c25 = _mark_iv(c25["instrument_name"])
+        iv_p25 = _mark_iv(p25["instrument_name"])
 
-    # Get skew instrument names via REST before subscribing
-    c25, p25 = _get_skew_instruments()
-    _deribit_skew_instruments["c25"] = c25
-    _deribit_skew_instruments["p25"] = p25
-
-    channels = ["deribit_volatility_index.btc_usd"]
-    if c25:
-        channels.append(f"ticker.{c25}.100ms")
-    if p25:
-        channels.append(f"ticker.{p25}.100ms")
-
-    ws.send(json.dumps({
-        "jsonrpc": "2.0",
-        "id":      1,
-        "method":  "public/subscribe",
-        "params":  {"channels": channels},
-    }))
-
-
-def _on_deribit_iv_message(ws, message):
-    global _iv_cache, _deribit_skew_ivs
-    try:
-        data = json.loads(message)
-
-        if "result" in data:
-            log.info(f"[Deribit IV WS] Subscribed OK: {data.get('result')}")
+        if iv_ac == 0 or iv_ap == 0:
             return
 
-        # Log any error responses from Deribit
-        if "error" in data:
-            log.warning(f"[Deribit IV WS] API error: {data['error']}")
-            return
+        atm_iv   = (iv_ac + iv_ap) / 2.0
+        skew_25d = iv_p25 - iv_c25  # negative = bearish fear premium
 
-        params  = data.get("params", {})
-        channel = params.get("channel", "")
-        payload = params.get("data", {})
+        # Rolling 30d range for IV rank
+        if atm_iv > _iv_cache["iv_30d_high"]:
+            _iv_cache["iv_30d_high"] = atm_iv
+        if 0 < atm_iv < _iv_cache["iv_30d_low"]:
+            _iv_cache["iv_30d_low"] = atm_iv
+        iv_range = _iv_cache["iv_30d_high"] - _iv_cache["iv_30d_low"]
+        iv_rank  = ((atm_iv - _iv_cache["iv_30d_low"]) / iv_range
+                    if iv_range > 1.0 else 0.5)
 
-        if not channel:
-            log.debug(f"[Deribit IV WS] Unrecognised message: {message[:200]}")
-            return
+        _iv_cache["atm_iv"]     = round(float(atm_iv), 2)
+        _iv_cache["skew_25d"]   = round(float(skew_25d), 2)
+        _iv_cache["iv_rank"]    = round(float(min(max(iv_rank, 0.0), 1.0)), 4)
+        _iv_cache["fetched_at"] = now_ts
 
-        # ── DVOL update ──────────────────────────────────────────────────────
-        if channel == "deribit_volatility_index.btc_usd":
-            log.debug(f"[Deribit IV WS] DVOL raw payload: {payload}")
-            dvol = float(payload.get("volatility", 0.0))
-            if dvol <= 0:
-                log.warning(f"[Deribit IV WS] DVOL value is zero/missing in payload: {payload}")
-                return
-            with _deribit_iv_lock:
-                if dvol > _iv_cache["iv_30d_high"]:
-                    _iv_cache["iv_30d_high"] = dvol
-                if 0 < dvol < _iv_cache["iv_30d_low"]:
-                    _iv_cache["iv_30d_low"] = dvol
-                iv_range = _iv_cache["iv_30d_high"] - _iv_cache["iv_30d_low"]
-                iv_rank  = ((dvol - _iv_cache["iv_30d_low"]) / iv_range
-                            if iv_range > 1.0 else 0.5)
-                _iv_cache["atm_iv"]     = round(dvol, 2)
-                _iv_cache["iv_rank"]    = round(float(min(max(iv_rank, 0.0), 1.0)), 4)
-                _iv_cache["fetched_at"] = time.time()
-            log.debug(f"[Deribit IV WS] DVOL={dvol:.1f}%  rank={iv_rank:.2f}  "
-                     f"skew={_iv_cache['skew_25d']:+.1f}%")
-
-        # ── Option ticker update (skew) ──────────────────────────────────────
-        elif channel.startswith("ticker.") and channel.endswith(".100ms"):
-            instrument = payload.get("instrument_name", "")
-            mark_iv    = payload.get("mark_iv")
-            log.debug(f"[Deribit IV WS] Ticker {instrument}: mark_iv={mark_iv} "
-                     f"(expecting c25={_deribit_skew_instruments.get('c25')} "
-                     f"p25={_deribit_skew_instruments.get('p25')})")
-            if mark_iv is None or float(mark_iv) <= 0:
-                return
-            iv = float(mark_iv)
-            if instrument == _deribit_skew_instruments.get("c25"):
-                _deribit_skew_ivs["c25"] = iv
-            elif instrument == _deribit_skew_instruments.get("p25"):
-                _deribit_skew_ivs["p25"] = iv
-
-            # Update skew whenever both sides have data
-            c_iv = _deribit_skew_ivs["c25"]
-            p_iv = _deribit_skew_ivs["p25"]
-            if c_iv > 0 and p_iv > 0:
-                skew = round(p_iv - c_iv, 2)
-                with _deribit_iv_lock:
-                    _iv_cache["skew_25d"] = skew
-                log.debug(f"[Deribit IV WS] skew={skew:+.2f}% "
-                          f"(put={p_iv:.1f}% call={c_iv:.1f}%)")
+        log.info(f"Deribit IV — ATM: {atm_iv:.1f}%  "
+                 f"skew: {skew_25d:+.1f}%  rank: {iv_rank:.2f}")
 
     except Exception as e:
-        log.warning(f"[Deribit IV WS] message parse error: {e}")
-
-
-def _on_deribit_iv_error(ws, error):
-    log.warning(f"[Deribit IV WS] error: {error}")
-
-
-def _on_deribit_iv_close(ws, close_status_code, close_msg):
-    global _deribit_iv_connected
-    _deribit_iv_connected = False
-    log.warning(f"[Deribit IV WS] closed ({close_status_code}) — will reconnect")
-
-
-def _deribit_iv_ws_thread():
-    """Background thread: maintains persistent WebSocket to Deribit for IV data."""
-    while True:
-        try:
-            ws = websocket.WebSocketApp(
-                _DERIBIT_WS,
-                on_open    = _on_deribit_iv_open,
-                on_message = _on_deribit_iv_message,
-                on_error   = _on_deribit_iv_error,
-                on_close   = _on_deribit_iv_close,
-            )
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as e:
-            log.warning(f"[Deribit IV WS] thread exception: {e}")
-        log.info("[Deribit IV WS] Reconnecting in 5s...")
-        time.sleep(5)
-
-
-def start_deribit_iv_ws():
-    """
-    Seed iv_rank range from 30d historical DVOL then start the WS thread.
-    Seeding is done synchronously before the thread starts so the first
-    DVOL tick produces a meaningful rank rather than defaulting to 0.5.
-    """
-    _seed_iv_rank()
-    t = threading.Thread(target=_deribit_iv_ws_thread, daemon=True)
-    t.start()
-    log.info("[Deribit IV WS] Background thread started")
+        log.debug(f"[Deribit IV] {e}")
 
 
 def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
@@ -1138,7 +953,9 @@ def refresh_shared_data():
                  f"Gate.io: {_funding_cache['binance']:+.6f} "
                  f"avg: {_funding_cache['rate']:+.6f}")
 
-    # Deribit IV — updated via WebSocket (start_deribit_iv_ws), no polling needed
+    # Deribit IV — forward-looking vol signal, refresh every 5 min
+    if time.time() - _iv_cache["fetched_at"] >= 300:
+        _fetch_deribit_iv()
 
     # Basis via OKX mark price vs spot
     if now - _basis_cache["fetched_at"] >= 10:
@@ -2166,6 +1983,19 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
                         reason="liquidation_volume_too_low")
             return position
 
+        # ── Volatility filter — data-driven (2026-03-26, 82 trades) ──────────
+        # Trades split by vol_range_pct percentile:
+        #   high_vol (>p50=0.2147): WR=65.9%  PnL=+$38.60  (41 trades)
+        #   mid_vol  (p25-p50):     WR=45.0%  PnL=-$5.41   (20 trades)
+        #   low_vol  (<p25=0.1455): WR=42.9%  PnL=-$19.72  (21 trades)
+        # Below median vol: coin-flip win rate, negative PnL — skip entirely
+        vol_range_now = _vol_cache.get("range_pct", 0.0)
+        if vol_range_now < 0.2147:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=vol_range_now, threshold=0.2147,
+                        reason="vol_too_low_for_cascade")
+            return position
+
         # Require meaningful imbalance — at least 65/35 split
         if total > 0:
             dominant_ratio = max(long_liqs, short_liqs) / total
@@ -2846,12 +2676,9 @@ def run():
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
 
-
-
     # Start Chainlink WebSocket before anything else
     start_chainlink_ws()
     start_binance_liq_ws()
-    start_deribit_iv_ws()
     log.info("Waiting 3s for WebSocket connections to establish...")
     time.sleep(3)
 
@@ -3001,20 +2828,9 @@ def run():
 
             cur["max_secs_left"] = max(cur["max_secs_left"], secs_left)
 
-            # ── Fetch poly prices and populate cache before strategies run ────
-            # _poly_cache must be current before strategy calls so _log_signal
-            # captures the correct p_market on every signal evaluation.
+            # ── Run all 8 strategies ──────────────────────────────────────────
             mkt = cur["market"]
             pos = cur["positions"]
-            _pre_poly = fetch_poly_prices(mkt, 20.0)
-            _poly_cache["up_mid"]    = round(_pre_poly.get("up_mid",    0.5), 4)
-            _poly_cache["spread"]    = round(_pre_poly.get("spread",    0.1), 4)
-            _poly_cache["fill_up"]   = round(_pre_poly.get("fill_up",   0.5), 4)
-            _poly_cache["fill_down"] = round(_pre_poly.get("fill_down", 0.5), 4)
-            _poly_cache["slip_up"]   = round(_pre_poly.get("slip_up",   0.0), 4)
-            _poly_cache["deviation"] = round(_poly_cache["up_mid"] - 0.50, 4)
-
-            # ── Run all 8 strategies ──────────────────────────────────────────
 
             pos["chainlink"]   = strategy_chainlink_arb(
                 mkt, secs_left, trackers["chainlink"],
@@ -3110,13 +2926,13 @@ def run():
                 cur["prev_ob_bid_depth"] = cur_bid_depth
                 cur["prev_ob_ask_depth"] = cur_ask_depth
 
-                poly_prices    = _poly_cache  # already fetched before strategies ran
-                poly_up_mid    = _poly_cache["up_mid"]
-                poly_spread    = _poly_cache["spread"]
-                poly_fill_up   = _poly_cache["fill_up"]
-                poly_fill_down = _poly_cache["fill_down"]
-                poly_slip_up   = _poly_cache["slip_up"]
-                poly_deviation = _poly_cache["deviation"]
+                poly_prices    = fetch_poly_prices(mkt, 20.0)
+                poly_up_mid    = round(poly_prices.get("up_mid", 0.5), 4)
+                poly_spread    = round(poly_prices.get("spread", 0.1), 4)
+                poly_fill_up   = round(poly_prices.get("fill_up",  0.5), 4)
+                poly_fill_down = round(poly_prices.get("fill_down", 0.5), 4)
+                poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
+                poly_deviation = round(poly_up_mid - 0.50, 4)
 
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
