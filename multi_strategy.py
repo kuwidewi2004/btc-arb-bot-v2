@@ -2820,6 +2820,27 @@ def run():
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
 
+    # ── BTC price source diagnostic ──────────────────────────────────────────
+    # Logs raw response from each price source at startup to verify correctness.
+    # Remove after confirming prices are accurate.
+    try:
+        r = _session.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
+        log.info(f"[PriceDiag] Coinbase raw: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"[PriceDiag] Coinbase failed: {e}")
+    try:
+        r = _session.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
+        log.info(f"[PriceDiag] Kraken raw: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"[PriceDiag] Kraken failed: {e}")
+    try:
+        r = _session.get("https://www.deribit.com/api/v2/public/get_index_price",
+                         params={"index_name": "btc_usd"}, timeout=5)
+        log.info(f"[PriceDiag] Deribit raw: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"[PriceDiag] Deribit failed: {e}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Start Chainlink WebSocket before anything else
     start_chainlink_ws()
     start_binance_liq_ws()
