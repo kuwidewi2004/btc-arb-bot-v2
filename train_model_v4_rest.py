@@ -1363,6 +1363,23 @@ def main():
         }, f)
     log.info("  Saved model_v4_profitable.pkl")
 
+    # ── No-pmarket model (microstructure only) ────────────────────────────────
+    NOPMARKET_EXCLUDE = {"pm_abs_deviation", "pm_uncertainty", "is_extreme_market",
+                         "bucket_enc", "vol_x_pm_abs_dev"}
+    npm_mask = [i for i, f in enumerate(fn) if f not in NOPMARKET_EXCLUDE]
+    npm_fn   = [fn[i] for i in npm_mask]
+    X_npm    = X[:, npm_mask]
+    npm_model, npm_imp = _train(X_npm, yp, n_est=200, leaves=25, calibration=cal_method_final)
+    with open("model_v4_nopmarket.pkl", "wb") as f:
+        pickle.dump({
+            "classifier":     npm_model,
+            "classifier_imp": npm_imp,
+            "features":       npm_fn,
+            "target":         "profitable",
+            "excludes":       list(NOPMARKET_EXCLUDE),
+        }, f)
+    log.info("  Saved model_v4_nopmarket.pkl")
+
     # ══════════════════════════════════════════════════════════════════════════
     # MARKET MODEL: strategy discovery (honest early-phase features only)
     # ══════════════════════════════════════════════════════════════════════════
@@ -1451,6 +1468,7 @@ def main():
           f"{'[OK]' if avg_imp3 > 0 else '[FAIL]'}")
     print()
     print("  Saved: model_v4_profitable.pkl")
+    print("         model_v4_nopmarket.pkl")
     print("         model_v4_market.pkl")
     print("=" * 60)
 
