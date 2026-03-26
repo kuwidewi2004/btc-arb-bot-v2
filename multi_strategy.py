@@ -938,17 +938,28 @@ def _on_deribit_iv_message(ws, message):
         data = json.loads(message)
 
         if "result" in data:
-            log.info(f"[Deribit IV WS] Subscribed OK: {len(data.get('result', []))} channels")
+            log.info(f"[Deribit IV WS] Subscribed OK: {data.get('result')}")
+            return
+
+        # Log any error responses from Deribit
+        if "error" in data:
+            log.warning(f"[Deribit IV WS] API error: {data['error']}")
             return
 
         params  = data.get("params", {})
         channel = params.get("channel", "")
         payload = params.get("data", {})
 
+        if not channel:
+            log.debug(f"[Deribit IV WS] Unrecognised message: {message[:200]}")
+            return
+
         # ── DVOL update ──────────────────────────────────────────────────────
         if channel == "deribit_volatility_index.btc_usd":
+            log.info(f"[Deribit IV WS] DVOL raw payload: {payload}")
             dvol = float(payload.get("volatility", 0.0))
             if dvol <= 0:
+                log.warning(f"[Deribit IV WS] DVOL value is zero/missing in payload: {payload}")
                 return
             with _deribit_iv_lock:
                 if dvol > _iv_cache["iv_30d_high"]:
@@ -968,6 +979,9 @@ def _on_deribit_iv_message(ws, message):
         elif channel.startswith("ticker.") and channel.endswith(".raw"):
             instrument = payload.get("instrument_name", "")
             mark_iv    = payload.get("mark_iv")
+            log.info(f"[Deribit IV WS] Ticker {instrument}: mark_iv={mark_iv} "
+                     f"(expecting c25={_deribit_skew_instruments.get('c25')} "
+                     f"p25={_deribit_skew_instruments.get('p25')})")
             if mark_iv is None or float(mark_iv) <= 0:
                 return
             iv = float(mark_iv)
