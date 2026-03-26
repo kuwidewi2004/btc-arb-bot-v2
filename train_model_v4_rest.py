@@ -325,7 +325,7 @@ def fetch_snapshots(conn) -> list:
         "price_vs_open_pct","price_vs_open_score",
         "momentum_10s","momentum_30s","momentum_60s","momentum_120s","momentum_score",
         "cl_divergence","cl_age","cl_vs_open_pct",
-        "liq_total","liq_imbalance",
+        "liq_total","liq_imbalance","liq_long_usd","liq_short_usd","liq_dominant_ratio",
         "ob_imbalance","ob_bid_delta","ob_ask_delta",
         "vol_range_pct","volume_buy_ratio",
         "p_market","poly_fill_up","poly_fill_down",
@@ -474,6 +474,9 @@ def build_snapshot_features(rows):
             "liq_imbalance":          li,
             "liq_total":              min(lt, 5e6) if not np.isnan(lt) else np.nan,  # clip outliers
             "log_liq_total":          math.log1p(min(lt, 5e6)) if not np.isnan(lt) and lt>=0 else np.nan,
+            "liq_long_usd":           min(_f(row.get("liq_long_usd")) or 0.0, 5e6),
+            "liq_short_usd":          min(_f(row.get("liq_short_usd")) or 0.0, 5e6),
+            "liq_dominant_ratio":     _f(row.get("liq_dominant_ratio")),
             "liq_abs_imbalance":      abs(li) if not np.isnan(li) else np.nan,
             # Order book (dropped ob_spread_pct — constant 0.0001 in all rows)
             "ob_imbalance":           obi,
