@@ -2988,9 +2988,20 @@ def run():
 
             cur["max_secs_left"] = max(cur["max_secs_left"], secs_left)
 
-            # ── Run all 8 strategies ──────────────────────────────────────────
+            # ── Fetch poly prices and populate cache before strategies run ────
+            # _poly_cache must be current before strategy calls so _log_signal
+            # captures the correct p_market on every signal evaluation.
             mkt = cur["market"]
             pos = cur["positions"]
+            _pre_poly = fetch_poly_prices(mkt, 20.0)
+            _poly_cache["up_mid"]    = round(_pre_poly.get("up_mid",    0.5), 4)
+            _poly_cache["spread"]    = round(_pre_poly.get("spread",    0.1), 4)
+            _poly_cache["fill_up"]   = round(_pre_poly.get("fill_up",   0.5), 4)
+            _poly_cache["fill_down"] = round(_pre_poly.get("fill_down", 0.5), 4)
+            _poly_cache["slip_up"]   = round(_pre_poly.get("slip_up",   0.0), 4)
+            _poly_cache["deviation"] = round(_poly_cache["up_mid"] - 0.50, 4)
+
+            # ── Run all 8 strategies ──────────────────────────────────────────
 
             pos["chainlink"]   = strategy_chainlink_arb(
                 mkt, secs_left, trackers["chainlink"],
@@ -3086,22 +3097,13 @@ def run():
                 cur["prev_ob_bid_depth"] = cur_bid_depth
                 cur["prev_ob_ask_depth"] = cur_ask_depth
 
-                poly_prices    = fetch_poly_prices(mkt, 20.0)
-                poly_up_mid    = round(poly_prices.get("up_mid", 0.5), 4)
-                poly_spread    = round(poly_prices.get("spread", 0.1), 4)
-                poly_fill_up   = round(poly_prices.get("fill_up",  0.5), 4)
-                poly_fill_down = round(poly_prices.get("fill_down", 0.5), 4)
-                poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
-                poly_deviation = round(poly_up_mid - 0.50, 4)
-
-                # Update shared poly cache so _log_signal can read p_market
-                # without needing it passed through all 45 call sites
-                _poly_cache["up_mid"]    = poly_up_mid
-                _poly_cache["spread"]    = poly_spread
-                _poly_cache["fill_up"]   = poly_fill_up
-                _poly_cache["fill_down"] = poly_fill_down
-                _poly_cache["slip_up"]   = poly_slip_up
-                _poly_cache["deviation"] = poly_deviation
+                poly_prices    = _poly_cache  # already fetched before strategies ran
+                poly_up_mid    = _poly_cache["up_mid"]
+                poly_spread    = _poly_cache["spread"]
+                poly_fill_up   = _poly_cache["fill_up"]
+                poly_fill_down = _poly_cache["fill_down"]
+                poly_slip_up   = _poly_cache["slip_up"]
+                poly_deviation = _poly_cache["deviation"]
 
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
