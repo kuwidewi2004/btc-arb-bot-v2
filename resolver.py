@@ -241,20 +241,70 @@ def patch_trade(row_id: int, trade_id: str, outcome_data: dict) -> bool:
 
 
 def resolve_signal_logs(outcome: str, condition_id: str):
-    """Patch all signal_log rows for this condition_id with the resolved outcome."""
+    """
+    Patch all signal_log rows for this condition_id with resolved outcome data.
+
+    Writes per-row:
+      resolved_outcome  — "UP" or "DOWN"
+      outcome_binary    — 1.0 if UP won, 0.0 if DOWN won
+      actual_win        — True if the crowd's chosen side won
+                          (crowd side = UP if p_market >= 0.5, else DOWN)
+
+    These three columns make signal_log self-contained for ML analysis —
+    no join to trades or market_snapshots needed to compute win rates.
+    """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        resp = _session.patch(
+        outcome_binary = 1.0 if outcome == "UP" else 0.0
+
+        # Step 1: fetch unresolved signal_log rows for this market
+        # so we can compute actual_win per row based on p_market
+        fetch_resp = _session.get(
             f"{SUPABASE_URL}/rest/v1/signal_log",
-            headers={**sb_headers(), "Prefer": "return=representation"},
-            params={"condition_id": f"eq.{condition_id}", "resolved_outcome": "is.null"},
-            json={"resolved_outcome": outcome},
+            headers=sb_headers(),
+            params={
+                "condition_id":    f"eq.{condition_id}",
+                "resolved_outcome": "is.null",
+                "select":          "id,p_market,poly_fill_up,poly_fill_down",
+            },
             timeout=10,
         )
-        updated = resp.json() if resp.content else []
-        if updated:
-            log.info(f"Updated {len(updated)} signal_log row(s) for {condition_id[:12]}... → {outcome}")
+        rows = fetch_resp.json() if fetch_resp.content else []
+        if not rows:
+            return
+
+        # Step 2: batch update all rows with resolved fields
+        # actual_win: crowd's side = UP if p_market >= 0.5, DOWN otherwise
+        # For each row, compute whether that side won
+        patched = 0
+        for row in rows:
+            pm = row.get("p_market")
+            if pm is not None:
+                crowd_side  = "UP" if float(pm) >= 0.5 else "DOWN"
+                actual_win  = (crowd_side == outcome)
+            else:
+                actual_win = None
+
+            patch_payload = {
+                "resolved_outcome": outcome,
+                "outcome_binary":   outcome_binary,
+                "actual_win":       actual_win,
+            }
+
+            _session.patch(
+                f"{SUPABASE_URL}/rest/v1/signal_log",
+                headers=sb_headers(),
+                params={"id": f"eq.{row['id']}"},
+                json=patch_payload,
+                timeout=10,
+            )
+            patched += 1
+
+        log.info(f"Resolved {patched} signal_log row(s) for "
+                 f"{condition_id[:12]}... → {outcome} "
+                 f"(outcome_binary={outcome_binary})")
+
     except Exception as e:
         log.warning(f"Signal log resolution failed: {e}")
 
