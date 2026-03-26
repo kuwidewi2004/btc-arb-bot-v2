@@ -920,9 +920,9 @@ def _on_deribit_iv_open(ws):
 
     channels = ["deribit_volatility_index.btc_usd"]
     if c25:
-        channels.append(f"ticker.{c25}.raw")
+        channels.append(f"ticker.{c25}.100ms")
     if p25:
-        channels.append(f"ticker.{p25}.raw")
+        channels.append(f"ticker.{p25}.100ms")
 
     ws.send(json.dumps({
         "jsonrpc": "2.0",
@@ -976,7 +976,7 @@ def _on_deribit_iv_message(ws, message):
                      f"skew={_iv_cache['skew_25d']:+.1f}%")
 
         # ── Option ticker update (skew) ──────────────────────────────────────
-        elif channel.startswith("ticker.") and channel.endswith(".raw"):
+        elif channel.startswith("ticker.") and channel.endswith(".100ms"):
             instrument = payload.get("instrument_name", "")
             mark_iv    = payload.get("mark_iv")
             log.info(f"[Deribit IV WS] Ticker {instrument}: mark_iv={mark_iv} "
