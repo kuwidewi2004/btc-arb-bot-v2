@@ -921,7 +921,7 @@ def _fetch_deribit_iv():
                  f"skew: {skew_25d:+.1f}%  rank: {iv_rank:.2f}")
 
     except Exception as e:
-        log.debug(f"[Deribit IV] {e}")
+        log.warning(f"[Deribit IV] fetch failed: {e}")
 
 
 def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
@@ -2883,6 +2883,14 @@ def run():
                 log.info(f"Market open price captured: ${spot:.2f}")
 
             cur["max_secs_left"] = max(cur["max_secs_left"], secs_left)
+
+            # ── Pre-fetch Polymarket prices once per cycle ────────────────────
+            # Ensures _poly_cache is populated before ANY strategy calls
+            # _log_signal — even early rejections get real fill prices
+            try:
+                _prefetch_prices = fetch_poly_prices(cur["market"])
+            except Exception:
+                pass  # _poly_cache retains last good values
 
             # ── Run all 8 strategies ──────────────────────────────────────────
             mkt = cur["market"]
