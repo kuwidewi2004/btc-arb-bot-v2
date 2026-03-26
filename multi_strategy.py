@@ -791,64 +791,148 @@ _volume_fetched: float = 0.0
 
 # --------------------------------------------------- DERIBIT IV WEBSOCKET -----
 # Subscribes to Deribit's deribit_volatility_index.btc_usd channel for ATM IV
-# and to the BTC DVOL index for iv_rank. Skew is derived from the volatility
-# smile published in the same feed. Replaces the 4-REST-call polling approach
-# which was silently failing (geo-blocking / mark_iv field absent).
+# and option ticker channels for 25-delta skew.
 #
-# Channels used:
-#   deribit_volatility_index.btc_usd  — Deribit's own BTC DVOL (annualised %)
-#   deribit_price_index.btc_usd       — BTC spot index (for skew strike selection)
+# atm_iv   = Deribit DVOL (their official ATM 30-day IV index)
+# skew_25d = put_iv - call_iv at ±8% strikes, fetched via WS ticker on connect
+# iv_rank  = DVOL percentile vs 30d historical range seeded from REST at startup
 #
-# ATM IV  = DVOL value directly (Deribit's DVOL is ATM 30-day IV equivalent)
-# skew_25d = not available directly from DVOL; approximated as 0 until a
-#            dedicated options ticker subscription is added.
-# iv_rank  = rolling percentile of DVOL vs observed 30d range (in-memory).
+# Skew approach: on each WS connect, fetch BTC index price + nearest expiry
+# instruments via REST (2 calls), subscribe to the 2 relevant option tickers,
+# then read mark_iv from those ticker updates. Re-seeds every reconnect so
+# strikes stay current as BTC price moves.
 
 _DERIBIT_WS = "wss://www.deribit.com/ws/api/v2"
+_DERIBIT_REST = "https://www.deribit.com/api/v2/public"
 
 _deribit_iv_lock = threading.Lock()
 _deribit_iv_connected = False
+_deribit_skew_instruments: dict = {"c25": "", "p25": ""}  # current strike names
+_deribit_skew_ivs: dict = {"c25": 0.0, "p25": 0.0}
+
+
+def _seed_iv_rank():
+    """
+    Seed iv_30d_high/low from Deribit's historical DVOL data at startup.
+    Uses the last 30 days of daily DVOL candles so iv_rank is meaningful
+    from the first tick rather than waiting hours to build a range.
+    Falls back silently — WS will build the range from live ticks if this fails.
+    """
+    try:
+        r = _session.get(
+            f"{_DERIBIT_REST}/get_volatility_index_data",
+            params={
+                "currency":   "BTC",
+                "start_timestamp": int((time.time() - 30 * 86400) * 1000),
+                "end_timestamp":   int(time.time() * 1000),
+                "resolution": "3600",  # hourly candles
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        candles = r.json().get("result", {}).get("data", [])
+        if not candles:
+            log.warning("[Deribit IV] Seed: no DVOL candle data returned")
+            return
+        # Each candle: [timestamp_ms, open, high, low, close]
+        highs = [c[2] for c in candles if c[2] > 0]
+        lows  = [c[3] for c in candles if c[3] > 0]
+        if not highs or not lows:
+            return
+        with _deribit_iv_lock:
+            _iv_cache["iv_30d_high"] = max(highs)
+            _iv_cache["iv_30d_low"]  = min(lows)
+        log.info(f"[Deribit IV] Seeded iv_rank range: "
+                 f"low={min(lows):.1f}% high={max(highs):.1f}%")
+    except Exception as e:
+        log.warning(f"[Deribit IV] Seed iv_rank failed — will build from live ticks: {e}")
+
+
+def _get_skew_instruments() -> tuple:
+    """
+    Fetch nearest expiry BTC option names for ±8% strikes (approx 25-delta).
+    Returns (call_name, put_name) or ("", "") on failure.
+    Two REST calls: get_index_price + get_instruments.
+    """
+    try:
+        r = _session.get(f"{_DERIBIT_REST}/get_index_price",
+                         params={"index_name": "btc_usd"}, timeout=5)
+        btc_price = float(r.json()["result"]["index_price"])
+
+        r2 = _session.get(f"{_DERIBIT_REST}/get_instruments",
+                          params={"currency": "BTC", "kind": "option",
+                                  "expired": "false"}, timeout=10)
+        instruments = r2.json().get("result", [])
+
+        now_ts   = time.time()
+        expiries = sorted(set(i["expiration_timestamp"] / 1000 for i in instruments))
+        future   = [e for e in expiries if e > now_ts + 86400]
+        if not future:
+            return "", ""
+        exp = future[0]
+
+        calls = [i for i in instruments
+                 if i["expiration_timestamp"] / 1000 == exp
+                 and i["option_type"] == "call"]
+        puts  = [i for i in instruments
+                 if i["expiration_timestamp"] / 1000 == exp
+                 and i["option_type"] == "put"]
+        if not calls or not puts:
+            return "", ""
+
+        c25 = min(calls, key=lambda x: abs(x["strike"] - btc_price * 1.08))
+        p25 = min(puts,  key=lambda x: abs(x["strike"] - btc_price * 0.92))
+        log.info(f"[Deribit IV] Skew instruments: call={c25['instrument_name']} "
+                 f"put={p25['instrument_name']} (BTC={btc_price:.0f})")
+        return c25["instrument_name"], p25["instrument_name"]
+    except Exception as e:
+        log.warning(f"[Deribit IV] _get_skew_instruments failed: {e}")
+        return "", ""
 
 
 def _on_deribit_iv_open(ws):
-    global _deribit_iv_connected
+    global _deribit_iv_connected, _deribit_skew_instruments
     _deribit_iv_connected = True
-    log.info("[Deribit IV WS] Connected — subscribing to DVOL + price index")
-    sub_msg = json.dumps({
+    log.info("[Deribit IV WS] Connected — subscribing to DVOL + skew tickers")
+
+    # Get skew instrument names via REST before subscribing
+    c25, p25 = _get_skew_instruments()
+    _deribit_skew_instruments["c25"] = c25
+    _deribit_skew_instruments["p25"] = p25
+
+    channels = ["deribit_volatility_index.btc_usd"]
+    if c25:
+        channels.append(f"ticker.{c25}.raw")
+    if p25:
+        channels.append(f"ticker.{p25}.raw")
+
+    ws.send(json.dumps({
         "jsonrpc": "2.0",
         "id":      1,
         "method":  "public/subscribe",
-        "params":  {
-            "channels": [
-                "deribit_volatility_index.btc_usd",
-                "deribit_price_index.btc_usd",
-            ]
-        }
-    })
-    ws.send(sub_msg)
+        "params":  {"channels": channels},
+    }))
 
 
 def _on_deribit_iv_message(ws, message):
-    global _iv_cache
+    global _iv_cache, _deribit_skew_ivs
     try:
         data = json.loads(message)
 
-        # Subscription confirmation — log and ignore
         if "result" in data:
-            log.info(f"[Deribit IV WS] Subscribed: {data.get('result')}")
+            log.info(f"[Deribit IV WS] Subscribed OK: {len(data.get('result', []))} channels")
             return
 
-        params = data.get("params", {})
+        params  = data.get("params", {})
         channel = params.get("channel", "")
         payload = params.get("data", {})
 
+        # ── DVOL update ──────────────────────────────────────────────────────
         if channel == "deribit_volatility_index.btc_usd":
             dvol = float(payload.get("volatility", 0.0))
             if dvol <= 0:
                 return
-
             with _deribit_iv_lock:
-                # Update rolling 30d high/low for rank
                 if dvol > _iv_cache["iv_30d_high"]:
                     _iv_cache["iv_30d_high"] = dvol
                 if 0 < dvol < _iv_cache["iv_30d_low"]:
@@ -856,17 +940,33 @@ def _on_deribit_iv_message(ws, message):
                 iv_range = _iv_cache["iv_30d_high"] - _iv_cache["iv_30d_low"]
                 iv_rank  = ((dvol - _iv_cache["iv_30d_low"]) / iv_range
                             if iv_range > 1.0 else 0.5)
-
                 _iv_cache["atm_iv"]     = round(dvol, 2)
                 _iv_cache["iv_rank"]    = round(float(min(max(iv_rank, 0.0), 1.0)), 4)
                 _iv_cache["fetched_at"] = time.time()
-
             log.info(f"[Deribit IV WS] DVOL={dvol:.1f}%  rank={iv_rank:.2f}  "
                      f"skew={_iv_cache['skew_25d']:+.1f}%")
 
-        elif channel == "deribit_price_index.btc_usd":
-            # BTC index price — available for future skew strike selection
-            log.debug(f"[Deribit IV WS] BTC index={payload.get('price', 0):.0f}")
+        # ── Option ticker update (skew) ──────────────────────────────────────
+        elif channel.startswith("ticker.") and channel.endswith(".raw"):
+            instrument = payload.get("instrument_name", "")
+            mark_iv    = payload.get("mark_iv")
+            if mark_iv is None or float(mark_iv) <= 0:
+                return
+            iv = float(mark_iv)
+            if instrument == _deribit_skew_instruments.get("c25"):
+                _deribit_skew_ivs["c25"] = iv
+            elif instrument == _deribit_skew_instruments.get("p25"):
+                _deribit_skew_ivs["p25"] = iv
+
+            # Update skew whenever both sides have data
+            c_iv = _deribit_skew_ivs["c25"]
+            p_iv = _deribit_skew_ivs["p25"]
+            if c_iv > 0 and p_iv > 0:
+                skew = round(p_iv - c_iv, 2)
+                with _deribit_iv_lock:
+                    _iv_cache["skew_25d"] = skew
+                log.debug(f"[Deribit IV WS] skew={skew:+.2f}% "
+                          f"(put={p_iv:.1f}% call={c_iv:.1f}%)")
 
     except Exception as e:
         log.warning(f"[Deribit IV WS] message parse error: {e}")
@@ -901,7 +1001,12 @@ def _deribit_iv_ws_thread():
 
 
 def start_deribit_iv_ws():
-    """Start the Deribit IV WebSocket listener in a daemon background thread."""
+    """
+    Seed iv_rank range from 30d historical DVOL then start the WS thread.
+    Seeding is done synchronously before the thread starts so the first
+    DVOL tick produces a meaningful rank rather than defaulting to 0.5.
+    """
+    _seed_iv_rank()
     t = threading.Thread(target=_deribit_iv_ws_thread, daemon=True)
     t.start()
     log.info("[Deribit IV WS] Background thread started")
