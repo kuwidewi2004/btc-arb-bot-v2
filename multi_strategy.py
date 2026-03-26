@@ -428,6 +428,12 @@ def _log_signal(strategy: str, market, secs_left: float,
         "session":         _regime.get("session", "UNKNOWN"),
         "activity":        _regime.get("activity", "UNKNOWN"),
         "day_type":        _regime.get("day_type", "UNKNOWN"),
+        # Polymarket prices at signal evaluation time
+        "p_market":        _poly_cache.get("up_mid",    0.5),
+        "poly_spread":     _poly_cache.get("spread",    0.1),
+        "poly_fill_up":    _poly_cache.get("fill_up",   0.5),
+        "poly_fill_down":  _poly_cache.get("fill_down", 0.5),
+        "poly_deviation":  _poly_cache.get("deviation", 0.0),
     }
     log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
               f"| regime={entry['regime']} session={entry['session']}")
@@ -758,6 +764,8 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
+_poly_cache:     dict  = {"up_mid": 0.5, "spread": 0.1, "fill_up": 0.5,
+                           "fill_down": 0.5, "slip_up": 0.0, "deviation": 0.0}
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
     "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
@@ -2820,26 +2828,7 @@ def run():
     log.info("Data: Coinbase + Kraken + OKX (all geo-unblocked)")
     log.info("Supabase: OPEN rows only — resolver.py writes all outcomes")
 
-    # ── BTC price source diagnostic ──────────────────────────────────────────
-    # Logs raw response from each price source at startup to verify correctness.
-    # Remove after confirming prices are accurate.
-    try:
-        r = _session.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
-        log.info(f"[PriceDiag] Coinbase raw: {r.text[:200]}")
-    except Exception as e:
-        log.warning(f"[PriceDiag] Coinbase failed: {e}")
-    try:
-        r = _session.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
-        log.info(f"[PriceDiag] Kraken raw: {r.text[:200]}")
-    except Exception as e:
-        log.warning(f"[PriceDiag] Kraken failed: {e}")
-    try:
-        r = _session.get("https://www.deribit.com/api/v2/public/get_index_price",
-                         params={"index_name": "btc_usd"}, timeout=5)
-        log.info(f"[PriceDiag] Deribit raw: {r.text[:200]}")
-    except Exception as e:
-        log.warning(f"[PriceDiag] Deribit failed: {e}")
-    # ─────────────────────────────────────────────────────────────────────────
+
 
     # Start Chainlink WebSocket before anything else
     start_chainlink_ws()
@@ -3099,6 +3088,15 @@ def run():
                 poly_fill_down = round(poly_prices.get("fill_down", 0.5), 4)
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
+
+                # Update shared poly cache so _log_signal can read p_market
+                # without needing it passed through all 45 call sites
+                _poly_cache["up_mid"]    = poly_up_mid
+                _poly_cache["spread"]    = poly_spread
+                _poly_cache["fill_up"]   = poly_fill_up
+                _poly_cache["fill_down"] = poly_fill_down
+                _poly_cache["slip_up"]   = poly_slip_up
+                _poly_cache["deviation"] = poly_deviation
 
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
