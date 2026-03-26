@@ -1,0 +1,71 @@
+{'strategy': 'Odds Mispricing', 'n': 183, 'wins': 37, 'wr': Decimal('20.2'), 'pnl': Decimal('-113.32')}
+{'strategy': 'Liquidation Cascade', 'n': 98, 'wins': 59, 'wr': Decimal('60.2'), 'pnl': Decimal('289.78')}
+{'strategy': 'Volume Clock', 'n': 94, 'wins': 10, 'wr': Decimal('10.6'), 'pnl': Decimal('-70.16')}
+{'strategy': 'OB Pressure', 'n': 58, 'wins': 12, 'wr': Decimal('20.7'), 'pnl': Decimal('36.63')}
+{'strategy': 'Basis Arb', 'n': 52, 'wins': 15, 'wr': Decimal('28.8'), 'pnl': Decimal('-24.14')}
+{'strategy': 'Price Anchor', 'n': 11, 'wins': 6, 'wr': Decimal('54.5'), 'pnl': Decimal('15.33')}
+
+MODEL 1: SNAPSHOT
+
+  Snapshot — direction
+    Brier      : 0.2497  (p_market baseline: 0.2360)
+    Improvement: -0.0137  [FAIL]
+    Log loss   : 0.6929
+    Accuracy   : 55.9%
+
+  Calibration — Snapshot direction
+  Range          Actual%       N
+  0.4-0.5           44.4%     401
+  0.5-0.6           57.2%     935
+  0.6-0.7           54.2%     367 <-
+  0.7-0.8           40.5%      37 <-
+
+  Snapshot — profitable
+    Brier      : 0.2491  (p_market baseline: 0.2457)
+    Improvement: -0.0034  [FAIL]
+    Log loss   : 0.6915
+    Accuracy   : 55.7%
+
+  Calibration — Snapshot profitable
+  Range          Actual%       N
+  0.4-0.5           88.9%      18 <-
+  0.5-0.6           57.3%   1,654
+  0.6-0.7           29.4%      68 <-
+
+MODEL 2: SIGNAL
+
+  Signal — direction
+    Brier      : 0.2509  (p_market baseline: 0.2449)
+    Improvement: -0.0061  [FAIL]
+    Log loss   : 0.6971
+    Accuracy   : 55.3%
+
+  Calibration — Signal direction
+  Range          Actual%       N
+  0.0-0.1          100.0%      20 <-
+  0.1-0.2          100.0%      63 <-
+  0.2-0.3           65.3%     147 <-
+  0.3-0.4           53.5%     600 <-
+  0.4-0.5           48.3%   4,377
+  0.5-0.6           57.4%   7,570
+  0.6-0.7           61.0%   1,022
+  0.7-0.8           96.8%     125 <-
+  0.8-0.9          100.0%      30 <-
+
+MODEL 3: MARKET LEVEL
+
+  Market-level LightGBM
+    Brier      : 0.1944  (p_market baseline: 0.1915)
+    Improvement: -0.0029  [FAIL]
+    Log loss   : 0.5778
+    Accuracy   : 75.8%
+
+  Calibration — Market-level
+  Range          Actual%       N
+  0.1-0.2            0.0%       1 <-
+  0.2-0.3           20.0%       5
+  0.3-0.4           20.0%      25 <-
+  0.4-0.5           38.5%      13
+  0.5-0.6           50.0%       4
+  0.6-0.7           77.5%      40 <-
+  0.7-0.8          100.0%       3 <-

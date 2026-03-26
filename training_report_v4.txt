@@ -1,0 +1,1 @@
+Primary model walk-forward: Brier=0.2462 imp=-0.0104 reg_corr=+0.038 sim_pnl=+73.4567

@@ -1,0 +1,42 @@
+Strategy Discovery Report — 2026-03-26 20:04:52
+Primary model avg improvement: -0.0104
+Market model avg improvement:  -0.0033
+Total simulated PnL:           +73.4567
+
+REGIME CANDIDATES:
+  vol_x_pm_abs_dev HIGH regime (threshold=0.0166, WF edge=+0.1669, n=707)
+  interact_liq_x_price HIGH regime (threshold=0.0000, WF edge=+0.1610, n=99)
+  liq_imbalance HIGH regime (threshold=0.0000, WF edge=+0.1492, n=332)
+  liq_imbal_x_secs HIGH regime (threshold=0.0000, WF edge=+0.1492, n=332)
+  liq_delta_abs HIGH regime (threshold=0.0000, WF edge=+0.1469, n=127)
+  mom_abs HIGH regime (threshold=0.0160, WF edge=+0.1453, n=707)
+  liq_delta HIGH regime (threshold=0.0000, WF edge=+0.1424, n=73)
+  secs_to_resolution LOW regime (threshold=205.0000, WF edge=+0.1408, n=708)
+
+INTERACTION CANDIDATES:
+  gate_funding_x_vol_x_funding_zscore (corr=+0.089, n=12730)
+  vol_range_pct_x_funding_zscore (corr=+0.065, n=12730)
+  gate_funding_x_funding_zscore (corr=+0.064, n=12730)
+  okx_funding_x_funding_zscore (corr=+0.056, n=12730)
+  vol_range_pct_x_vol_x_funding_zscore (corr=+0.053, n=12730)
+
+MARKET MODEL TOP SIGNALS:
+  p_market_std: 235.0
+  avg_funding_zscore_abs: 209.0
+  avg_momentum_abs: 173.0
+  avg_funding_rate_abs: 169.0
+  avg_ob_imbalance_abs: 142.0
+  p_market_open: 140.0
+  avg_vol_range_pct: 140.0
+  avg_cl_divergence_abs: 136.0
+
+GENERATED TEMPLATES:
+  strategy_candidates/candidate_vol_x_pm_abs_dev_high.py
+  strategy_candidates/candidate_interact_liq_x_price_high.py
+  strategy_candidates/candidate_liq_imbalance_high.py
+
+RECOMMENDATIONS:
+  1. Add vol_x_pm_abs_dev HIGH filter to Liquidation Cascade (WF edge +0.1669, threshold=0.0166)
+  2. Add gate_funding_x_vol_x_funding_zscore as feature — corr=+0.089 with profitability label
+  3. Market model near zero (-0.0033) — add as market pre-filter when it crosses 0
+  4. Simulated PnL positive (+73.5) — classifier threshold 0.55 is adding value
