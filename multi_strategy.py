@@ -428,20 +428,33 @@ def _log_signal(strategy: str, market, secs_left: float,
         "threshold":       round(threshold, 6),
         "fired":           False,
         "reason":          reason,
-        # Regime labels — allows slicing win rates by market condition
+        # Regime labels
         "regime":          _regime.get("composite", "UNKNOWN"),
         "session":         _regime.get("session", "UNKNOWN"),
         "activity":        _regime.get("activity", "UNKNOWN"),
         "day_type":        _regime.get("day_type", "UNKNOWN"),
-        # Polymarket prices at signal evaluation time
+        # Polymarket prices
         "p_market":        _poly_cache.get("up_mid",    0.5),
         "poly_spread":     _poly_cache.get("spread",    0.1),
         "poly_fill_up":    _poly_cache.get("fill_up",   0.5),
         "poly_fill_down":  _poly_cache.get("fill_down", 0.5),
         "poly_deviation":  _poly_cache.get("deviation", 0.0),
+        # Market microstructure signals from shared caches
+        "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
+        "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
+        "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
+        "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
+        "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
+        "liq_imbalance":   round(
+            (_liq_cache.get("long", 0.0) - _liq_cache.get("short", 0.0)) /
+            max(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 1.0)
+        , 4),
+        "liq_total":       round(_liq_cache.get("long", 0.0) + _liq_cache.get("short", 0.0), 2),
+        "momentum_30s":    round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
+        "momentum_60s":    round(btc_momentum_pct(lookback_secs=60) or 0.0, 6),
     }
-    log.info(f"[SIGNAL_LOG] {strategy} | {reason} | p_market={_poly_cache.get('up_mid', 'MISSING')} "
-             f"poly_spread={_poly_cache.get('spread', 'MISSING')}")
+    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
+              f"| regime={entry['regime']} session={entry['session']}")
     supabase_signal_log(entry)
 
 
