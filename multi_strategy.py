@@ -413,60 +413,25 @@ def supabase_market_snapshot(snapshot: dict):
 
 def _log_signal(strategy: str, market, secs_left: float,
                 signal_value: float, threshold: float, reason: str):
-    """
-    Helper — builds and sends a signal log entry for a non-firing evaluation.
-    Writes snapshot context columns directly so signal_log is self-contained
-    for ML training without needing a join to market_snapshots.
-    """
-    try:
-        thr      = threshold if threshold and threshold > 0 else 1.0
-        liq_long = _liq_cache.get("long", 0.0)
-        liq_short= _liq_cache.get("short", 0.0)
-        liq_tot  = liq_long + liq_short
-
-        # Safe momentum reads — use cached values, never call btc_momentum_pct
-        # inside _log_signal to avoid recursion / empty history errors
-        try:
-            m30 = round(btc_momentum_pct(lookback_secs=30) or 0.0, 6)
-        except Exception:
-            m30 = 0.0
-        try:
-            m60 = round(btc_momentum_pct(lookback_secs=60) or 0.0, 6)
-        except Exception:
-            m60 = 0.0
-
-        entry = {
-            "strategy":        strategy,
-            "condition_id":    market.condition_id if market else "",
-            "market_question": market.question if market else "",
-            "secs_left":       round(secs_left, 1),
-            "signal_value":    round(signal_value, 6),
-            "threshold":       round(threshold, 6),
-            "fired":           False,
-            "reason":          reason,
-            "regime":          _regime.get("composite", "UNKNOWN"),
-            "session":         _regime.get("session",   "UNKNOWN"),
-            "activity":        _regime.get("activity",  "UNKNOWN"),
-            "day_type":        _regime.get("day_type",  "UNKNOWN"),
-            "signal_ratio":    round(signal_value / thr, 6),
-            "above_threshold": signal_value >= threshold,
-            "p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
-            "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
-            "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
-            "liq_total":       round(liq_tot, 2),
-            "liq_imbalance":   round((liq_long - liq_short) / max(liq_tot, 1.0), 4),
-            "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
-            "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
-            "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
-            "momentum_30s":    m30,
-            "momentum_60s":    m60,
-        }
-        log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} "
-                  f"threshold={threshold:.6f} | regime={entry['regime']} "
-                  f"session={entry['session']}")
-        supabase_signal_log(entry)
-    except Exception as e:
-        log.warning(f"[_log_signal] failed: {e}")
+    """Helper — builds and sends a signal log entry for a non-firing evaluation."""
+    entry = {
+        "strategy":        strategy,
+        "condition_id":    market.condition_id if market else "",
+        "market_question": market.question if market else "",
+        "secs_left":       round(secs_left, 1),
+        "signal_value":    round(signal_value, 6),
+        "threshold":       round(threshold, 6),
+        "fired":           False,
+        "reason":          reason,
+        # Regime labels — allows slicing win rates by market condition
+        "regime":          _regime.get("composite", "UNKNOWN"),
+        "session":         _regime.get("session", "UNKNOWN"),
+        "activity":        _regime.get("activity", "UNKNOWN"),
+        "day_type":        _regime.get("day_type", "UNKNOWN"),
+    }
+    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
+              f"| regime={entry['regime']} session={entry['session']}")
+    supabase_signal_log(entry)
 
 
 # --------------------------------------------------------------- DATACLASSES --
@@ -644,18 +609,6 @@ class StrategyTracker:
         # Write to Supabase — this is the ONLY row we write per trade.
         # Outcome fields (actual_win, resolved_outcome, pnl, etc.) will be
         # patched later by resolver.py using trade_id as the key.
-        _sd = signal_data or {}
-        def _sd_f(k):
-            v = _sd.get(k)
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        _liq_long  = _liq_cache.get("long", 0.0)
-        _liq_short = _liq_cache.get("short", 0.0)
-        _liq_tot   = _liq_long + _liq_short
-
         supabase_insert({
             "trade_id":        trade_id,
             "strategy":        self.name,
@@ -674,38 +627,6 @@ class StrategyTracker:
             "day_type":        _regime.get("day_type",  "UNKNOWN"),
             "kelly_fraction":  round(KELLY_FRACTION, 4),
             "max_bet_pct":     round(MAX_BET_PCT, 4),
-            # Unpacked signal_data — typed columns, no JSON parsing at training time
-            "liq_long_liqs":         _sd_f("long_liqs"),
-            "liq_short_liqs":        _sd_f("short_liqs"),
-            "liq_vol_range":         _sd_f("vol_range"),
-            "liq_intensity":         _sd_f("intensity"),
-            "ob_imbalance_entry":    _sd_f("imbalance"),
-            "momentum_entry":        _sd_f("momentum"),
-            "pa_price_vs_open_pct":  _sd_f("price_vs_open_pct"),
-            "pa_market_progress":    _sd_f("market_progress"),
-            "pa_displacement_score": _sd_f("displacement_score"),
-            "pa_progress_score":     _sd_f("progress_score"),
-            "odds_up_mid":           _sd_f("up_mid"),
-            "odds_deviation":        _sd_f("deviation"),
-            "vol_buy_ratio":         _sd_f("buy_ratio"),
-            "cl_divergence_entry":   _sd_f("divergence"),
-            "fund_avg_rate":         _sd_f("avg_rate"),
-            "basis_pct_entry":       _sd_f("basis_pct"),
-            "secs_left_entry":       _sd_f("secs_left"),
-            # Full snapshot context at entry — from live caches
-            "snap_p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
-            "snap_ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
-            "snap_liq_total":       round(_liq_tot, 2),
-            "snap_liq_imbalance":   round((_liq_long - _liq_short) / max(_liq_tot, 1.0), 4),
-            "snap_vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
-            "snap_momentum_30s":    round(btc_momentum_pct(lookback_secs=30) or 0.0, 6),
-            "snap_momentum_60s":    round(btc_momentum_pct(lookback_secs=60) or 0.0, 6),
-            "snap_funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
-            "snap_funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
-            "snap_volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
-            "snap_btc_price":       round(_price_cache.get("btc", 0.0), 2),
-            "snap_poly_spread":     round(_poly_cache.get("spread", 0.1), 4),
-            "snap_price_vs_open":   round(_poly_cache.get("up_mid", 0.5) - 0.5, 4),
         })
         log.info(f"[{self.name}] OPEN {side} | size={size:.2f} @ {price:.4f} | "
                  f"portfolio=${self.portfolio.available():.2f} | trade_id={trade_id[:8]}... | "
@@ -824,16 +745,19 @@ class StrategyTracker:
 
 _price_cache:    dict  = {"btc": 0.0, "eth": 0.0, "fetched_at": 0.0}
 _funding_cache:  dict  = {"okx": 0.0, "binance": 0.0, "rate": 0.0, "fetched_at": 0.0}
+_iv_cache:       dict  = {
+    "atm_iv":      0.0,    # Deribit ATM implied vol (annualised %)
+    "skew_25d":    0.0,    # 25-delta put/call skew: put_iv - call_iv
+    "iv_rank":     0.5,    # IV percentile vs rolling 30d range (0-1)
+    "iv_30d_high": 0.0,    # rolling 30d high for rank
+    "iv_30d_low":  999.0,  # rolling 30d low for rank
+    "fetched_at":  0.0,
+}
 _basis_cache:    dict  = {"spot": 0.0, "futures": 0.0, "fetched_at": 0.0}
 _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
-_poly_cache:     dict  = {"market_id": "", "fetched_at": 0.0,
-                          "up_mid": 0.5, "down_mid": 0.5,
-                          "fill_up": 0.5, "fill_down": 0.5,
-                          "slip_up": 0.0, "slip_down": 0.0,
-                          "spread": 0.1}
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
     "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
@@ -863,6 +787,102 @@ _btc_history:    deque = deque(maxlen=30)  # last 150s of BTC prices (5s poll = 
                                            # 30 entries needed for momentum_120s lookback
 _volume_history: deque = deque(maxlen=25)
 _volume_fetched: float = 0.0
+
+
+def _fetch_deribit_iv():
+    """
+    Fetch BTC implied volatility from Deribit public API.
+    No API key required. Runs every 5 minutes inside refresh_shared_data().
+
+    Stores in _iv_cache:
+      atm_iv   — ATM IV for nearest weekly expiry (annualised %)
+      skew_25d — 25-delta skew: put_iv - call_iv
+                 negative = puts expensive = market fears downside
+      iv_rank  — IV percentile vs rolling 30d range (0=low IV, 1=high IV)
+
+    High iv_rank → volatile regime likely → Liquidation Cascade fires better
+    Negative skew → sophisticated money pricing downside risk
+    Low iv_rank  → calm market → reduce position sizes
+    """
+    global _iv_cache
+    try:
+        # BTC index price
+        r = _session.get(
+            "https://www.deribit.com/api/v2/public/get_index_price",
+            params={"index_name": "btc_usd"}, timeout=5)
+        btc_price = r.json()["result"]["index_price"]
+
+        # All active BTC option instruments
+        r2 = _session.get(
+            "https://www.deribit.com/api/v2/public/get_instruments",
+            params={"currency": "BTC", "kind": "option", "expired": False},
+            timeout=5)
+        instruments = r2.json()["result"]
+
+        # Nearest expiry at least 24h away
+        now_ts = time.time()
+        expiries = sorted(set(
+            i["expiration_timestamp"] / 1000 for i in instruments))
+        future = [e for e in expiries if e > now_ts + 86400]
+        if not future:
+            return
+        exp = future[0]
+
+        calls = [i for i in instruments
+                 if i["expiration_timestamp"] / 1000 == exp
+                 and i["option_type"] == "call"]
+        puts  = [i for i in instruments
+                 if i["expiration_timestamp"] / 1000 == exp
+                 and i["option_type"] == "put"]
+        if not calls or not puts:
+            return
+
+        # ATM strike = closest to spot
+        atm_call = min(calls, key=lambda x: abs(x["strike"] - btc_price))
+        atm_put  = min(puts,  key=lambda x: abs(x["strike"] - btc_price))
+        # 25-delta strikes ≈ ±8% from ATM
+        c25 = min(calls, key=lambda x: abs(x["strike"] - btc_price * 1.08))
+        p25 = min(puts,  key=lambda x: abs(x["strike"] - btc_price * 0.92))
+
+        def _mark_iv(name):
+            try:
+                r = _session.get(
+                    "https://www.deribit.com/api/v2/public/ticker",
+                    params={"instrument_name": name}, timeout=5)
+                return float(r.json()["result"].get("mark_iv", 0.0))
+            except Exception:
+                return 0.0
+
+        iv_ac = _mark_iv(atm_call["instrument_name"])
+        iv_ap = _mark_iv(atm_put["instrument_name"])
+        iv_c25 = _mark_iv(c25["instrument_name"])
+        iv_p25 = _mark_iv(p25["instrument_name"])
+
+        if iv_ac == 0 or iv_ap == 0:
+            return
+
+        atm_iv   = (iv_ac + iv_ap) / 2.0
+        skew_25d = iv_p25 - iv_c25  # negative = bearish fear premium
+
+        # Rolling 30d range for IV rank
+        if atm_iv > _iv_cache["iv_30d_high"]:
+            _iv_cache["iv_30d_high"] = atm_iv
+        if 0 < atm_iv < _iv_cache["iv_30d_low"]:
+            _iv_cache["iv_30d_low"] = atm_iv
+        iv_range = _iv_cache["iv_30d_high"] - _iv_cache["iv_30d_low"]
+        iv_rank  = ((atm_iv - _iv_cache["iv_30d_low"]) / iv_range
+                    if iv_range > 1.0 else 0.5)
+
+        _iv_cache["atm_iv"]     = round(float(atm_iv), 2)
+        _iv_cache["skew_25d"]   = round(float(skew_25d), 2)
+        _iv_cache["iv_rank"]    = round(float(min(max(iv_rank, 0.0), 1.0)), 4)
+        _iv_cache["fetched_at"] = now_ts
+
+        log.info(f"Deribit IV — ATM: {atm_iv:.1f}%  "
+                 f"skew: {skew_25d:+.1f}%  rank: {iv_rank:.2f}")
+
+    except Exception as e:
+        log.debug(f"[Deribit IV] {e}")
 
 
 def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
@@ -932,6 +952,10 @@ def refresh_shared_data():
         log.info(f"Funding — OKX: {_funding_cache['okx']:+.6f} "
                  f"Gate.io: {_funding_cache['binance']:+.6f} "
                  f"avg: {_funding_cache['rate']:+.6f}")
+
+    # Deribit IV — forward-looking vol signal, refresh every 5 min
+    if time.time() - _iv_cache["fetched_at"] >= 300:
+        _fetch_deribit_iv()
 
     # Basis via OKX mark price vs spot
     if now - _basis_cache["fetched_at"] >= 10:
@@ -1953,26 +1977,10 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         short_liqs = _liq_cache["short"] + binance["short"]
         total      = long_liqs + short_liqs
 
-        # Filter 1: minimum size $150k (sub-$150k WR 40-52%)
-        if total < 150_000:
+        if total < 10_000:
             _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=150_000,
+                        signal_value=total, threshold=10_000,
                         reason="liquidation_volume_too_low")
-            return position
-
-        # Filter 2: skip CALM regime unless very large
-        composite = _regime.get("composite", "CALM")
-        if composite == "CALM" and total < 500_000:
-            _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=500_000,
-                        reason="calm_regime_insufficient_size")
-            return position
-
-        # Filter 3: skip OFFPEAK (WR=40%)
-        if _regime.get("session") == "OFFPEAK":
-            _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=total, threshold=150_000,
-                        reason="offpeak_session_filtered")
             return position
 
         # Require meaningful imbalance — at least 65/35 split
@@ -1995,20 +2003,17 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
 
         direction = "DOWN" if long_liqs > short_liqs else "UP"
 
+        # Volatility-adjusted intensity:
+        # Normalize liquidation size by current 5-min BTC price range
+        # High volatility = liquidations are expected = weaker signal
+        # Low volatility = liquidations are surprising = stronger signal
         vol_range = _vol_cache.get("range_pct", 0.1)
-        vol_range = max(vol_range, 0.05)
-        raw_intensity      = min(total / 500_000, 1.0)
-        vol_scalar         = max(0.3, min(1.0, 0.15 / vol_range))
+        vol_range = max(vol_range, 0.05)  # floor to avoid division by zero
+        raw_intensity    = min(total / 500_000, 1.0)
+        vol_scalar       = max(0.3, min(1.0, 0.15 / vol_range))  # inverse vol
         adjusted_intensity = min(raw_intensity * vol_scalar, 1.0)
 
-        # Filter 4: minimum intensity 0.20 (0.10-0.20 band WR=25%)
-        if adjusted_intensity < 0.20:
-            _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=adjusted_intensity, threshold=0.20,
-                        reason="intensity_too_low")
-            return position
-
-        prices = get_poly_prices(market)
+        prices = fetch_poly_prices(market)
         if prices["spread"] > 0.06:
             _log_signal("Liquidation Cascade", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
@@ -2018,105 +2023,23 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
         price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
         size  = kelly_size(adjusted_intensity, price, tracker.balance, "Liquidation Cascade")
         if size == 0.0:
-            return position
+            return position  # Kelly says no edge at this price
 
-        trade_id = tracker.open(direction, price, size,
-                    {"long_liqs":   round(long_liqs),
-                     "short_liqs":  round(short_liqs),
-                     "vol_range":   round(vol_range, 4),
-                     "intensity":   round(adjusted_intensity, 3),
-                     "source":      "OKX+Binance"},
-                    market)
-        if not trade_id:
-            return position
-        t = StrategyTrade("liquidation_cascade", direction, size, price, market)
-        t.trade_id = trade_id
-        return t
+        if tracker.balance >= MIN_BET:
+            trade_id = tracker.open(direction, price, size,
+                        {"long_liqs":   round(long_liqs),
+                         "short_liqs":  round(short_liqs),
+                         "vol_range":   round(vol_range, 4),
+                         "intensity":   round(adjusted_intensity, 3),
+                         "source":      "OKX+Binance"},
+                        market)
+            if not trade_id:
+                return position
+            t = StrategyTrade("liquidation_cascade", direction, size, price, market)
+            t.trade_id = trade_id
+            return t
     except Exception as e:
         log.warning(f"[Liquidation cascade] error: {e}")
-    return position
-
-
-def strategy_up_bias(market, secs_left, tracker, position):
-    """
-    Strategy: UP Bias (observation mode — no live betting yet)
-    ============================================================
-    Exploits systematic crowd underpricing of UP outcomes in the
-    mid-market phase (60-200 seconds remaining) when p_market is
-    between 0.50 and 0.70.
-
-    Data-driven finding (2026-03-26, 424 markets):
-      MID phase (120-200s): actual UP rate 63% vs p_market 57% → +6% edge
-      LATE phase (60-120s): actual UP rate 63% vs p_market 57% → +5.8% edge
-      FINAL (<60s):         actual UP rate 36% vs p_market 51% → -15% edge
-      Per-market stddev: ~49% — too high to confirm edge at current sample size
-
-    STATUS: OBSERVATION MODE
-      - Logs every evaluation to signal_log for data collection
-      - Does NOT place real bets until edge confirmed at 200+ mid markets
-      - Re-evaluate after 1 week of data (expected ~200 more markets)
-
-    Entry conditions:
-      - p_market between 0.52 and 0.68 (sweet spot, avoids edge fill costs)
-      - secs_left between 80 and 220 (mid/late phase only)
-      - No microstructure signal required — pure crowd miscalibration
-      - Always bets UP
-    """
-    try:
-        prices = fetch_poly_prices(market)
-        pm     = prices.get("up_mid", 0.5)
-
-        # Condition 1: p_market in sweet spot
-        if not (0.52 <= pm <= 0.68):
-            _log_signal("UP Bias", market, secs_left,
-                        signal_value=pm, threshold=0.52,
-                        reason="p_market_outside_range")
-            return position
-
-        # Condition 2: mid/late phase only
-        if not (80 <= secs_left <= 220):
-            _log_signal("UP Bias", market, secs_left,
-                        signal_value=secs_left, threshold=80,
-                        reason="wrong_phase")
-            return position
-
-        # Condition 3: spread must be reasonable
-        if prices.get("spread", 1.0) > 0.06:
-            _log_signal("UP Bias", market, secs_left,
-                        signal_value=prices["spread"], threshold=0.06,
-                        reason="spread_too_wide")
-            return position
-
-        # Log the signal — this is the data collection point
-        # Even in observation mode we log fired=False so signal_log
-        # accumulates labeled examples of this strategy evaluating
-        _log_signal("UP Bias", market, secs_left,
-                    signal_value=pm, threshold=0.52,
-                    reason="observation_mode_no_bet")
-
-        # OBSERVATION MODE: return without betting
-        # Remove this block when edge is confirmed at 200+ mid markets
-        return position
-
-        # ── LIVE MODE (uncomment when confirmed) ──────────────────────────
-        # if position:
-        #     return position
-        # intensity = (pm - 0.50) * 2   # 0.0 at pm=0.50, 0.36 at pm=0.68
-        # price = prices["fill_up"]
-        # size  = kelly_size(intensity, price, tracker.balance, "UP Bias")
-        # if size == 0.0:
-        #     return position
-        # trade_id = tracker.open("UP", price, size,
-        #             {"p_market": round(pm, 4), "intensity": round(intensity, 3)},
-        #             market)
-        # if not trade_id:
-        #     return position
-        # t = StrategyTrade("up_bias", "UP", size, price, market)
-        # t.trade_id = trade_id
-        # return t
-
-    except Exception as e:
-        log.warning(f"[UP Bias] error: {e}")
     return position
 
 
@@ -2731,8 +2654,6 @@ def _make_market_state() -> dict:
         "prev_ob_ask_depth": 0.0,
         "max_secs_left":     0.0,
         "liq_total_history": deque(maxlen=6),
-        "p_market_history":  deque(maxlen=60),
-        "p_market_open":     None,
     }
 
 
@@ -2758,7 +2679,6 @@ def run():
         "volume":        StrategyTracker("Volume Clock",         portfolio),
         "ob_pressure":   StrategyTracker("OB Pressure",         portfolio),
         "price_anchor":  StrategyTracker("Price Anchor",        portfolio),
-        "up_bias":       StrategyTracker("UP Bias",             portfolio),
     }
 
     restored_state   = restore_state_from_supabase(portfolio)
@@ -2915,14 +2835,13 @@ def run():
                 mkt, secs_left, trackers["basis"],
                 pos["basis"])
 
-            # Odds Mispricing disabled — WR=20.3%, PnL=-$110, no edge
-            # pos["odds"] = strategy_odds_mispricing(...)
+            pos["odds"]        = strategy_odds_mispricing(
+                mkt, secs_left, trackers["odds"],
+                pos["odds"])
 
-            # Volume Clock disabled — WR=10.6%, PnL=-$70, no edge
-            # pos["volume"] = strategy_volume_clock(...)
-
-            # UP Bias — observation mode, logging only, no real bets
-            strategy_up_bias(mkt, secs_left, trackers["up_bias"], pos.get("up_bias"))
+            pos["volume"]      = strategy_volume_clock(
+                mkt, secs_left, trackers["volume"],
+                pos["volume"])
 
             pos["ob_pressure"] = strategy_ob_pressure(
                 mkt, secs_left, trackers["ob_pressure"],
@@ -3001,20 +2920,6 @@ def run():
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
 
-                # p_market rolling stats
-                cur["p_market_history"].append(poly_up_mid)
-                if cur["p_market_open"] is None:
-                    cur["p_market_open"] = poly_up_mid
-                pm_hist = list(cur["p_market_history"])
-                pm_open = cur["p_market_open"]
-                p_market_vs_open_delta = round(poly_up_mid - pm_open, 4)                                          if pm_open is not None else 0.0
-                if len(pm_hist) >= 3:
-                    pm_mean = sum(pm_hist) / len(pm_hist)
-                    pm_var  = sum((x - pm_mean) ** 2 for x in pm_hist) / len(pm_hist)
-                    p_market_std = round(pm_var ** 0.5, 6)
-                else:
-                    p_market_std = 0.0
-
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
                 interact_liq_x_price_pos     = round(liq_imbalance * price_vs_open_pct, 6)
@@ -3078,9 +2983,6 @@ def run():
                     "poly_fill_up":        poly_fill_up,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
-                    "p_market_open":       round(pm_open, 4) if pm_open is not None else None,
-                    "p_market_vs_open_delta": p_market_vs_open_delta,
-                    "p_market_std":        p_market_std,
                     "price_bucket":        price_bucket,
                     "interact_momentum_x_vol":      interact_momentum_x_vol,
                     "interact_ob_x_spread":         interact_ob_x_spread,
@@ -3109,6 +3011,10 @@ def run():
                     "outcome_binary":      None,
                     "edge_realized":       None,
                     "resolved_outcome":    None,
+                    # Deribit implied volatility (observation — not used for trading yet)
+                    "iv_atm":   round(_iv_cache.get("atm_iv",   0.0), 2),
+                    "iv_skew":  round(_iv_cache.get("skew_25d", 0.0), 2),
+                    "iv_rank":  round(_iv_cache.get("iv_rank",  0.5), 4),
                 })
             except Exception as e:
                 log.debug(f"market_snapshot write failed: {e}")
