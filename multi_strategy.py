@@ -372,7 +372,7 @@ def supabase_signal_log(entry: dict):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        _session.post(
+        resp = _session.post(
             f"{SUPABASE_URL}/rest/v1/signal_log",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -383,6 +383,9 @@ def supabase_signal_log(entry: dict):
             json=entry,
             timeout=5,
         )
+        if resp.status_code not in (200, 201, 204):
+            log.warning(f"signal_log HTTP {resp.status_code}: {resp.text[:300]}")
+            log.warning(f"signal_log payload keys: {list(entry.keys())}")
     except Exception as e:
         log.warning(f"Supabase signal_log insert failed: {e}")
 
