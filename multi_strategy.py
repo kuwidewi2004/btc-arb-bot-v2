@@ -458,6 +458,11 @@ def _log_signal(strategy: str, market, secs_left: float,
             "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
             "momentum_30s":    m30,
             "momentum_60s":    m60,
+            # Poly columns — from shared cache updated by fetch_poly_prices()
+            "poly_spread":     round(_poly_cache.get("spread",    0.02), 4),
+            "poly_fill_up":    round(_poly_cache.get("fill_up",   0.5),  4),
+            "poly_fill_down":  round(_poly_cache.get("fill_down", 0.5),  4),
+            "poly_deviation":  round(_poly_cache.get("up_mid", 0.5) - 0.5, 4),
         }
         log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} "
                   f"threshold={threshold:.6f} | regime={entry['regime']} "
@@ -2716,6 +2721,8 @@ def _make_market_state() -> dict:
         "prev_ob_ask_depth": 0.0,
         "max_secs_left":     0.0,
         "liq_total_history": deque(maxlen=6),
+        "p_market_history":  deque(maxlen=30),  # for p_market_open, std, vs_open_delta
+        "p_market_open":     None,              # first p_market seen this market
     }
 
 
@@ -2939,6 +2946,20 @@ def run():
                 market_open_price   = cur["market_open_price"]
                 price_vs_open_pct   = round((spot - market_open_price) / market_open_price * 100, 6) \
                                       if market_open_price > 0 else 0.0
+
+                # p_market tracking — open, std, delta for ML features
+                if poly_up_mid and poly_up_mid > 0:
+                    cur["p_market_history"].append(float(poly_up_mid))
+                    if cur["p_market_open"] is None:
+                        cur["p_market_open"] = float(poly_up_mid)
+                p_market_open      = cur["p_market_open"]
+                p_market_hist      = list(cur["p_market_history"])
+                p_market_std       = round(float(np.std(p_market_hist)), 4) \
+                                     if len(p_market_hist) >= 3 else None
+                p_market_vs_delta  = round(float(poly_up_mid) - p_market_open, 4) \
+                                     if p_market_open and poly_up_mid else None
+                # secs_to_resolution — same as secs_left but explicit name for ML
+                secs_to_res        = round(secs_left, 1)
                 price_vs_open_score = round(math.tanh(price_vs_open_pct / 0.10), 4)
 
                 cl_open_price  = cur["cl_open_price"]
@@ -3073,6 +3094,11 @@ def run():
                     "outcome_binary":      None,
                     "edge_realized":       None,
                     "resolved_outcome":    None,
+                    # p_market tracking
+                    "secs_to_resolution":       secs_to_res,
+                    "p_market_open":            p_market_open,
+                    "p_market_vs_open_delta":   p_market_vs_delta,
+                    "p_market_std":             p_market_std,
                     # Deribit implied volatility (observation — not used for trading yet)
                     "iv_atm":   round(_iv_cache.get("atm_iv",   0.0), 2),
                     "iv_skew":  round(_iv_cache.get("skew_25d", 0.0), 2),
