@@ -848,7 +848,17 @@ def _update_ml_score(condition_id: str, secs_to_res: float, market_progress: flo
                      price_bucket: str, cl_div: float, cl_age: float,
                      cl_vs_open_pct: float, basis: float,
                      ob_bid_delta: float, ob_ask_delta: float, buy_ratio: float) -> float:
-    """Build 75-feature vector, score with classifier, store in _ml_scores. Returns P(profit)."""
+    """
+    Build feature vector matching train_model_v4_rest.py exactly, impute, and score.
+
+    Feature parity rules:
+    - mom_accel_abs = abs(m30 - m60)  [NOT m30-m10 — matches training]
+    - All NaNs imputed via saved classifier_imp before predict_proba
+    - Encoding maps must match REGIME_MAP/SESSION_MAP/etc in training script
+
+    Stores result in _ml_scores[condition_id] and _ml_scores_npm[condition_id].
+    Returns P(profitable) from primary model, or -1.0 if model unavailable.
+    """
     global _ml_scores
     if _ml_bundle is None:
         return -1.0
@@ -949,13 +959,15 @@ def _update_ml_score(condition_id: str, secs_to_res: float, market_progress: flo
             "liq_ob_agree":            (1.0 if (li > 0 and obi > 0) or (li < 0 and obi < 0)
                                         else (-1.0 if li != 0 and obi != 0 else 0.0)),
             "signal_dispersion":       float(np.std(sig_vals)),
-            "mom_accel_abs":           abs(m30 - m10),
+            "mom_accel_abs":           abs(m30 - m60),  # matches training: abs(m30 - m60)
         }
         fn = _ml_bundle["features"]
         missing = [k for k in fn if k not in f]
         if missing:
             log.warning(f"ML gate: {len(missing)} missing features {missing[:5]} — score unreliable")
         X  = np.array([[f.get(k, float('nan')) for k in fn]], dtype=np.float32)
+        # Apply saved imputer before scoring — must match training pipeline exactly
+        X  = _ml_bundle["classifier_imp"].transform(X)
         p  = float(_ml_bundle["classifier"].predict_proba(X)[0][1])
         _ml_scores[condition_id] = p
 
@@ -967,7 +979,8 @@ def _update_ml_score(condition_id: str, secs_to_res: float, market_progress: flo
                          if k not in ("pm_abs_deviation", "pm_uncertainty",
                                       "is_extreme_market", "bucket_enc", "vol_x_pm_abs_dev")}
                 fn2 = _ml_bundle_npm["features"]
-                X2  = np.array([[npm_f[k] for k in fn2]], dtype=np.float32)
+                X2  = np.array([[npm_f.get(k, float('nan')) for k in fn2]], dtype=np.float32)
+                X2  = _ml_bundle_npm["classifier_imp"].transform(X2)
                 p2  = float(_ml_bundle_npm["classifier"].predict_proba(X2)[0][1])
                 _ml_scores_npm[condition_id] = p2
             except Exception as e2:
