@@ -610,6 +610,12 @@ class StrategyTracker:
         Enforces per-market directional exposure cap before opening.
         Returns the trade_id so the caller can store it on StrategyTrade.
         """
+        # ML gate — block low-confidence trades (1-tick lag score)
+        ml_p = _ml_scores.get(market.condition_id, -1.0)
+        if ml_p >= 0.0 and ml_p < ML_GATE_THRESHOLD:
+            log.info(f"[{self.name}] ML gate blocked: P(profit)={ml_p:.3f} < {ML_GATE_THRESHOLD:.2f}")
+            return ""
+
         # Enforce directional exposure cap — cap size to whatever room remains
         cap_remaining = self.portfolio.exposure_cap_remaining(market.condition_id, side)
         if cap_remaining <= 0:
@@ -797,6 +803,180 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
+
+# ─────────────────────────────────────────── ML GATE (Option A) ────────────
+# Model scores every market each tick. If P(profitable) < threshold, open()
+# is blocked. Uses 1-tick lag (score computed after snapshot variables ready).
+import pickle as _pickle
+
+ML_GATE_THRESHOLD = 0.55  # block trades below this confidence
+_ml_scores: dict  = {}    # condition_id -> latest P(profitable)
+_ml_bundle        = None
+
+try:
+    with open("model_v4_profitable.pkl", "rb") as _mf:
+        _ml_bundle = _pickle.load(_mf)
+except Exception:
+    pass  # model unavailable — gate disabled, all trades pass through
+
+# Encoding maps — must match train_model_v4_rest.py exactly
+_ML_REGIME_ENC   = {"TREND_UP": 2, "TREND_DOWN": -2, "VOLATILE": 1, "CALM": 0, "DEAD": -1}
+_ML_SESSION_ENC  = {"OVERLAP": 3, "US": 2, "LONDON": 1, "ASIA": 0, "OFFPEAK": -1}
+_ML_ACTIVITY_ENC = {"HIGH": 2, "NORMAL": 1, "LOW": 0, "DEAD": -1}
+_ML_DAY_ENC      = {"WEEKDAY": 1, "WEEKEND": 0}
+_ML_BUCKET_ENC   = {"heavy_fav": 3, "favourite": 2, "underdog": 1, "longshot": 0}
+
+# No-pmarket variant (microstructure-only — p_market features excluded)
+_ml_bundle_npm = None
+try:
+    with open("model_v4_nopmarket.pkl", "rb") as _mf2:
+        _ml_bundle_npm = _pickle.load(_mf2)
+except Exception:
+    pass
+
+_ml_scores_npm: dict = {}  # condition_id -> P(profitable) from nopmarket model
+
+
+def _update_ml_score(condition_id: str, secs_to_res: float, market_progress: float,
+                     phase_early: int, phase_mid: int, phase_late: int, phase_final: int,
+                     momentum_10s: float, momentum_30s: float, momentum_60s: float,
+                     momentum_120s: float, liq_imbalance: float, liq_total: float,
+                     price_vs_open_pct: float, price_vs_open_score: float,
+                     poly_up_mid: float, poly_spread: float, poly_slip_up: float,
+                     price_bucket: str, cl_div: float, cl_age: float,
+                     cl_vs_open_pct: float, basis: float,
+                     ob_bid_delta: float, ob_ask_delta: float, buy_ratio: float) -> float:
+    """Build 75-feature vector, score with classifier, store in _ml_scores. Returns P(profit)."""
+    global _ml_scores
+    if _ml_bundle is None:
+        return -1.0
+    try:
+        pm = poly_up_mid or 0.5
+        pm_abs_dev    = abs(pm - 0.5)
+        pm_uncertainty = 1.0 - pm_abs_dev * 2
+        is_extreme    = float(pm < 0.25 or pm > 0.75)
+        m10, m30, m60, m120 = momentum_10s, momentum_30s, momentum_60s, momentum_120s
+        str_   = float(secs_to_res)
+        mp     = float(market_progress)
+        pvop   = float(price_vs_open_pct)
+        li     = float(liq_imbalance)
+        lt     = min(float(liq_total), 5e6)
+        obi    = float(_ob_cache.get("imbalance", 0.0))
+        vr     = float(_vol_cache.get("range_pct", 0.0))
+        ps     = float(poly_spread)
+        sl2    = float(poly_slip_up)
+        fr     = float(_funding_cache.get("rate", 0.0))
+        fz     = float(_regime.get("funding_zscore", 0.0) or 0.0)
+        sig_vals = [abs(li), abs(obi), min(abs(m30) * 10, 1.0)]
+        f = {
+            "secs_to_resolution":      str_,
+            "log_secs_to_resolution":  math.log1p(str_),
+            "market_progress":         mp,
+            "phase_early":             float(phase_early),
+            "phase_mid":               float(phase_mid),
+            "phase_late":              float(phase_late),
+            "phase_final":             float(phase_final),
+            "hour_sin":                float(_regime.get("hour_sin", 0.0) or 0.0),
+            "hour_cos":                float(_regime.get("hour_cos", 0.0) or 0.0),
+            "dow_sin":                 float(_regime.get("dow_sin", 0.0) or 0.0),
+            "dow_cos":                 float(_regime.get("dow_cos", 0.0) or 0.0),
+            "pm_abs_deviation":        pm_abs_dev,
+            "pm_uncertainty":          pm_uncertainty,
+            "is_extreme_market":       is_extreme,
+            "price_vs_open_pct":       pvop,
+            "price_vs_open_score":     float(price_vs_open_score or 0.0),
+            "momentum_10s":            m10,
+            "momentum_30s":            m30,
+            "momentum_60s":            m60,
+            "momentum_120s":           m120,
+            "momentum_score":          float(_regime.get("momentum_score", 0.0) or 0.0),
+            "mom_accel_short":         m30 - m10,
+            "mom_accel_mid":           m60 - m30,
+            "mom_accel_long":          m120 - m60,
+            "mom_windows_positive":    float(sum(1 for v in [m10, m30, m60, m120] if v > 0)),
+            "mom_all_agree":           1.0 if (all(v > 0 for v in [m10,m30,m60,m120]) or
+                                               all(v < 0 for v in [m10,m30,m60,m120])) else 0.0,
+            "mom_mean":                (m10 + m30 + m60 + m120) / 4,
+            "mom_anchor_div":          m30 - pvop,
+            "mom_abs":                 abs(m30),
+            "cl_divergence":           float(cl_div or 0.0),
+            "cl_age":                  float(cl_age or 0.0),
+            "cl_vs_open_pct":          float(cl_vs_open_pct or 0.0),
+            "cl_abs_divergence":       abs(float(cl_div or 0.0)),
+            "liq_imbalance":           li,
+            "liq_total":               lt,
+            "log_liq_total":           math.log1p(lt) if lt >= 0 else 0.0,
+            "liq_abs_imbalance":       abs(li),
+            "ob_imbalance":            obi,
+            "ob_bid_delta":            float(ob_bid_delta),
+            "ob_ask_delta":            float(ob_ask_delta),
+            "ob_abs_imbalance":        abs(obi),
+            "vol_range_pct":           vr,
+            "volatility_pct":          float(_regime.get("volatility_pct", 0.0) or 0.0),
+            "volume_buy_ratio":        float(buy_ratio or 0.5),
+            "poly_spread":             ps,
+            "poly_slip_up":            sl2,
+            "effective_entry_cost":    ps + sl2,
+            "round_trip_cost":         ps + sl2 + TAKER_FEE * 2,
+            "basis_pct":               float(basis or 0.0),
+            "funding_rate":            fr,
+            "funding_zscore":          fz,
+            "okx_funding":             float(_funding_cache.get("okx", 0.0)),
+            "gate_funding":            float(_funding_cache.get("binance", 0.0)),
+            "funding_abs":             abs(fr),
+            "flow_score":              float(_regime.get("flow_score", 0.0) or 0.0),
+            "regime_enc":              _ML_REGIME_ENC.get(_regime.get("composite", ""), 0),
+            "session_enc":             _ML_SESSION_ENC.get(_regime.get("session", ""), 0),
+            "activity_enc":            _ML_ACTIVITY_ENC.get(_regime.get("activity", ""), 0),
+            "day_type_enc":            _ML_DAY_ENC.get(_regime.get("day_type", ""), 0),
+            "bucket_enc":              _ML_BUCKET_ENC.get(price_bucket, 1),
+            "interact_mom_x_vol":      m30 * vr,
+            "interact_liq_x_price":    li * pvop,
+            "interact_mom_x_progress": m30 * mp,
+            "interact_ob_x_spread":    obi * ps,
+            "signal_strength":         float(sum(1 for v in sig_vals if v > 0.1)),
+            "vol_x_pm_abs_dev":        vr * pm_abs_dev,
+            "vol_x_funding_zscore":    vr * fz,
+            "liq_imbal_x_secs":        li * str_,
+            "mom_x_secs":              m30 * str_,
+            "ob_imbal_x_secs":         obi * str_,
+            "mom_liq_agree":           (1.0 if (m30 > 0 and li > 0) or (m30 < 0 and li < 0)
+                                        else (-1.0 if m30 != 0 and li != 0 else 0.0)),
+            "mom_ob_agree":            (1.0 if (m30 > 0 and obi > 0) or (m30 < 0 and obi < 0)
+                                        else (-1.0 if m30 != 0 and obi != 0 else 0.0)),
+            "liq_ob_agree":            (1.0 if (li > 0 and obi > 0) or (li < 0 and obi < 0)
+                                        else (-1.0 if li != 0 and obi != 0 else 0.0)),
+            "signal_dispersion":       float(np.std(sig_vals)),
+            "mom_accel_abs":           abs(m30 - m10),
+        }
+        fn = _ml_bundle["features"]
+        missing = [k for k in fn if k not in f]
+        if missing:
+            log.warning(f"ML gate: {len(missing)} missing features {missing[:5]} — score unreliable")
+        X  = np.array([[f.get(k, float('nan')) for k in fn]], dtype=np.float32)
+        p  = float(_ml_bundle["classifier"].predict_proba(X)[0][1])
+        _ml_scores[condition_id] = p
+
+        # Score nopmarket model in parallel (excludes pm_abs_deviation, pm_uncertainty,
+        # is_extreme_market, bucket_enc, vol_x_pm_abs_dev)
+        if _ml_bundle_npm is not None:
+            try:
+                npm_f = {k: v for k, v in f.items()
+                         if k not in ("pm_abs_deviation", "pm_uncertainty",
+                                      "is_extreme_market", "bucket_enc", "vol_x_pm_abs_dev")}
+                fn2 = _ml_bundle_npm["features"]
+                X2  = np.array([[npm_f[k] for k in fn2]], dtype=np.float32)
+                p2  = float(_ml_bundle_npm["classifier"].predict_proba(X2)[0][1])
+                _ml_scores_npm[condition_id] = p2
+            except Exception as e2:
+                log.debug(f"ML nopmarket score error: {e2}")
+
+        return p
+    except Exception as e:
+        log.debug(f"ML score error: {e}")
+        return -1.0
+
+
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
     "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
@@ -2081,8 +2261,9 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
                         reason="spread_too_wide")
             return position
 
+        intensity = min(total / 200_000, 1.0) * dominant_ratio
         price = prices["fill_up"] if direction == "UP" else prices["fill_down"]
-        size  = kelly_size(adjusted_intensity, price, tracker.balance, "Liquidation Cascade")
+        size  = kelly_size(intensity, price, tracker.balance, "Liquidation Cascade")
         if size == 0.0:
             return position  # Kelly says no edge at this price
 
@@ -2090,8 +2271,8 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
             trade_id = tracker.open(direction, price, size,
                         {"long_liqs":   round(long_liqs),
                          "short_liqs":  round(short_liqs),
-                         "vol_range":   round(vol_range, 4),
-                         "intensity":   round(adjusted_intensity, 3),
+                         "vol_range":   round(vol_range_now, 4),
+                         "intensity":   round(intensity, 3),
                          "source":      "OKX+Binance"},
                         market)
             if not trade_id:
@@ -2717,6 +2898,8 @@ def _make_market_state() -> dict:
         "liq_total_history": deque(maxlen=6),
         "p_market_history":  deque(maxlen=30),  # for p_market_open, std, vs_open_delta
         "p_market_open":     None,              # first p_market seen this market
+        "ml_b_fired":        False,             # Option B dry run — only fire once per market
+        "ml_b_npm_fired":    False,             # No-pmarket dry run — only fire once per market
     }
 
 
@@ -3021,6 +3204,51 @@ def run():
                     "heavy_fav"
                 )
 
+                # ── ML gate score (stored; used next tick by StrategyTracker.open) ──
+                _ml_p = _update_ml_score(
+                    mkt.condition_id, secs_to_res, market_progress,
+                    phase_early, phase_mid, phase_late, phase_final,
+                    momentum_10s, momentum_30s, momentum_60s, momentum_120s,
+                    liq_imbalance, liq_total,
+                    price_vs_open_pct, price_vs_open_score,
+                    poly_up_mid, poly_spread, poly_slip_up,
+                    price_bucket, cl_div, cl_age, cl_vs_open_pct, basis,
+                    ob_bid_delta, ob_ask_delta, buy_ratio,
+                )
+                if _ml_p >= 0:
+                    log.debug(f"ML score [{mkt.condition_id[:10]}]: P(profit)={_ml_p:.3f}")
+
+                # ── Option B dry run — log what ML would trade (once per market) ──
+                if _ml_p >= 0 and not cur["ml_b_fired"]:
+                    if _ml_p > 0.60:
+                        cur["ml_b_fired"] = True
+                        _log_signal("ML_B_DryRun", mkt, secs_left,
+                                    signal_value=_ml_p, threshold=0.60,
+                                    reason="would_buy_UP")
+                        log.info(f"[ML_B_DryRun] WOULD BUY UP | P={_ml_p:.3f} | secs={secs_left:.0f}")
+                    elif _ml_p < 0.40:
+                        cur["ml_b_fired"] = True
+                        _log_signal("ML_B_DryRun", mkt, secs_left,
+                                    signal_value=1.0 - _ml_p, threshold=0.60,
+                                    reason="would_buy_DOWN")
+                        log.info(f"[ML_B_DryRun] WOULD BUY DOWN | P={_ml_p:.3f} | secs={secs_left:.0f}")
+
+                # ── No-pmarket dry run (microstructure-only model) ──────────────
+                _npm_p = _ml_scores_npm.get(mkt.condition_id, -1.0)
+                if _npm_p >= 0 and not cur["ml_b_npm_fired"]:
+                    if _npm_p > 0.60:
+                        cur["ml_b_npm_fired"] = True
+                        _log_signal("ML_NoPmarket_DryRun", mkt, secs_left,
+                                    signal_value=_npm_p, threshold=0.60,
+                                    reason="would_buy_UP")
+                        log.info(f"[ML_NoPmarket_DryRun] WOULD BUY UP | P={_npm_p:.3f} | secs={secs_left:.0f}")
+                    elif _npm_p < 0.40:
+                        cur["ml_b_npm_fired"] = True
+                        _log_signal("ML_NoPmarket_DryRun", mkt, secs_left,
+                                    signal_value=1.0 - _npm_p, threshold=0.60,
+                                    reason="would_buy_DOWN")
+                        log.info(f"[ML_NoPmarket_DryRun] WOULD BUY DOWN | P={_npm_p:.3f} | secs={secs_left:.0f}")
+
                 supabase_market_snapshot({
                     "condition_id":        mkt.condition_id,
                     "market_question":     mkt.question,
@@ -3055,14 +3283,12 @@ def run():
                     "liq_accel":           liq_accel,
                     "vol_range_pct":       round(_vol_cache.get("range_pct", 0.0), 6),
                     "ob_imbalance":        round(_ob_cache.get("imbalance", 0.0), 4),
-                    "ob_spread_pct":       round(_ob_cache.get("spread_pct", 0.0), 6),
                     "ob_bid_depth":        round(cur_bid_depth, 2),
                     "ob_ask_depth":        round(cur_ask_depth, 2),
                     "ob_bid_delta":        ob_bid_delta,
                     "ob_ask_delta":        ob_ask_delta,
                     "volume_buy_ratio":    buy_ratio,
                     "p_market":            poly_up_mid,
-                    "poly_up_mid":         poly_up_mid,
                     "poly_spread":         poly_spread,
                     "poly_fill_up":        poly_fill_up,
                     "poly_fill_down":      poly_fill_down,
@@ -3074,33 +3300,21 @@ def run():
                     "interact_liq_x_price_pos":     interact_liq_x_price_pos,
                     "interact_momentum_x_progress": interact_momentum_x_progress,
                     "regime":              _regime["composite"],
-                    "momentum_label":      _regime["momentum_label"],
-                    "volatility_label":    _regime["volatility_label"],
-                    "flow_label":          _regime["flow_label"],
                     "session":             _regime["session"],
                     "activity":            _regime["activity"],
                     "day_type":            _regime["day_type"],
                     "momentum_score":      _regime["momentum_score"],
                     "volatility_pct":      _regime["volatility_pct"],
                     "flow_score":          _regime["flow_score"],
-                    "liquidity_score":     _regime["liquidity_score"],
                     "funding_zscore":      _regime["funding_zscore"],
                     "hour_sin":            _regime["hour_sin"],
                     "hour_cos":            _regime["hour_cos"],
                     "dow_sin":             _regime["dow_sin"],
                     "dow_cos":             _regime["dow_cos"],
-                    "anchor_open_price":   round(market_open_price, 2),
-                    "anchor_pct":          price_vs_open_pct,
-                    "anchor_score":        price_vs_open_score,
-                    "anchor_progress":     market_progress,
                     "outcome_binary":      None,
                     "edge_realized":       None,
                     "resolved_outcome":    None,
-                    # p_market tracking
                     "secs_to_resolution":       secs_to_res,
-                    "p_market_open":            p_market_open,
-                    "p_market_vs_open_delta":   p_market_vs_delta,
-                    "p_market_std":             p_market_std,
                     # Deribit implied volatility (observation — not used for trading yet)
                     "iv_atm":   round(_iv_cache.get("atm_iv",   0.0), 2),
                     "iv_skew":  round(_iv_cache.get("skew_25d", 0.0), 2),
