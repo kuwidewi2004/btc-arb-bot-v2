@@ -413,25 +413,58 @@ def supabase_market_snapshot(snapshot: dict):
 
 def _log_signal(strategy: str, market, secs_left: float,
                 signal_value: float, threshold: float, reason: str):
-    """Helper — builds and sends a signal log entry for a non-firing evaluation."""
-    entry = {
-        "strategy":        strategy,
-        "condition_id":    market.condition_id if market else "",
-        "market_question": market.question if market else "",
-        "secs_left":       round(secs_left, 1),
-        "signal_value":    round(signal_value, 6),
-        "threshold":       round(threshold, 6),
-        "fired":           False,
-        "reason":          reason,
-        # Regime labels — allows slicing win rates by market condition
-        "regime":          _regime.get("composite", "UNKNOWN"),
-        "session":         _regime.get("session", "UNKNOWN"),
-        "activity":        _regime.get("activity", "UNKNOWN"),
-        "day_type":        _regime.get("day_type", "UNKNOWN"),
-    }
-    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
-              f"| regime={entry['regime']} session={entry['session']}")
-    supabase_signal_log(entry)
+    """
+    Helper — builds and sends an enriched signal log entry.
+    Writes microstructure context columns directly so signal_log is
+    self-contained for ML training without needing a join to market_snapshots.
+    """
+    try:
+        thr       = threshold if threshold and threshold > 0 else 1.0
+        liq_long  = _liq_cache.get("long", 0.0)
+        liq_short = _liq_cache.get("short", 0.0)
+        liq_tot   = liq_long + liq_short
+
+        try:
+            m30 = round(btc_momentum_pct(lookback_secs=30) or 0.0, 6)
+        except Exception:
+            m30 = 0.0
+        try:
+            m60 = round(btc_momentum_pct(lookback_secs=60) or 0.0, 6)
+        except Exception:
+            m60 = 0.0
+
+        entry = {
+            "strategy":        strategy,
+            "condition_id":    market.condition_id if market else "",
+            "market_question": market.question if market else "",
+            "secs_left":       round(secs_left, 1),
+            "signal_value":    round(signal_value, 6),
+            "threshold":       round(threshold, 6),
+            "fired":           False,
+            "reason":          reason,
+            "regime":          _regime.get("composite", "UNKNOWN"),
+            "session":         _regime.get("session",   "UNKNOWN"),
+            "activity":        _regime.get("activity",  "UNKNOWN"),
+            "day_type":        _regime.get("day_type",  "UNKNOWN"),
+            "signal_ratio":    round(signal_value / thr, 6),
+            "above_threshold": 1 if signal_value >= threshold else 0,
+            "p_market":        round(_poly_cache.get("up_mid", 0.5), 4),
+            "ob_imbalance":    round(_ob_cache.get("imbalance", 0.0), 4),
+            "vol_range_pct":   round(_vol_cache.get("range_pct", 0.0), 6),
+            "liq_total":       round(liq_tot, 2),
+            "liq_imbalance":   round((liq_long - liq_short) / max(liq_tot, 1.0), 4),
+            "funding_rate":    round(_funding_cache.get("rate", 0.0), 6),
+            "funding_zscore":  round(_regime.get("funding_zscore", 0.0), 4),
+            "volatility_pct":  round(_regime.get("volatility_pct", 0.5), 4),
+            "momentum_30s":    m30,
+            "momentum_60s":    m60,
+        }
+        log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} "
+                  f"threshold={threshold:.6f} | regime={entry['regime']} "
+                  f"session={entry['session']}")
+        supabase_signal_log(entry)
+    except Exception as e:
+        log.warning(f"[_log_signal] failed: {e}")
 
 
 # --------------------------------------------------------------- DATACLASSES --
@@ -744,6 +777,7 @@ class StrategyTracker:
 # --------------------------------------------------------- SHARED DATA -------
 
 _price_cache:    dict  = {"btc": 0.0, "eth": 0.0, "fetched_at": 0.0}
+_poly_cache:     dict  = {"up_mid": 0.5, "fill_up": 0.5, "fill_down": 0.5, "spread": 0.02}
 _funding_cache:  dict  = {"okx": 0.0, "binance": 0.0, "rate": 0.0, "fetched_at": 0.0}
 _iv_cache:       dict  = {
     "atm_iv":      0.0,    # Deribit ATM implied vol (annualised %)
@@ -1613,6 +1647,12 @@ def fetch_poly_prices(market: Market, size_usdc: float = 50.0) -> dict:
         if slip_up > 0.005 or slip_down > 0.005:
             log.warning(f"High slippage estimate: UP +{slip_up:.4f} DOWN +{slip_down:.4f}")
 
+        # Update shared cache so _log_signal can read latest poly prices
+        _poly_cache["up_mid"]    = up_mid
+        _poly_cache["fill_up"]   = fill_up
+        _poly_cache["fill_down"] = fill_down
+        _poly_cache["spread"]    = spread
+
         return {
             "up_mid":    up_mid,
             "down_mid":  down_mid,
@@ -1981,6 +2021,15 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
             _log_signal("Liquidation Cascade", market, secs_left,
                         signal_value=total, threshold=10_000,
                         reason="liquidation_volume_too_low")
+            return position
+
+        # ── Volatility filter (data-driven, 2026-03-26, n=82 trades) ─────────
+        # high_vol (>0.2147): WR=65.9%  low/mid (<0.2147): WR=43-45%
+        vol_range_now = _vol_cache.get("range_pct", 0.0)
+        if vol_range_now < 0.2147:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=vol_range_now, threshold=0.2147,
+                        reason="vol_too_low_for_cascade")
             return position
 
         # ── Volatility filter — data-driven (2026-03-26, 82 trades) ──────────
@@ -2848,13 +2897,11 @@ def run():
                 mkt, secs_left, trackers["basis"],
                 pos["basis"])
 
-            pos["odds"]        = strategy_odds_mispricing(
-                mkt, secs_left, trackers["odds"],
-                pos["odds"])
+            # Odds Mispricing disabled — WR=20.4%, PnL=-$105, no edge
+            # pos["odds"] = strategy_odds_mispricing(...)
 
-            pos["volume"]      = strategy_volume_clock(
-                mkt, secs_left, trackers["volume"],
-                pos["volume"])
+            # Volume Clock disabled — WR=10.2%, PnL=-$82, no edge
+            # pos["volume"] = strategy_volume_clock(...)
 
             pos["ob_pressure"] = strategy_ob_pressure(
                 mkt, secs_left, trackers["ob_pressure"],
