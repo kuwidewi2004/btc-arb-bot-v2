@@ -428,6 +428,12 @@ def _log_signal(strategy: str, market, secs_left: float,
         "session":         _regime.get("session", "UNKNOWN"),
         "activity":        _regime.get("activity", "UNKNOWN"),
         "day_type":        _regime.get("day_type", "UNKNOWN"),
+        # Polymarket prices at signal evaluation time
+        "p_market":        _poly_cache.get("up_mid",    0.5),
+        "poly_spread":     _poly_cache.get("spread",    0.1),
+        "poly_fill_up":    _poly_cache.get("fill_up",   0.5),
+        "poly_fill_down":  _poly_cache.get("fill_down", 0.5),
+        "poly_deviation":  _poly_cache.get("deviation", 0.0),
     }
     log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
               f"| regime={entry['regime']} session={entry['session']}")
@@ -758,6 +764,8 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "spread_pct": 0.0, "fetched_at": 0.0}
+_poly_cache:     dict  = {"up_mid": 0.5, "spread": 0.1, "fill_up": 0.5,
+                           "fill_down": 0.5, "slip_up": 0.0, "deviation": 0.0}
 _regime:         dict  = {
     # Market microstructure regime — recomputed every poll cycle
     "momentum_label":   "NEUTRAL",  # TREND_UP | TREND_DOWN | NEUTRAL
@@ -790,91 +798,6 @@ _volume_fetched: float = 0.0
 
 
 def _fetch_deribit_iv():
-    try:
-        btc_price = _price_cache.get("btc", 0.0)
-        if btc_price <= 0:
-            log.warning("[Deribit IV] BTC price not available yet — skipping")
-            return
-
-        r = _session.get(
-            "https://www.deribit.com/api/v2/public/get_instruments",
-            params={"currency": "BTC", "kind": "option", "expired": "false"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        instruments = r.json().get("result", [])
-        log.info(f"[Deribit IV] {len(instruments)} instruments returned")
-
-        if not instruments:
-            log.warning("[Deribit IV] No instruments returned — geo-blocked or API down")
-            return
-
-        now_ts = time.time()
-        expiries = sorted(set(
-            i["expiration_timestamp"] / 1000 for i in instruments))
-        future = [e for e in expiries if e > now_ts + 86400]
-        log.info(f"[Deribit IV] {len(future)} future expiries found: "
-                 f"{[datetime.fromtimestamp(e, tz=timezone.utc).strftime('%Y-%m-%d') for e in future[:3]]}")
-
-        if not future:
-            log.warning("[Deribit IV] No expiry > 24h out — skipping")
-            return
-        exp = future[0]
-
-        calls = [i for i in instruments
-                 if i["expiration_timestamp"] / 1000 == exp
-                 and i["option_type"] == "call"]
-        puts  = [i for i in instruments
-                 if i["expiration_timestamp"] / 1000 == exp
-                 and i["option_type"] == "put"]
-        log.info(f"[Deribit IV] expiry={datetime.fromtimestamp(exp, tz=timezone.utc).date()} "
-                 f"calls={len(calls)} puts={len(puts)}")
-
-        if not calls or not puts:
-            log.warning("[Deribit IV] No calls or puts for selected expiry")
-            return
-
-        atm_call = min(calls, key=lambda x: abs(x["strike"] - btc_price))
-        atm_put  = min(puts,  key=lambda x: abs(x["strike"] - btc_price))
-        c25 = min(calls, key=lambda x: abs(x["strike"] - btc_price * 1.08))
-        p25 = min(puts,  key=lambda x: abs(x["strike"] - btc_price * 0.92))
-
-        log.info(f"[Deribit IV] ATM call={atm_call['instrument_name']} "
-                 f"put={atm_put['instrument_name']} "
-                 f"c25={c25['instrument_name']} p25={p25['instrument_name']}")
-
-        def _mark_iv(name):
-            try:
-                r = _session.get(
-                    "https://www.deribit.com/api/v2/public/ticker",
-                    params={"instrument_name": name}, timeout=5)
-                r.raise_for_status()
-                result = r.json().get("result", {})
-                iv = result.get("mark_iv", None)
-                log.info(f"[Deribit IV] {name} → mark_iv={iv}")
-                if iv is None:
-                    log.warning(f"[Deribit IV] mark_iv missing from ticker response for {name}. "
-                                f"Keys present: {list(result.keys())}")
-                    return 0.0
-                return float(iv)
-            except Exception as e:
-                log.warning(f"[Deribit IV] ticker fetch failed for {name}: {e}")
-                return 0.0
-
-        iv_ac  = _mark_iv(atm_call["instrument_name"])
-        iv_ap  = _mark_iv(atm_put["instrument_name"])
-        iv_c25 = _mark_iv(c25["instrument_name"])
-        iv_p25 = _mark_iv(p25["instrument_name"])
-
-        log.info(f"[Deribit IV] raw IVs — atm_call={iv_ac} atm_put={iv_ap} "
-                 f"c25={iv_c25} p25={iv_p25}")
-
-        if iv_ac == 0 or iv_ap == 0:
-            log.warning(f"[Deribit IV] ATM IV is zero — not updating cache. "
-                        f"atm_call={iv_ac} atm_put={iv_ap}")
-            return
-
-        # rest of function unchanged...
     """
     Fetch BTC implied volatility from Deribit public API.
     No API key required. Runs every 5 minutes inside refresh_shared_data().
@@ -3005,6 +2928,15 @@ def run():
                 poly_fill_down = round(poly_prices.get("fill_down", 0.5), 4)
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
+
+                # Update shared poly cache so _log_signal can read p_market
+                # without needing it passed through all 45 call sites
+                _poly_cache["up_mid"]    = poly_up_mid
+                _poly_cache["spread"]    = poly_spread
+                _poly_cache["fill_up"]   = poly_fill_up
+                _poly_cache["fill_down"] = poly_fill_down
+                _poly_cache["slip_up"]   = poly_slip_up
+                _poly_cache["deviation"] = poly_deviation
 
                 interact_momentum_x_vol      = round(momentum_30s * _vol_cache.get("range_pct", 0.0), 6)
                 interact_ob_x_spread         = round(_ob_cache.get("imbalance", 0.0) * poly_spread, 6)
