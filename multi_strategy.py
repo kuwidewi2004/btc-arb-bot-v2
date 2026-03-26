@@ -56,6 +56,8 @@ import sys
 import io
 import uuid
 import threading
+import smtplib
+import email.mime.text
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
@@ -2903,6 +2905,66 @@ def _make_market_state() -> dict:
     }
 
 
+_REPORT_EMAIL    = "kingkuon2004@gmail.com"
+_SMTP_USER       = os.environ.get("SMTP_USER", "")   # set in Railway env vars
+_SMTP_PASS       = os.environ.get("SMTP_PASS", "")   # Gmail app password
+
+
+def _send_hourly_report(portfolio, trackers: dict) -> None:
+    """Send hourly performance email. Silently skips if SMTP creds not set."""
+    if not _SMTP_USER or not _SMTP_PASS:
+        log.debug("Hourly email skipped — SMTP_USER/SMTP_PASS not set")
+        return
+    try:
+        now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines = [f"BTC Arb Bot — Hourly Report ({now})", ""]
+
+        # Portfolio balance
+        lines.append("=== PORTFOLIO ===")
+        for l in portfolio.summary_lines():
+            lines.append(l)
+        lines.append("")
+
+        # Strategy win rates (from Supabase resolver)
+        lines.append("=== STRATEGY WIN RATES (resolved trades) ===")
+        if _win_rates:
+            for strat, wr in sorted(_win_rates.items(), key=lambda x: -x[1]):
+                lines.append(f"  {strat:<30} {wr*100:.1f}%")
+        else:
+            lines.append("  (no resolved trades yet)")
+        lines.append("")
+
+        # ML model scores — last known per active market
+        lines.append("=== ML GATE ===")
+        lines.append(f"  Threshold (live):     P >= {ML_GATE_THRESHOLD:.2f}")
+        lines.append(f"  Active market scores: {len(_ml_scores)} markets tracked")
+        if _ml_scores:
+            scores = list(_ml_scores.values())
+            lines.append(f"  Score range:  min={min(scores):.3f}  max={max(scores):.3f}  avg={sum(scores)/len(scores):.3f}")
+        if _ml_scores_npm:
+            scores_npm = list(_ml_scores_npm.values())
+            lines.append(f"  NoPmkt range: min={min(scores_npm):.3f}  max={max(scores_npm):.3f}  avg={sum(scores_npm)/len(scores_npm):.3f}")
+        lines.append("")
+
+        # Per-tracker local summary
+        lines.append("=== STRATEGY TRACKERS (local session) ===")
+        for t in trackers.values():
+            lines.append(f"  {t.summary()}")
+
+        body = "\n".join(lines)
+        msg  = email.mime.text.MIMEText(body, "plain")
+        msg["Subject"] = f"[BTC Bot] Hourly Report — {now}"
+        msg["From"]    = _SMTP_USER
+        msg["To"]      = _REPORT_EMAIL
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as srv:
+            srv.login(_SMTP_USER, _SMTP_PASS)
+            srv.sendmail(_SMTP_USER, _REPORT_EMAIL, msg.as_string())
+        log.info(f"Hourly report sent to {_REPORT_EMAIL}")
+    except Exception as e:
+        log.warning(f"Hourly email failed: {e}")
+
+
 def run():
     log.info("Multi-Strategy Mechanical Edge Simulator v3.5")
     log.info("Strategies: Chainlink | Funding | Liquidation | Basis | Odds | Volume | OB Pressure | Price Anchor")
@@ -2952,6 +3014,7 @@ def run():
 
     last_summary       = 0
     last_winrate_fetch = time.time()
+    last_email         = time.time()
 
     # Initial market fetch
     cur["market"] = fetch_current_market()
@@ -3339,6 +3402,11 @@ def run():
                     log.info(t.summary())
                 log.info("=" * 60)
                 last_summary = time.time()
+
+            if time.time() - last_email > 3600:
+                threading.Thread(target=_send_hourly_report,
+                                 args=(portfolio, trackers), daemon=True).start()
+                last_email = time.time()
 
             time.sleep(POLL_SEC)
 
