@@ -956,7 +956,7 @@ def _on_deribit_iv_message(ws, message):
 
         # ── DVOL update ──────────────────────────────────────────────────────
         if channel == "deribit_volatility_index.btc_usd":
-            log.info(f"[Deribit IV WS] DVOL raw payload: {payload}")
+            log.debug(f"[Deribit IV WS] DVOL raw payload: {payload}")
             dvol = float(payload.get("volatility", 0.0))
             if dvol <= 0:
                 log.warning(f"[Deribit IV WS] DVOL value is zero/missing in payload: {payload}")
@@ -972,14 +972,14 @@ def _on_deribit_iv_message(ws, message):
                 _iv_cache["atm_iv"]     = round(dvol, 2)
                 _iv_cache["iv_rank"]    = round(float(min(max(iv_rank, 0.0), 1.0)), 4)
                 _iv_cache["fetched_at"] = time.time()
-            log.info(f"[Deribit IV WS] DVOL={dvol:.1f}%  rank={iv_rank:.2f}  "
+            log.debug(f"[Deribit IV WS] DVOL={dvol:.1f}%  rank={iv_rank:.2f}  "
                      f"skew={_iv_cache['skew_25d']:+.1f}%")
 
         # ── Option ticker update (skew) ──────────────────────────────────────
         elif channel.startswith("ticker.") and channel.endswith(".100ms"):
             instrument = payload.get("instrument_name", "")
             mark_iv    = payload.get("mark_iv")
-            log.info(f"[Deribit IV WS] Ticker {instrument}: mark_iv={mark_iv} "
+            log.debug(f"[Deribit IV WS] Ticker {instrument}: mark_iv={mark_iv} "
                      f"(expecting c25={_deribit_skew_instruments.get('c25')} "
                      f"p25={_deribit_skew_instruments.get('p25')})")
             if mark_iv is None or float(mark_iv) <= 0:
