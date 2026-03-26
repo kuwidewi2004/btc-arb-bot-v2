@@ -852,12 +852,30 @@ def _get_skew_instruments() -> tuple:
     """
     Fetch nearest expiry BTC option names for ±8% strikes (approx 25-delta).
     Returns (call_name, put_name) or ("", "") on failure.
-    Two REST calls: get_index_price + get_instruments.
+    Uses live _price_cache BTC price (Coinbase/Kraken) for strike selection.
+    Falls back to Deribit index price only if cache not yet populated.
+    One REST call: get_instruments only.
     """
     try:
-        r = _session.get(f"{_DERIBIT_REST}/get_index_price",
-                         params={"index_name": "btc_usd"}, timeout=5)
-        btc_price = float(r.json()["result"]["index_price"])
+        # Always fetch fresh from Coinbase/Kraken — do not trust _price_cache
+        # (empty at startup) or Deribit index (known to return stale prices)
+        btc_price = 0.0
+        try:
+            r = _session.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
+            btc_price = float(r.json()["data"]["amount"])
+        except Exception:
+            pass
+        if btc_price <= 0:
+            try:
+                r = _session.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
+                res = r.json()["result"]
+                btc_price = float(res[list(res.keys())[0]]["c"][0])
+            except Exception:
+                pass
+        if btc_price <= 0:
+            log.warning("[Deribit IV] Could not fetch BTC price for skew strikes — skipping")
+            return "", ""
+        log.info(f"[Deribit IV] BTC price for skew strikes: ${btc_price:,.0f}")
 
         r2 = _session.get(f"{_DERIBIT_REST}/get_instruments",
                           params={"currency": "BTC", "kind": "option",
