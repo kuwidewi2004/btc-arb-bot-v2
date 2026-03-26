@@ -399,7 +399,7 @@ def supabase_market_snapshot(snapshot: dict):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        _session.post(
+        resp = _session.post(
             f"{SUPABASE_URL}/rest/v1/market_snapshots",
             headers={
                 "apikey":        SUPABASE_KEY,
@@ -410,6 +410,8 @@ def supabase_market_snapshot(snapshot: dict):
             json=snapshot,
             timeout=5,
         )
+        if resp.status_code not in (200, 201, 204):
+            log.warning(f"market_snapshot HTTP {resp.status_code}: {resp.text[:300]}")
     except Exception as e:
         log.warning(f"market_snapshot insert failed: {e}")
 
