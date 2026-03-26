@@ -440,8 +440,8 @@ def _log_signal(strategy: str, market, secs_left: float,
         "poly_fill_down":  _poly_cache.get("fill_down", 0.5),
         "poly_deviation":  _poly_cache.get("deviation", 0.0),
     }
-    log.debug(f"[SIGNAL] {strategy} | {reason} | value={signal_value:.6f} threshold={threshold:.6f} "
-              f"| regime={entry['regime']} session={entry['session']}")
+    log.info(f"[SIGNAL_LOG] {strategy} | {reason} | p_market={_poly_cache.get('up_mid', 'MISSING')} "
+             f"poly_spread={_poly_cache.get('spread', 'MISSING')}")
     supabase_signal_log(entry)
 
 
