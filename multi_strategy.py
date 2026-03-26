@@ -921,7 +921,7 @@ def _fetch_deribit_iv():
                  f"skew: {skew_25d:+.1f}%  rank: {iv_rank:.2f}")
 
     except Exception as e:
-        log.warning(f"[Deribit IV] fetch failed: {e}")
+        log.debug(f"[Deribit IV] fetch failed: {e}")
 
 
 def fetch_spot(symbol: str = BTC_SYMBOL) -> Optional[float]:
@@ -2037,19 +2037,6 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
                         reason="vol_too_low_for_cascade")
             return position
 
-        # ── Volatility filter — data-driven (2026-03-26, 82 trades) ──────────
-        # Trades split by vol_range_pct percentile:
-        #   high_vol (>p50=0.2147): WR=65.9%  PnL=+$38.60  (41 trades)
-        #   mid_vol  (p25-p50):     WR=45.0%  PnL=-$5.41   (20 trades)
-        #   low_vol  (<p25=0.1455): WR=42.9%  PnL=-$19.72  (21 trades)
-        # Below median vol: coin-flip win rate, negative PnL — skip entirely
-        vol_range_now = _vol_cache.get("range_pct", 0.0)
-        if vol_range_now < 0.2147:
-            _log_signal("Liquidation Cascade", market, secs_left,
-                        signal_value=vol_range_now, threshold=0.2147,
-                        reason="vol_too_low_for_cascade")
-            return position
-
         # Require meaningful imbalance — at least 65/35 split
         if total > 0:
             dominant_ratio = max(long_liqs, short_liqs) / total
@@ -2070,17 +2057,24 @@ def strategy_liquidation_cascade(market, secs_left, tracker, position):
 
         direction = "DOWN" if long_liqs > short_liqs else "UP"
 
-        # Volatility-adjusted intensity:
-        # Normalize liquidation size by current 5-min BTC price range
-        # High volatility = liquidations are expected = weaker signal
-        # Low volatility = liquidations are surprising = stronger signal
-        vol_range = _vol_cache.get("range_pct", 0.1)
-        vol_range = max(vol_range, 0.05)  # floor to avoid division by zero
-        raw_intensity    = min(total / 500_000, 1.0)
-        vol_scalar       = max(0.3, min(1.0, 0.15 / vol_range))  # inverse vol
-        adjusted_intensity = min(raw_intensity * vol_scalar, 1.0)
-
+        # Fetch prices early — needed for vol_x_pm_abs_dev filter and entry
         prices = fetch_poly_prices(market)
+
+        # ── vol_x_pm_abs_dev filter (data-driven, 2026-03-27, n=110 trades) ──
+        # vol_x_pm_abs_dev = vol_range_pct * abs(p_market - 0.5)
+        # LOW regime (<=0.0174): WR=60.3%  PnL=+$282  avg=$+3.87  (73 trades) ✅
+        # HIGH regime (>0.0174): WR=51.4%  PnL=-$3    avg=$-0.07  (37 trades) ❌
+        # Interpretation: when market is already one-sided AND volatile,
+        # the crowd has already priced in the move — cascade adds no edge.
+        p_market_now    = prices["up_mid"]
+        vol_x_pm_abs_dev = vol_range_now * abs(p_market_now - 0.5)
+        if vol_x_pm_abs_dev > 0.0174:
+            _log_signal("Liquidation Cascade", market, secs_left,
+                        signal_value=round(vol_x_pm_abs_dev, 5),
+                        threshold=0.0174,
+                        reason="vol_x_pmdev_too_high_crowd_priced_in")
+            return position
+
         if prices["spread"] > 0.06:
             _log_signal("Liquidation Cascade", market, secs_left,
                         signal_value=prices["spread"], threshold=0.06,
