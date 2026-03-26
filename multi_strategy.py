@@ -2916,7 +2916,8 @@ def run():
                 poly_prices    = fetch_poly_prices(mkt, 20.0)
                 poly_up_mid    = round(poly_prices.get("up_mid", 0.5), 4)
                 poly_spread    = round(poly_prices.get("spread", 0.1), 4)
-                poly_fill_up   = round(poly_prices.get("fill_up", 0.5), 4)
+                poly_fill_up   = round(poly_prices.get("fill_up",  0.5), 4)
+                poly_fill_down = round(poly_prices.get("fill_down", 0.5), 4)
                 poly_slip_up   = round(poly_prices.get("slip_up", 0.0), 4)
                 poly_deviation = round(poly_up_mid - 0.50, 4)
 
@@ -2981,6 +2982,7 @@ def run():
                     "poly_up_mid":         poly_up_mid,
                     "poly_spread":         poly_spread,
                     "poly_fill_up":        poly_fill_up,
+                    "poly_fill_down":      poly_fill_down,
                     "poly_slip_up":        poly_slip_up,
                     "poly_deviation":      poly_deviation,
                     "price_bucket":        price_bucket,
