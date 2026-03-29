@@ -2,11 +2,12 @@
 V5 Futures Edge Regressor Training Pipeline
 =============================================
 Trains dual regressors for dYdX BTC-USD perpetual futures:
-  E(edge_long)  = (btc_resolution_price - btc_entry_price) / btc_entry_price - fees
-  E(edge_short) = (btc_entry_price - btc_resolution_price) / btc_entry_price - fees
+  E(edge_long)  = (btc_price_5min_later - btc_price_now) / btc_price_now - fees
+  E(edge_short) = (btc_price_now - btc_price_5min_later) / btc_price_now - fees
 
-Labels: pure BTC price movement over 5-minute windows, minus 0.04% round-trip fees.
-Features: 82 including Polymarket sentiment (unique edge over other futures traders).
+Labels: 5-minute lookahead BTC price movement, minus 0.10% round-trip fees.
+Every snapshot with a valid 5-min lookahead is usable — no Polymarket resolution dependency.
+Features: 78 including Polymarket sentiment (unique edge over other futures traders).
 
 This is the FUTURE production model for dYdX. V4 is the current production model.
 V5 replaces V4 when both correlations cross positive across 5+ folds.
@@ -203,9 +204,12 @@ def _build_cross_market_lookup(rows) -> dict:
     return cross
 
 
+LOOKAHEAD_SECS = 180  # 3-minute lookahead for future BTC price
+LOOKAHEAD_TOLERANCE = 15  # accept a match within ±15 seconds of target
+
 def fetch_snapshots_v5() -> list:
-    """Fetch snapshots with btc_resolution_price for futures labels."""
-    log.info("Fetching market_snapshots for V5 (futures)...")
+    """Fetch ALL snapshots with btc_price, then compute 5-min lookahead labels."""
+    log.info("Fetching market_snapshots for V5 (futures, 5-min lookahead)...")
     cols = ",".join([
         "created_at","condition_id","secs_left","secs_to_resolution","market_progress",
         "phase_early",
@@ -229,26 +233,120 @@ def fetch_snapshots_v5() -> list:
         "tick_cvd_60s","tick_taker_buy_ratio_60s","tick_intensity_60s",
         "delta_cvd","delta_taker_buy","delta_momentum","delta_poly","delta_score",
         "delta_funding","delta_basis",
-        "btc_price","btc_resolution_price",
+        "btc_price",
         "outcome_binary",
     ])
     all_rows = _rest_fetch("market_snapshots", {
         "select": cols,
-        "outcome_binary": "not.is.null",
+        "btc_price": "gt.0",
         "order": "created_at.asc",
     })
-    log.info(f"  {len(all_rows):,} total resolved rows fetched")
-    rows = [r for r in all_rows if r.get("btc_resolution_price") is not None]
-    log.info(f"  {len(rows):,} rows with btc_resolution_price")
-    return rows
+    log.info(f"  {len(all_rows):,} total rows with btc_price")
+
+    # Parse timestamps and build a time-sorted price array for lookahead matching
+    from datetime import datetime, timezone
+    timestamps = []
+    prices = []
+    for row in all_rows:
+        ts_str = row.get("created_at", "")
+        btc = row.get("btc_price")
+        if not ts_str or not btc:
+            continue
+        ts = datetime.fromisoformat(ts_str).timestamp()
+        timestamps.append(ts)
+        prices.append(float(btc))
+
+    ts_arr = np.array(timestamps)
+    px_arr = np.array(prices)
+    log.info(f"  Built price timeline: {len(ts_arr):,} points, "
+             f"span {(ts_arr[-1]-ts_arr[0])/3600:.1f} hours")
+
+    # For each row, find the BTC price ~5 min later using binary search
+    matched = 0
+    no_match = 0
+    for row in all_rows:
+        ts_str = row.get("created_at", "")
+        if not ts_str:
+            row["btc_future_price"] = None
+            no_match += 1
+            continue
+        ts = datetime.fromisoformat(ts_str).timestamp()
+        target_ts = ts + LOOKAHEAD_SECS
+        # Binary search for closest timestamp to target
+        idx = np.searchsorted(ts_arr, target_ts)
+        best_price = None
+        best_gap = LOOKAHEAD_TOLERANCE + 1
+        for candidate in [idx - 1, idx]:
+            if 0 <= candidate < len(ts_arr):
+                gap = abs(ts_arr[candidate] - target_ts)
+                if gap < best_gap:
+                    best_gap = gap
+                    best_price = px_arr[candidate]
+        if best_price is not None and best_gap <= LOOKAHEAD_TOLERANCE:
+            row["btc_future_price"] = float(best_price)
+            matched += 1
+        else:
+            row["btc_future_price"] = None
+            no_match += 1
+
+    log.info(f"  Lookahead matched: {matched:,}  no match: {no_match:,} "
+             f"({matched/(matched+no_match)*100:.1f}% match rate)")
+    return all_rows
+
+
+def _compute_sequence_features(rows):
+    """Pre-compute sequence features from consecutive snapshots within each condition_id."""
+    from collections import defaultdict, deque as dq
+
+    # Group row indices by condition_id
+    groups = defaultdict(list)
+    for i, row in enumerate(rows):
+        groups[row.get("condition_id", "")].append(i)
+
+    for cid, indices in groups.items():
+        prev_delta_cvd = 0.0
+        prev_delta_mom = 0.0
+        mom_signs = dq(maxlen=10)
+        ob_signs = dq(maxlen=10)
+
+        for idx in indices:
+            row = rows[idx]
+            dc = row.get("delta_cvd") or 0.0
+            dm = row.get("delta_momentum") or 0.0
+            m30 = row.get("momentum_30s") or 0.0
+            obi = row.get("ob_imbalance") or 0.0
+
+            # Only compute from DB if not already backfilled
+            if row.get("cvd_accel") is None:
+                row["cvd_accel"] = round(dc - prev_delta_cvd, 2)
+            if row.get("momentum_accel") is None:
+                row["momentum_accel"] = round(dm - prev_delta_mom, 6)
+
+            mom_signs.append(1 if m30 > 0 else (-1 if m30 < 0 else 0))
+            if row.get("momentum_consistency_10") is None:
+                if len(mom_signs) >= 3:
+                    current = mom_signs[-1]
+                    same = sum(1 for s in mom_signs if s == current)
+                    row["momentum_consistency_10"] = round(same / len(mom_signs), 2)
+
+            ob_signs.append(1 if obi > 0 else -1)
+            if row.get("ob_flip_count_10") is None:
+                if len(ob_signs) >= 3:
+                    row["ob_flip_count_10"] = sum(1 for i in range(1, len(ob_signs))
+                                                   if ob_signs[i] != ob_signs[i-1])
+
+            prev_delta_cvd = dc
+            prev_delta_mom = dm
 
 
 def build_v5_features(rows):
     """
     Build feature matrix for V5 futures model.
-    Labels based on BTC price movement (not Polymarket fills).
-    Features include Polymarket data as unique signal source.
+    Labels: BTC price 3 minutes from now vs current price (minus fees).
+    Every snapshot with a valid lookahead match is usable — no market dependency.
     """
+    # _compute_sequence_features(rows)  # disabled — sequence features not in V5 yet (accumulating in pipeline)
+
     cross_mkt = _build_cross_market_lookup(rows)
 
     records = []
@@ -258,10 +356,9 @@ def build_v5_features(rows):
     skipped = 0
 
     for row in rows:
-        ob = _f(row.get("outcome_binary"))
         pm = _f(row.get("p_market"))
         btc_price = _f(row.get("btc_price"))
-        btc_res   = _f(row.get("btc_resolution_price"))
+        btc_future = _f(row.get("btc_future_price"))
 
         str_val = _f(row.get("secs_to_resolution"))
         sl_val  = _f(row.get("secs_left"))
@@ -272,16 +369,16 @@ def build_v5_features(rows):
         else:
             str_ = np.nan
 
-        if np.isnan(ob) or np.isnan(pm) or np.isnan(str_):
+        if np.isnan(pm):
             skipped += 1; continue
-        if str_ < LEAKAGE_SECS:
-            skipped += 1; continue
-        if np.isnan(btc_price) or np.isnan(btc_res) or btc_price <= 0:
+        if np.isnan(str_) or str_ < 0:
+            str_ = 0.0  # snapshot after market expiry — treat as zero time left
+        if np.isnan(btc_price) or np.isnan(btc_future) or btc_price <= 0:
             skipped += 1; continue
 
-        # Futures labels: pure BTC price movement minus fees
-        edge_long  = (btc_res - btc_price) / btc_price - ROUND_TRIP
-        edge_short = (btc_price - btc_res) / btc_price - ROUND_TRIP
+        # Futures labels: BTC price 5 min from now minus fees
+        edge_long  = (btc_future - btc_price) / btc_price - ROUND_TRIP
+        edge_short = (btc_price - btc_future) / btc_price - ROUND_TRIP
 
         _cross = cross_mkt.get(row.get("condition_id", ""), {})
         mp = _f(row.get("market_progress"))

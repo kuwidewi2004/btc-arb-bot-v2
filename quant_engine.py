@@ -2185,6 +2185,11 @@ def _make_market_state() -> dict:
         "prev_funding_rate": 0.0,
         "prev_basis_pct":    0.0,
         "prev_trade_imb":    0.0,
+        # Sequence tracking — for LSTM-like features
+        "prev_delta_cvd":    0.0,
+        "prev_delta_mom":    0.0,
+        "mom_sign_history":  deque(maxlen=10),   # momentum sign per snapshot
+        "ob_sign_history":   deque(maxlen=10),   # OB imbalance sign per snapshot
         # Intra-market memory — backward-looking summary of this market so far
         "snapshots_seen":    0,
         "max_score":         0.0,        # highest ML score seen this market
@@ -2547,7 +2552,29 @@ def run():
                 binance_vwap = tick_30.get("vwap_displacement", 0.0)
                 xex_spread   = round(binance_vwap, 6)  # VWAP displacement IS the cross-exchange signal
 
+                # Sequence-aware features (LSTM-like for LightGBM)
+                cvd_accel = round(delta_cvd - cur["prev_delta_cvd"], 2)
+                momentum_accel = round(delta_momentum - cur["prev_delta_mom"], 6)
+
+                mom_sign = 1 if momentum_30s > 0 else (-1 if momentum_30s < 0 else 0)
+                cur["mom_sign_history"].append(mom_sign)
+                if len(cur["mom_sign_history"]) >= 3:
+                    same = sum(1 for s in cur["mom_sign_history"] if s == mom_sign)
+                    momentum_consistency_10 = round(same / len(cur["mom_sign_history"]), 2)
+                else:
+                    momentum_consistency_10 = 0.5
+
+                ob_sign = 1 if ob_imb_now > 0 else -1
+                cur["ob_sign_history"].append(ob_sign)
+                if len(cur["ob_sign_history"]) >= 3:
+                    ob_flip_count_10 = sum(1 for i in range(1, len(cur["ob_sign_history"]))
+                                           if cur["ob_sign_history"][i] != cur["ob_sign_history"][i-1])
+                else:
+                    ob_flip_count_10 = 0
+
                 # Update prev values for next cycle
+                cur["prev_delta_cvd"]     = delta_cvd
+                cur["prev_delta_mom"]     = delta_momentum
                 cur["prev_cvd_30s"]       = tick_30["cvd"]
                 cur["prev_taker_buy_30s"] = tick_30["taker_buy_ratio"]
                 cur["prev_momentum_30s"]  = momentum_30s
@@ -2893,6 +2920,11 @@ def run():
                         "tick_cvd_60s":              tick_60["cvd"],
                         "tick_taker_buy_ratio_60s":  tick_60["taker_buy_ratio"],
                         "tick_intensity_60s":        tick_60["trade_intensity"],
+                        # Sequence-aware features (LSTM-like)
+                        "cvd_accel":               cvd_accel,
+                        "momentum_accel":          momentum_accel,
+                        "momentum_consistency_10": momentum_consistency_10,
+                        "ob_flip_count_10":        ob_flip_count_10,
                         # Binance open interest + long/short ratio
                         "oi_value":            round(_oi_cache.get("open_interest", 0.0), 2),
                         "oi_change_5m":        round(_oi_cache.get("oi_change_5m", 0.0), 6),
