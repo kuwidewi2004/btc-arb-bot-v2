@@ -1,1 +1,1 @@
-web: python multi_strategy.py & python resolver.py & wait
+web: python quant_engine.py
