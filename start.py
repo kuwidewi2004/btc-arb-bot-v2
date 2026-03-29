@@ -3,6 +3,7 @@ print(f"START Python {sys.version}", flush=True)
 print(f"CWD: {os.getcwd()}", flush=True)
 print(f"FILES: {os.listdir('.')[:10]}", flush=True)
 
-# Skip lightgbm entirely — just launch the engine
-os.environ["SKIP_LIGHTGBM"] = "1"
+# Import and run the engine
 import quant_engine
+print("QUANT ENGINE v5.0 STARTING", flush=True)
+quant_engine.run()
