@@ -1,36 +1,33 @@
 """
 Quant Engine v5.0
 ==================
-BTC perpetual futures trading engine. Executes on dYdX v4 (Cosmos chain).
+BTC perpetual futures data collection + ML scoring engine.
+Executes on dYdX v4 (Cosmos chain) — currently paper mode, no live trading yet.
 Uses Polymarket 5-minute BTC markets as timing signal and sentiment source.
 
 Models:
-  v4 Primary   — P(profitable) classifier. Production model for trade timing.
-                  Scores every tick, trades when score > 0.60.
-  v5 Futures   — E(edge_long), E(edge_short) regressors. Future upgrade.
-                  Predicts BTC price movement directly. Not yet production.
+  v4 Primary   — P(profitable) + P(UP wins) classifiers loaded via ONNX.
+                  Scores every tick. Paper trade logging disabled because
+                  V4 model predicts Polymarket outcomes, not BTC futures.
+  v5 Futures   — E(edge_long), E(edge_short) regressors. Not yet wired
+                  in for execution.
 
-Execution:
-  - Venue: dYdX v4 BTC-USD perpetual (decentralized, no geo-blocking)
-  - Entry: open LONG or SHORT when V4 score > threshold
-  - Exit: close position when Polymarket market window expires (~5 min)
-  - Sizing: flat $10 per trade (V5 will enable proportional sizing)
+Data feeds (8 real-time sources):
+  - Coinbase WS:    BTC spot price (sub-second)
+  - Chainlink WS:   Polymarket RTDS (resolution price oracle)
+  - Binance WS x3:  liquidations, aggTrades (tick flow), depth (order book)
+  - Poly CLOB WS:   Polymarket trade stream (sentiment / flow imbalance)
+  - OKX REST:       funding rate, open interest, long/short ratio
+  - Deribit REST:    BTC implied volatility
 
-Data sources (7 real-time WebSockets):
-  - BTC spot:       Coinbase WebSocket (sub-second)
-  - Order book:     Binance futures depth WebSocket (100ms updates)
-  - Tick flow:      Binance aggTrades WebSocket (every trade)
-  - Liquidations:   Binance WebSocket (real-time)
-  - Chainlink:      Polymarket RTDS WebSocket (resolution price)
-  - Poly flow:      Polymarket CLOB WebSocket (trade imbalance, sentiment)
-  - REST:           OKX funding/basis/volume, Deribit IV (slower refresh)
+Features: Tier 4 — core + tick flow + Poly CLOB + OI + long/short ratio
+          + sequence features. Written to market_snapshots every ~3 seconds.
 
 Pipeline:
-  1. Collect 75+ features every ~2.7s via hybrid snapshot trigger
-  2. Score with LightGBM V4 (walk-forward validated, 4/4 kill tests pass)
-  3. Execute on dYdX when score > threshold (paper or live mode)
-  4. Write market_snapshots to Supabase (resolved by resolver.py)
-  5. Retrain daily — V4 for production, V5 futures in background
+  1. Collect features every ~3s via hybrid snapshot trigger
+  2. Score with ONNX V4 (walk-forward validated, 4/4 kill tests pass)
+  3. Write market_snapshots to Supabase (resolved by resolver.py)
+  4. Paper trade logging disabled (V4 model doesn't match dYdX futures)
 """
 
 import os

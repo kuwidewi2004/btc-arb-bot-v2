@@ -2,20 +2,20 @@
 V5 Futures Edge Regressor Training Pipeline
 =============================================
 Trains dual regressors for dYdX BTC-USD perpetual futures:
-  E(edge_long)  = (btc_price_5min_later - btc_price_now) / btc_price_now - fees
-  E(edge_short) = (btc_price_now - btc_price_5min_later) / btc_price_now - fees
+  E(edge_long)  = (btc_price_3min_later - btc_price_now) / btc_price_now - fees
+  E(edge_short) = (btc_price_now - btc_price_3min_later) / btc_price_now - fees
 
-Labels: 5-minute lookahead BTC price movement, minus 0.10% round-trip fees.
-Every snapshot with a valid 5-min lookahead is usable — no Polymarket resolution dependency.
-Features: 78 including Polymarket sentiment (unique edge over other futures traders).
+Labels: 3-minute lookahead BTC price movement (NOT market resolution),
+  minus 0.02% maker round-trip fees (0.01% per side, dYdX Tier 1).
+Features: 78 including Polymarket sentiment.
+Data fetch: cursor-based pagination (not OFFSET) to avoid Supabase timeouts.
+Spot OB features removed — permanently dead (Binance geo-block).
 
-This is the FUTURE production model for dYdX. V4 is the current production model.
-V5 replaces V4 when both correlations cross positive across 5+ folds.
+Walk-forward validation by condition_id grouping.
+_compute_sequence_features() available but disabled — accumulating in
+pipeline for future LSTM use.
 
-When ready, V5 enables:
-  - Model-driven direction: side = argmax(pred_long, pred_short)
-  - Model-driven sizing: size proportional to predicted edge
-  - No arbitrary threshold: predicted edge > 0 = trade
+Current best: corr ~+0.092, near break-even PnL with maker fees.
 
 Usage:
   python train_v5_futures.py
@@ -143,9 +143,12 @@ def _importance(model, fn, top_n=10):
         print(f"  {fname:<40} {sc:>8.1f}  {bar}")
 
 # Unified cost model — matches quant_engine.py and execution.py
-DYDX_TAKER_FEE = 0.0005   # 0.05% per side on dYdX
-ROUND_TRIP     = DYDX_TAKER_FEE * 2  # 0.10% round trip
-MIN_EDGE       = 0.0005   # 0.05% minimum edge for futures
+DYDX_MAKER_FEE = 0.0001   # 0.01% per side (1.0 bps) — Tier 1
+DYDX_TAKER_FEE = 0.0005   # 0.05% per side (5.0 bps) — Tier 1
+ROUND_TRIP_TAKER = DYDX_TAKER_FEE * 2   # 0.10% — worst case (market orders both sides)
+ROUND_TRIP_MAKER = DYDX_MAKER_FEE * 2   # 0.02% — best case (limit orders both sides)
+ROUND_TRIP       = ROUND_TRIP_MAKER      # train with maker fees — we'll use limit orders
+MIN_EDGE         = 0.0001               # 0.01% minimum edge filter
 
 
 def _build_cross_market_lookup(rows) -> dict:
@@ -208,7 +211,7 @@ LOOKAHEAD_SECS = 180  # 3-minute lookahead for future BTC price
 LOOKAHEAD_TOLERANCE = 15  # accept a match within ±15 seconds of target
 
 def fetch_snapshots_v5() -> list:
-    """Fetch ALL snapshots with btc_price, then compute 5-min lookahead labels."""
+    """Fetch ALL snapshots with btc_price, then compute 3-min lookahead labels."""
     log.info("Fetching market_snapshots for V5 (futures, 5-min lookahead)...")
     cols = ",".join([
         "created_at","condition_id","secs_left","secs_to_resolution","market_progress",

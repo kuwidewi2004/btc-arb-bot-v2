@@ -1,58 +1,27 @@
 """
 Resolution Tracker v3.5
 ========================
-Runs alongside multi_strategy.py on Railway.
+Runs as a separate Railway service.
 
-Every 60 seconds it:
-  1. Fetches all OPEN trades from Supabase where:
-       - resolved_outcome IS NULL  (not yet resolved)
-       - market_end_time IS NOT NULL (bot wrote it)
-  2. Checks Polymarket CLOB API for the actual market outcome.
-     Uses https://clob.polymarket.com/markets/{condition_id} and reads
-     winner=true from the tokens array.
-  3. If resolved: patches the exact row by integer id (primary key) with:
-       - resolved_outcome (UP / DOWN / VOID)
-       - actual_win (True / False / None for VOID)
-       - polymarket_final_price
-       - resolved_at timestamp
-       - pnl / flat_pnl / edge based on real outcome
-  4. If not yet resolved: skips — will retry next cycle
-  5. If market_end_time > 1 hour ago and still unresolved: marks VOID + gave_up_at
+Resolves three Supabase tables every 60 seconds:
 
-INDEPENDENT RESOLUTION (v3.2+):
-  - signal_snapshots and signal_log are resolved independently of trades.
-  - Any condition_id with unresolved rows in either table is checked against
-    the CLOB API and patched, even if no trade was placed on that market.
-  - Outcome cache is shared within each cycle to avoid duplicate CLOB calls.
+  market_snapshots — patches outcome_binary, btc_resolution_price,
+      edge_realized, price_vs_resolution_pct, secs_to_resolution.
+  trades — resolves OPEN trades via Polymarket CLOB outcome (UP/DOWN/VOID),
+      computes pnl/flat_pnl/edge. VOIDs after 1 hour unresolved.
+  paper_trades — finds trades with no exit_price, looks up BTC price
+      3 minutes after entry (from market_snapshots), computes PnL.
 
-NOTE: Patching is done by integer id (primary key) not trade_id UUID,
-because Supabase REST API uuid column filtering is unreliable.
-trade_id is still stored on every row for reference and traceability.
+Data sources:
+  - Polymarket CLOB API for market outcomes (tokens[].winner)
+  - Coinbase primary, Kraken fallback for BTC spot price at resolution
 
-Summary queries only OPEN rows where resolved_outcome IS NOT NULL,
-so all win-rate stats are 100% ground truth from Polymarket.
+Independent resolution (v3.2+): signal_log and market_snapshots are
+resolved for any condition_id with unresolved rows, even if no trade
+was placed. Outcome cache is shared within each cycle to avoid
+duplicate CLOB calls.
 
-Fixes applied (v3.5):
-  - fetch_btc_price() added — Coinbase primary, Kraken fallback.
-    Called once per resolved market to capture BTC price at resolution.
-  - resolve_market_snapshots() now patches three additional fields:
-      btc_resolution_price   — BTC spot price at the moment of resolution
-                               (same value for all rows in a market)
-      price_vs_resolution_pct — per-row: how much BTC moved between the
-                               snapshot and resolution. Critical ML feature
-                               for understanding reversal patterns.
-                               = (btc_resolution - btc_at_snapshot) / btc_at_snapshot * 100
-      secs_to_resolution     — per-row: how many seconds remained between
-                               the snapshot and market resolution.
-                               = (market_end_time - snapshot created_at)
-  - resolve_pending_trades() now fetches BTC price at resolution and passes
-    it to resolve_market_snapshots() and resolve_signal_logs().
-  - resolve_independent_signals() similarly passes btc_resolution_price.
-  - Required new Supabase columns (add before deploying):
-      ALTER TABLE market_snapshots
-        ADD COLUMN IF NOT EXISTS btc_resolution_price   numeric,
-        ADD COLUMN IF NOT EXISTS price_vs_resolution_pct numeric,
-        ADD COLUMN IF NOT EXISTS secs_to_resolution     numeric;
+Patching is by integer id (primary key), not trade_id UUID.
 """
 
 import os
@@ -111,7 +80,7 @@ KRAKEN_API   = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
 def fetch_btc_price() -> float:
     """
     Fetch current BTC spot price at the moment of market resolution.
-    Coinbase primary, Kraken fallback — same sources as multi_strategy.py.
+    Coinbase primary, Kraken fallback.
     Called once per resolved market so the resolution price is captured
     as close to the actual resolution moment as possible.
     Returns 0.0 on failure — callers must handle gracefully.
