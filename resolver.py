@@ -256,7 +256,7 @@ def resolve_signal_logs(outcome: str, condition_id: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        outcome_binary = 1.0 if outcome == "UP" else 0.0
+        outcome_binary = 1 if outcome == "UP" else 0
 
         # Step 1: fetch unresolved signal_log rows for this market
         # so we can compute actual_win per row based on p_market
@@ -318,7 +318,7 @@ def resolve_market_snapshots(outcome: str, condition_id: str,
 
     Patches six fields per row:
       resolved_outcome        — "UP" or "DOWN" (classification label)
-      outcome_binary          — 1.0 if UP won, 0.0 if DOWN won
+      outcome_binary          — 1 if UP won, 0 if DOWN won
       edge_realized           — outcome_binary - p_market (per-row profitability label)
       btc_resolution_price    — BTC spot price at market resolution (same for all rows)
       price_vs_resolution_pct — per-row: % BTC moved from snapshot to resolution
@@ -338,7 +338,7 @@ def resolve_market_snapshots(outcome: str, condition_id: str,
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
     try:
-        outcome_binary = 1.0 if outcome == "UP" else 0.0
+        outcome_binary = 1 if outcome == "UP" else 0
 
         # Parse market end time for secs_to_resolution computation
         market_end_dt = None
@@ -632,6 +632,112 @@ def resolve_pending_trades(outcome_cache: dict) -> int:
     return resolved_count
 
 
+def resolve_paper_trades():
+    """
+    Resolve paper trades: find trades with no exit_price,
+    look up the BTC price 3 minutes after entry, compute PnL.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+
+    try:
+        # Fetch unresolved paper trades (no exit_price yet)
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/paper_trades",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            params={
+                "select": "id,created_at,side,entry_price",
+                "exit_price": "is.null",
+                "order": "created_at.asc",
+                "limit": "50",
+            },
+            timeout=10,
+        )
+        trades = r.json()
+        if not trades or not isinstance(trades, list):
+            return 0
+
+        resolved = 0
+        now = time.time()
+
+        for trade in trades:
+            trade_id = trade["id"]
+            entry_price = trade["entry_price"]
+            side = trade["side"]
+            created_at = trade["created_at"]
+
+            # Parse trade timestamp
+            from datetime import datetime, timezone
+            trade_ts = datetime.fromisoformat(created_at).timestamp()
+
+            # Need 3 minutes to have passed
+            if now - trade_ts < 200:  # 3min20s buffer
+                continue
+
+            # Find snapshot closest to 3 min after this trade
+            target_ts = datetime.fromtimestamp(trade_ts + 180, tz=timezone.utc).isoformat()
+            r2 = requests.get(
+                f"{SUPABASE_URL}/rest/v1/market_snapshots",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                },
+                params={
+                    "select": "btc_price,created_at",
+                    "created_at": f"gte.{target_ts}",
+                    "btc_price": "gt.0",
+                    "order": "created_at.asc",
+                    "limit": "1",
+                },
+                timeout=10,
+            )
+            snaps = r2.json()
+            if not snaps or not isinstance(snaps, list) or not snaps[0].get("btc_price"):
+                continue
+
+            exit_price = float(snaps[0]["btc_price"])
+
+            # Compute PnL
+            if side == "UP" or side == "LONG":
+                pnl_pct = (exit_price - entry_price) / entry_price * 100 - 0.10  # minus fees
+            else:
+                pnl_pct = (entry_price - exit_price) / entry_price * 100 - 0.10
+            pnl_usd = pnl_pct / 100 * 10.0  # $10 position size
+
+            # Patch the trade
+            r3 = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/paper_trades",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                params={"id": f"eq.{trade_id}"},
+                json={
+                    "exit_price": round(exit_price, 2),
+                    "pnl_pct": round(pnl_pct, 4),
+                    "pnl_usd": round(pnl_usd, 4),
+                    "edge_actual": round(pnl_pct + 0.10, 4),  # edge before fees
+                },
+                timeout=10,
+            )
+            if r3.status_code < 300:
+                resolved += 1
+                result = "WIN" if pnl_pct > 0 else "LOSS"
+                log.info(f"[Paper] {result} {side} entry=${entry_price:,.2f} exit=${exit_price:,.2f} "
+                         f"PnL={pnl_pct:+.4f}% (${pnl_usd:+.4f})")
+
+        return resolved
+
+    except Exception as e:
+        log.warning(f"Paper trade resolution failed: {e}")
+        return 0
+
+
 def resolve_independent_signals(outcome_cache: dict):
     """
     Independently resolve signal_log for any condition_id that has unresolved
@@ -733,6 +839,11 @@ def run():
 
             # Independently resolve snapshots/signal_log even with no trades
             resolve_independent_signals(outcome_cache)
+
+            # Resolve paper trades — fill in exit_price and PnL
+            paper_count = resolve_paper_trades()
+            if paper_count > 0:
+                log.info(f"Resolved {paper_count} paper trade(s)")
 
             if time.time() - last_summary > 1800:
                 print_summary()
