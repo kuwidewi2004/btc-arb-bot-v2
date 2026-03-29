@@ -2564,7 +2564,7 @@ def run():
                 else:
                     momentum_consistency_10 = 0.5
 
-                ob_sign = 1 if ob_imb_now > 0 else -1
+                ob_sign = 1 if _ob_cache.get("imbalance", 0.0) > 0 else -1
                 cur["ob_sign_history"].append(ob_sign)
                 if len(cur["ob_sign_history"]) >= 3:
                     ob_flip_count_10 = sum(1 for i in range(1, len(cur["ob_sign_history"]))
