@@ -248,17 +248,20 @@ def _cache_ages() -> dict:
 # is blocked. Uses 1-tick lag (score computed after snapshot variables ready).
 import pickle as _pickle
 
-# Pre-check: can lightgbm load? If not, skip all model loading to avoid segfault.
+# Pre-check: can lightgbm load? Test in subprocess to avoid segfault killing main process.
 _lgbm_available = False
-if os.environ.get("SKIP_LIGHTGBM") != "1":
-    try:
+try:
+    import subprocess as _sp
+    _rc = _sp.call([sys.executable, "-c", "import lightgbm; print('ok')"],
+                   timeout=10, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    if _rc == 0:
         import lightgbm
         _lgbm_available = True
         log.info(f"lightgbm {lightgbm.__version__} available")
-    except Exception as _e:
-        log.warning(f"lightgbm NOT available: {_e} — ML scoring disabled")
-else:
-    log.warning("lightgbm SKIPPED via SKIP_LIGHTGBM=1 — ML scoring disabled")
+    else:
+        log.warning(f"lightgbm subprocess test failed (rc={_rc}) — ML scoring disabled")
+except Exception as _e:
+    log.warning(f"lightgbm check failed: {_e} — ML scoring disabled")
 
 _ml_scores: dict  = {}    # condition_id -> latest P(profitable)
 _ml_bundle        = None
