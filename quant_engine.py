@@ -838,25 +838,9 @@ def refresh_shared_data():
     if time.time() - _iv_cache["fetched_at"] >= 300:
         _fetch_deribit_iv()
 
-    # OKX open interest — how crowded is the BTC futures market?
-    # Rapid OI increase + price stall = potential liquidation cascade
-    # (Binance fapi REST is geo-blocked from Railway US; OKX works fine)
-    if now - _oi_cache["fetched_at"] >= 30:
-        try:
-            r = _session.get(
-                f"{OKX_BASE}/api/v5/public/open-interest",
-                params={"instType": "SWAP", "instId": OKX_BTC}, timeout=5)
-            r.raise_for_status()
-            data = r.json().get("data", [{}])[0]
-            new_oi = float(data.get("oiCcy", 0))  # OI in BTC
-            prev_oi = _oi_cache["open_interest"]
-            _oi_cache["oi_change_5m"] = round((new_oi - prev_oi) / max(prev_oi, 1.0), 6) if prev_oi > 0 else 0.0
-            _oi_cache["open_interest"] = new_oi
-            _oi_cache["fetched_at"] = now
-        except Exception as e:
-            log.warning(f"OKX OI fetch failed: {e}")
+    # OKX OI + funding now via WebSocket (start_okx_ws), no REST polling needed.
 
-    # OKX long/short ratio — contract-level positioning
+    # OKX long/short ratio — contract-level positioning (no WS channel, keep REST)
     # Extreme readings (>2.0 or <0.5) = contrarian signal
     if now - _lsr_cache["fetched_at"] >= 60:
         try:
@@ -876,20 +860,7 @@ def refresh_shared_data():
         except Exception as e:
             log.warning(f"OKX LSR fetch failed: {e}")
 
-    # Basis via OKX mark price vs spot
-    if now - _basis_cache["fetched_at"] >= 10:
-        try:
-            r = _session.get(
-                f"{OKX_BASE}/api/v5/public/mark-price",
-                params={"instType": "SWAP", "instId": OKX_BTC},
-                timeout=5)
-            r.raise_for_status()
-            data = r.json().get("data", [{}])[0]
-            _basis_cache["futures"]    = float(data.get("markPx", 0))
-            _basis_cache["spot"]       = _price_cache["btc"]
-            _basis_cache["fetched_at"] = now
-        except Exception as e:
-            log.warning(f"Basis fetch failed: {e}")
+    # Basis now updated via OKX tickers WebSocket (start_okx_ws).
 
     # Liquidations via OKX — 2-minute window, refreshed every 60s
     # _liq_cache holds OKX-only values. Binance WebSocket data is combined
@@ -1573,6 +1544,93 @@ def start_binance_spot_depth_ws():
     t = threading.Thread(target=_binance_spot_depth_ws_thread, daemon=True)
     t.start()
     log.info("[Binance Spot Depth] Background thread started")
+
+
+# ── OKX WebSocket — real-time OI, funding, tickers ────────────────────────
+# Replaces REST polling for OI (was 30s) and funding (was 60s).
+# OI updates every ~4s, funding every ~7s via WebSocket.
+
+_OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+
+
+def _on_okx_ws_message(ws, message):
+    """Handle OKX WebSocket messages for OI, funding, and tickers."""
+    try:
+        d = json.loads(message)
+        if "data" not in d:
+            return
+        channel = d.get("arg", {}).get("channel", "")
+        data = d["data"][0]
+
+        if channel == "open-interest":
+            new_oi = float(data.get("oiCcy", 0))
+            prev_oi = _oi_cache["open_interest"]
+            if prev_oi > 0:
+                _oi_cache["oi_change_5m"] = round((new_oi - prev_oi) / prev_oi, 6)
+            _oi_cache["open_interest"] = new_oi
+            _oi_cache["fetched_at"] = time.time()
+
+        elif channel == "funding-rate":
+            fr = float(data.get("fundingRate", 0))
+            _funding_cache["okx"] = fr
+            _funding_cache["rate"] = (_funding_cache["okx"] + _funding_cache["binance"]) / 2
+            _funding_cache["fetched_at"] = time.time()
+
+        elif channel == "tickers":
+            # OKX futures price — use as secondary price source for basis
+            futures_px = float(data.get("last", 0))
+            if futures_px > 0:
+                _basis_cache["futures"] = futures_px
+                _basis_cache["spot"] = _price_cache["btc"]
+                _basis_cache["fetched_at"] = time.time()
+
+    except Exception as e:
+        log.debug(f"[OKX WS] parse error: {e}")
+
+
+def _on_okx_ws_open(ws):
+    log.info("[OKX WS] Connected — subscribing to OI, funding, tickers")
+    ws.send(json.dumps({
+        "op": "subscribe",
+        "args": [
+            {"channel": "open-interest", "instId": OKX_BTC},
+            {"channel": "funding-rate", "instId": OKX_BTC},
+            {"channel": "tickers", "instId": OKX_BTC},
+        ]
+    }))
+
+
+def _on_okx_ws_error(ws, error):
+    log.warning(f"[OKX WS] error: {error}")
+
+
+def _on_okx_ws_close(ws, code, msg):
+    log.warning(f"[OKX WS] closed ({code}) — will reconnect")
+
+
+def _okx_ws_thread():
+    """Background thread: persistent WebSocket to OKX for OI + funding."""
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                _OKX_WS_URL,
+                on_open=_on_okx_ws_open,
+                on_message=_on_okx_ws_message,
+                on_error=_on_okx_ws_error,
+                on_close=_on_okx_ws_close,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            log.warning(f"[OKX WS] thread exception: {e}")
+        log.info("[OKX WS] Reconnecting in 5s...")
+        time.sleep(5)
+
+
+def start_okx_ws():
+    """Start the OKX WebSocket in a daemon background thread."""
+    t = threading.Thread(target=_okx_ws_thread, daemon=True)
+    t.start()
+    log.info("[OKX WS] Background thread started")
 
 
 def get_spot_futures_divergence() -> dict:
@@ -2315,6 +2373,7 @@ def run():
     start_binance_trades_ws()
     start_binance_depth_ws()
     # start_binance_spot_depth_ws()  # disabled — Binance spot API geo-blocked on Railway US
+    start_okx_ws()
     start_poly_trades_ws()
     log.info("Waiting 3s for WebSocket connections to establish...")
     time.sleep(3)

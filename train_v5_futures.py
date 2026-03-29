@@ -242,6 +242,7 @@ def fetch_snapshots_v5() -> list:
     all_rows = _rest_fetch("market_snapshots", {
         "select": cols,
         "btc_price": "gt.0",
+        "outcome_binary": "not.is.null",
         "order": "created_at.asc",
     })
     log.info(f"  {len(all_rows):,} total rows with btc_price")
