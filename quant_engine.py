@@ -248,15 +248,27 @@ def _cache_ages() -> dict:
 # is blocked. Uses 1-tick lag (score computed after snapshot variables ready).
 import pickle as _pickle
 
+# Pre-check: can lightgbm load? If not, skip all model loading to avoid segfault.
+_lgbm_available = False
+try:
+    import lightgbm
+    _lgbm_available = True
+    log.info(f"lightgbm {lightgbm.__version__} available")
+except Exception as _e:
+    log.warning(f"lightgbm NOT available: {_e} — ML scoring disabled")
+
 _ml_scores: dict  = {}    # condition_id -> latest P(profitable)
 _ml_bundle        = None
 
-try:
-    with open("model_v4_profitable.pkl", "rb") as _mf:
-        _ml_bundle = _pickle.load(_mf)
-    log.info(f"ML bundle loaded: {len(_ml_bundle['features'])} features")
-except Exception as _e:
-    log.warning(f"ML bundle NOT loaded: {_e}  — gate disabled")
+if _lgbm_available:
+    try:
+        with open("model_v4_profitable.pkl", "rb") as _mf:
+            _ml_bundle = _pickle.load(_mf)
+        log.info(f"ML bundle loaded: {len(_ml_bundle['features'])} features")
+    except Exception as _e:
+        log.warning(f"ML bundle NOT loaded: {_e}  — gate disabled")
+else:
+    log.warning("ML bundle NOT loaded: lightgbm unavailable — gate disabled")
 
 # Encoding maps — must match train_model_v4_rest.py exactly
 _ML_REGIME_ENC   = {"TREND_UP": 2, "TREND_DOWN": -2, "VOLATILE": 1, "CALM": 0, "DEAD": -1}
@@ -267,12 +279,13 @@ _ML_BUCKET_ENC   = {"heavy_fav": 3, "favourite": 2, "underdog": 1, "longshot": 0
 
 # No-pmarket variant (microstructure-only — p_market features excluded)
 _ml_bundle_npm = None
-try:
-    with open("model_v4_nopmarket.pkl", "rb") as _mf2:
-        _ml_bundle_npm = _pickle.load(_mf2)
-    log.info(f"ML nopmarket bundle loaded: {len(_ml_bundle_npm['features'])} features")
-except Exception as _e:
-    log.warning(f"ML nopmarket bundle NOT loaded: {_e}")
+if _lgbm_available:
+    try:
+        with open("model_v4_nopmarket.pkl", "rb") as _mf2:
+            _ml_bundle_npm = _pickle.load(_mf2)
+        log.info(f"ML nopmarket bundle loaded: {len(_ml_bundle_npm['features'])} features")
+    except Exception as _e:
+        log.warning(f"ML nopmarket bundle NOT loaded: {_e}")
 
 _ml_scores_npm: dict = {}  # condition_id -> P(profitable) from nopmarket model
 
@@ -292,12 +305,13 @@ _prev_market: dict = {
     "streak_up":          0.0,
     "streak_down":        0.0,
 }
-try:
-    with open("model_v4_direction.pkl", "rb") as _mf3:
-        _ml_bundle_dir = _pickle.load(_mf3)
-    log.info(f"ML direction bundle loaded: {len(_ml_bundle_dir['features'])} features")
-except Exception as _e:
-    log.warning(f"ML direction bundle NOT loaded: {_e}")
+if _lgbm_available:
+    try:
+        with open("model_v4_direction.pkl", "rb") as _mf3:
+            _ml_bundle_dir = _pickle.load(_mf3)
+        log.info(f"ML direction bundle loaded: {len(_ml_bundle_dir['features'])} features")
+    except Exception as _e:
+        log.warning(f"ML direction bundle NOT loaded: {_e}")
 
 
 def _update_ml_score(condition_id: str, secs_to_res: float, market_progress: float,

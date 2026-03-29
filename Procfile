@@ -1,1 +1,1 @@
-web: apt-get update -qq && apt-get install -y -qq libgomp1 2>/dev/null; python start.py
+web: python start.py
