@@ -284,15 +284,15 @@ try:
 
     # Load ONNX models + metadata
     import json as _json
-    with open("model_v4_onnx_meta.json", "r") as _mf:
+    with open("models/model_v4_onnx_meta.json", "r") as _mf:
         _meta = _json.load(_mf)
     _ml_features = _meta["features"]
     _ml_imputer_medians = np.array(_meta["imputer_medians"], dtype=np.float32)
     _ml_dir_features = _meta["dir_features"]
     _ml_dir_imputer_medians = np.array(_meta["dir_imputer_medians"], dtype=np.float32)
 
-    _ml_onnx_session = _ort.InferenceSession("model_v4_profitable.onnx")
-    _ml_dir_onnx_session = _ort.InferenceSession("model_v4_direction.onnx")
+    _ml_onnx_session = _ort.InferenceSession("models/model_v4_profitable.onnx")
+    _ml_dir_onnx_session = _ort.InferenceSession("models/model_v4_direction.onnx")
     _ml_bundle = {"features": _ml_features}  # minimal compat
     log.info(f"ML ONNX loaded: profitable ({len(_ml_features)} features) + direction ({len(_ml_dir_features)} features)")
 except Exception as _e:

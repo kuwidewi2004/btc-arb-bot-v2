@@ -1985,7 +1985,7 @@ def main():
         edge = act - base_pct
         print(f"  {lo:.2f}-{hi:.2f}      {n:>7,}  {act:>7.1f}%  {base_pct:>6.1f}%  {edge:>+6.1f}%")
 
-    with open("model_v4_profitable.pkl", "wb") as f:
+    with open("models/model_v4_profitable.pkl", "wb") as f:
         pickle.dump({
             "classifier":     final_model,
             "classifier_imp": final_imp,
@@ -2008,7 +2008,7 @@ def main():
     npm_fn   = [fn[i] for i in npm_mask]
     X_npm    = X[:, npm_mask]
     npm_model, npm_imp = _train(X_npm, yp, n_est=200, leaves=25, calibration=cal_method_final)
-    with open("model_v4_nopmarket.pkl", "wb") as f:
+    with open("models/model_v4_nopmarket.pkl", "wb") as f:
         pickle.dump({
             "classifier":     npm_model,
             "classifier_imp": npm_imp,
@@ -2112,7 +2112,7 @@ def main():
     print(f"\n  Direction model feature importance (top 15):")
     _importance(dir_final, fn, top_n=15)
 
-    with open("model_v4_direction.pkl", "wb") as f:
+    with open("models/model_v4_direction.pkl", "wb") as f:
         pickle.dump({
             "classifier":     dir_final,
             "classifier_imp": dir_imp_final,
@@ -2173,7 +2173,7 @@ def main():
         print("  Feature importance above shows what early-market conditions")
         print("  predict outcome — use these to build new strategies.")
 
-    with open("model_v4_market.pkl", "wb") as f:
+    with open("models/model_v4_market.pkl", "wb") as f:
         pickle.dump({"model": m3_final, "imputer": imp3_final, "features": fn3,
                      "target": "direction", "early_phase_only": True}, f)
     log.info("  Saved model_v4_market.pkl")

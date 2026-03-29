@@ -657,7 +657,7 @@ def main():
     _importance(final_down, fn, top_n=15)
 
     # Save
-    with open("model_v5_edge.pkl", "wb") as f:
+    with open("models/model_v5_edge.pkl", "wb") as f:
         pickle.dump({
             "regressor_up":      final_up,
             "regressor_up_imp":  imp_up,
