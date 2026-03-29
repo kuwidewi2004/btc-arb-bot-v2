@@ -178,6 +178,28 @@ def _sb_fetch_all(table: str, params: dict) -> list:
     return rows
 
 
+def supabase_paper_trade(trade: dict):
+    """Log a paper trade decision to Supabase for tracking."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        r = _session.post(
+            f"{SUPABASE_URL}/rest/v1/paper_trades",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            json=trade,
+            timeout=5,
+        )
+        if r.status_code >= 400:
+            log.warning(f"paper_trade insert HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"paper_trade insert failed: {e}")
+
+
 def supabase_market_snapshot(snapshot: dict):
     """Insert one snapshot row — the primary ML training table."""
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -246,38 +268,44 @@ def _cache_ages() -> dict:
     }
 
 
-# ─────────────────────────────────────────── ML GATE (Option A) ────────────
+# ─────────────────────────────────────────── ML GATE (ONNX) ────────────
 # Model scores every market each tick. If P(profitable) < threshold, open()
-# is blocked. Uses 1-tick lag (score computed after snapshot variables ready).
+# is blocked. Uses ONNX runtime — no lightgbm/libgomp dependency.
 import pickle as _pickle
 
-# Pre-check: can lightgbm load? Test in subprocess to avoid segfault killing main process.
-_lgbm_available = False
+_ml_onnx_session = None
+_ml_dir_onnx_session = None
+_ml_features = None
+_ml_imputer_medians = None
+_ml_dir_features = None
+_ml_dir_imputer_medians = None
+_ml_bundle = None  # kept for backward compat checks
+
 try:
-    import subprocess as _sp
-    _rc = _sp.call([sys.executable, "-c", "import lightgbm; print('ok')"],
-                   timeout=10, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-    if _rc == 0:
-        import lightgbm
-        _lgbm_available = True
-        log.info(f"lightgbm {lightgbm.__version__} available")
-    else:
-        log.warning(f"lightgbm subprocess test failed (rc={_rc}) — ML scoring disabled")
+    import onnxruntime as _ort
+    _ort.set_default_logger_severity(3)  # suppress ONNX warnings
+
+    # Load ONNX models + metadata
+    import json as _json
+    with open("model_v4_onnx_meta.json", "r") as _mf:
+        _meta = _json.load(_mf)
+    _ml_features = _meta["features"]
+    _ml_imputer_medians = np.array(_meta["imputer_medians"], dtype=np.float32)
+    _ml_dir_features = _meta["dir_features"]
+    _ml_dir_imputer_medians = np.array(_meta["dir_imputer_medians"], dtype=np.float32)
+
+    _ml_onnx_session = _ort.InferenceSession("model_v4_profitable.onnx")
+    _ml_dir_onnx_session = _ort.InferenceSession("model_v4_direction.onnx")
+    _ml_bundle = {"features": _ml_features}  # minimal compat
+    log.info(f"ML ONNX loaded: profitable ({len(_ml_features)} features) + direction ({len(_ml_dir_features)} features)")
 except Exception as _e:
-    log.warning(f"lightgbm check failed: {_e} — ML scoring disabled")
+    log.warning(f"ML ONNX NOT loaded: {_e} — scoring disabled")
 
 _ml_scores: dict  = {}    # condition_id -> latest P(profitable)
-_ml_bundle        = None
-
-if _lgbm_available:
-    try:
-        with open("model_v4_profitable.pkl", "rb") as _mf:
-            _ml_bundle = _pickle.load(_mf)
-        log.info(f"ML bundle loaded: {len(_ml_bundle['features'])} features")
-    except Exception as _e:
-        log.warning(f"ML bundle NOT loaded: {_e}  — gate disabled")
-else:
-    log.warning("ML bundle NOT loaded: lightgbm unavailable — gate disabled")
+_ml_scores_npm: dict = {}
+_ml_scores_dir: dict = {}
+_ml_bundle_npm = None
+_ml_bundle_dir = _ml_dir_onnx_session  # truthy if loaded
 
 # Encoding maps — must match train_model_v4_rest.py exactly
 _ML_REGIME_ENC   = {"TREND_UP": 2, "TREND_DOWN": -2, "VOLATILE": 1, "CALM": 0, "DEAD": -1}
@@ -285,22 +313,6 @@ _ML_SESSION_ENC  = {"OVERLAP": 3, "US": 2, "LONDON": 1, "ASIA": 0, "OFFPEAK": -1
 _ML_ACTIVITY_ENC = {"HIGH": 2, "NORMAL": 1, "LOW": 0, "DEAD": -1}
 _ML_DAY_ENC      = {"WEEKDAY": 1, "WEEKEND": 0}
 _ML_BUCKET_ENC   = {"heavy_fav": 3, "favourite": 2, "underdog": 1, "longshot": 0}
-
-# No-pmarket variant (microstructure-only — p_market features excluded)
-_ml_bundle_npm = None
-if _lgbm_available:
-    try:
-        with open("model_v4_nopmarket.pkl", "rb") as _mf2:
-            _ml_bundle_npm = _pickle.load(_mf2)
-        log.info(f"ML nopmarket bundle loaded: {len(_ml_bundle_npm['features'])} features")
-    except Exception as _e:
-        log.warning(f"ML nopmarket bundle NOT loaded: {_e}")
-
-_ml_scores_npm: dict = {}  # condition_id -> P(profitable) from nopmarket model
-
-# Direction model: P(UP wins | features) — tells you WHICH side to bet
-_ml_bundle_dir = None
-_ml_scores_dir: dict = {}  # condition_id -> P(UP wins)
 
 # Cross-market state: tracks previous market's outcome and features
 _prev_market: dict = {
@@ -531,23 +543,28 @@ def _update_ml_score(condition_id: str, secs_to_res: float, market_progress: flo
             "tick_taker_buy_ratio_60s": float(tick_taker_buy_60s),
             "tick_intensity_60s":     float(tick_intensity_60s),
         }
-        fn = _ml_bundle["features"]
+        fn = _ml_features
         missing = [k for k in fn if k not in f]
         if missing:
             log.warning(f"ML gate: {len(missing)} missing features {missing[:5]} — score unreliable")
         X  = np.array([[f.get(k, float('nan')) for k in fn]], dtype=np.float32)
-        # Apply saved imputer before scoring — must match training pipeline exactly
-        X  = _ml_bundle["classifier_imp"].transform(X)
-        p  = float(_ml_bundle["classifier"].predict_proba(X)[0][1])
+        # Apply imputer — replace NaN with training medians
+        nan_mask = np.isnan(X[0])
+        X[0, nan_mask] = _ml_imputer_medians[nan_mask]
+        # ONNX inference
+        result = _ml_onnx_session.run(None, {"features": X})
+        p  = float(result[1][0][1])  # result[1] = probabilities, [0][1] = P(class=1)
         _ml_scores[condition_id] = p
 
-        # Score direction model: P(UP wins) — same features as primary
-        if _ml_bundle_dir is not None:
+        # Score direction model: P(UP wins) — same features
+        if _ml_dir_onnx_session is not None:
             try:
-                fn_dir = _ml_bundle_dir["features"]
+                fn_dir = _ml_dir_features
                 X_dir  = np.array([[f.get(k, float('nan')) for k in fn_dir]], dtype=np.float32)
-                X_dir  = _ml_bundle_dir["classifier_imp"].transform(X_dir)
-                p_up   = float(_ml_bundle_dir["classifier"].predict_proba(X_dir)[0][1])
+                nan_mask_dir = np.isnan(X_dir[0])
+                X_dir[0, nan_mask_dir] = _ml_dir_imputer_medians[nan_mask_dir]
+                result_dir = _ml_dir_onnx_session.run(None, {"features": X_dir})
+                p_up   = float(result_dir[1][0][1])
                 _ml_scores_dir[condition_id] = p_up
             except Exception as e2:
                 log.debug(f"ML direction score error: {e2}")
@@ -2775,6 +2792,26 @@ def run():
                                 ef.write(json.dumps(exec_record) + "\n")
                         except Exception:
                             pass
+
+                        # Log to Supabase paper_trades table
+                        if would_trade:
+                            threading.Thread(target=supabase_paper_trade, daemon=True, args=({
+                                "condition_id":    mkt.condition_id,
+                                "side":            quant_side,
+                                "entry_price":     round(spot, 2),
+                                "score":           round(quant_score, 4),
+                                "edge_predicted":  round(quant_fill - 0.5, 4) if quant_fill else None,
+                                "hold_secs":       round(secs_left, 1),
+                                "features":        json.dumps({
+                                    "p_market": round(poly_up_mid, 4),
+                                    "ob_imbalance": round(float(_ob_cache.get("imbalance", 0.0)), 4),
+                                    "momentum_30s": round(momentum_30s, 6),
+                                    "funding_rate": round(float(_funding_cache.get("rate", 0.0)), 6),
+                                    "tick_cvd_30s": round(tick_30["cvd"], 2),
+                                    "oi_value": round(_oi_cache.get("open_interest", 0.0), 2),
+                                    "long_short_ratio": _lsr_cache.get("long_short_ratio", 1.0),
+                                }),
+                            },)).start()
 
                         if would_trade and executor.position is None:
                             # Data quality gate — don't trade on stale or missing data

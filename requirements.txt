@@ -4,4 +4,4 @@ numpy>=1.24.0
 py-clob-client>=0.14.0
 scikit-learn>=1.3.0
 websocket-client>=1.6.0
-# lightgbm removed — causes segfault on Railway (missing libgomp)
+onnxruntime>=1.17.0
