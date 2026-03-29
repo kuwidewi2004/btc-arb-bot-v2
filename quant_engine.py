@@ -226,6 +226,9 @@ _liq_cache:      dict  = {"long": 0.0, "short": 0.0, "fetched_at": 0.0}
 _vol_cache:      dict  = {"range_pct": 0.0, "fetched_at": 0.0}
 _ob_cache:       dict  = {"imbalance": 0.0, "bid_depth": 0.0, "ask_depth": 0.0,
                            "fetched_at": 0.0}
+_oi_cache:       dict  = {"open_interest": 0.0, "oi_change_5m": 0.0, "fetched_at": 0.0}
+_lsr_cache:      dict  = {"long_short_ratio": 1.0, "long_account_pct": 0.5,
+                           "short_account_pct": 0.5, "fetched_at": 0.0}
 
 
 def _cache_ages() -> dict:
@@ -827,6 +830,40 @@ def refresh_shared_data():
     # Deribit IV — forward-looking vol signal, refresh every 5 min
     if time.time() - _iv_cache["fetched_at"] >= 300:
         _fetch_deribit_iv()
+
+    # Binance open interest — how crowded is the BTC futures market?
+    # Rapid OI increase + price stall = potential liquidation cascade
+    if now - _oi_cache["fetched_at"] >= 30:
+        try:
+            r = _session.get(
+                "https://fapi.binance.com/fapi/v1/openInterest",
+                params={"symbol": "BTCUSDT"}, timeout=5)
+            r.raise_for_status()
+            new_oi = float(r.json().get("openInterest", 0))
+            prev_oi = _oi_cache["open_interest"]
+            _oi_cache["oi_change_5m"] = round((new_oi - prev_oi) / max(prev_oi, 1.0), 6) if prev_oi > 0 else 0.0
+            _oi_cache["open_interest"] = new_oi
+            _oi_cache["fetched_at"] = now
+        except Exception as e:
+            log.warning(f"Binance OI fetch failed: {e}")
+
+    # Binance long/short ratio — account-level positioning
+    # Extreme readings (>2.0 or <0.5) = contrarian signal
+    if now - _lsr_cache["fetched_at"] >= 60:
+        try:
+            r = _session.get(
+                "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+                params={"symbol": "BTCUSDT", "period": "5m", "limit": "1"}, timeout=5)
+            r.raise_for_status()
+            data = r.json()
+            if data and isinstance(data, list):
+                entry = data[0]
+                _lsr_cache["long_short_ratio"] = round(float(entry.get("longShortRatio", 1.0)), 4)
+                _lsr_cache["long_account_pct"] = round(float(entry.get("longAccount", 0.5)), 4)
+                _lsr_cache["short_account_pct"] = round(float(entry.get("shortAccount", 0.5)), 4)
+                _lsr_cache["fetched_at"] = now
+        except Exception as e:
+            log.warning(f"Binance LSR fetch failed: {e}")
 
     # Basis via OKX mark price vs spot
     if now - _basis_cache["fetched_at"] >= 10:
@@ -2852,6 +2889,12 @@ def run():
                         "tick_cvd_60s":              tick_60["cvd"],
                         "tick_taker_buy_ratio_60s":  tick_60["taker_buy_ratio"],
                         "tick_intensity_60s":        tick_60["trade_intensity"],
+                        # Binance open interest + long/short ratio
+                        "oi_value":            round(_oi_cache.get("open_interest", 0.0), 2),
+                        "oi_change_5m":        round(_oi_cache.get("oi_change_5m", 0.0), 6),
+                        "long_short_ratio":    _lsr_cache.get("long_short_ratio", 1.0),
+                        "long_account_pct":    _lsr_cache.get("long_account_pct", 0.5),
+                        "short_account_pct":   _lsr_cache.get("short_account_pct", 0.5),
                         # Deribit implied volatility (observation — not used for trading yet)
                         "iv_atm":   round(_iv_cache.get("atm_iv",   0.0), 2),
                         "iv_skew":  round(_iv_cache.get("skew_25d", 0.0), 2),

@@ -1,43 +1,32 @@
 """
-ML Training Pipeline v4
-========================
-Structural improvements over v3:
+V4 Training Pipeline — Production Model for dYdX
+==================================================
+Trains the primary trading model: P(profitable | features).
+Used for trade timing on dYdX BTC-USD perpetual via quant_engine.py.
 
-  1. ONE primary model: P(profitable | features)
-     - Direction model dropped as primary objective
-     - Profitable = edge on p_market-chosen side > MIN_EDGE after fill + fees
-     - Side policy: follow p_market (bet UP if p_market >= 0.5, DOWN otherwise)
+Architecture:
+  - 75 pruned features (from 121 total, family-optimized)
+  - LightGBM classifier with walk-forward validation
+  - 4/4 kill tests pass (shuffle, time shift, ablation, random)
+  - Calibrated via isotonic regression
 
-  2. Net edge target:
-     - edge_up   = P(UP)   - fill_up   - fees
-     - edge_down = P(DOWN) - fill_down - fees
-     - label = 1 if edge on p_market side > 0 else 0
-     - (max-edge label was considered but discarded — p_market side is used)
+The model answers: "Is there a profitable trade right now?"
+  Score > 0.60 → open LONG or SHORT on dYdX
+  Direction: follow Polymarket crowd (p_market > 0.5 → LONG)
+  Exit: close when 5-minute market window expires
 
-  3. Walk-forward validation:
-     - Multiple folds: train on first N markets, test on next K
-     - Average Brier across folds for stable estimate
-     - No data snooping via repeated test-set inspection
-
-  4. Calibration: Platt scaling (sigmoid) for small datasets
-     - Isotonic calibration needs large N to avoid overfitting
-     - Switch to isotonic when markets > 1000
-
-  5. Single model output: P(profitable)
-     - Threshold at 0.5 → bet if profitable probability > 0.5
-     - Kelly fraction = f(P(profitable), fill_price)
+Also trains:
+  - Direction model: P(UP wins) — experimental, crowd beats it
+  - Market model: market-level aggregates for strategy discovery
 
 Usage:
-  $env:DB_URL="postgresql://..."
-  python train_model_v4.py
+  python train_model_v4_rest.py
 
 Output:
-  model_v4_profitable.pkl   — primary model: P(profitable | features)
-  model_v4_market.pkl       — market-level model for strategy discovery
-  training_report_v4.txt
-
-Install:
-  pip install psycopg2-binary scikit-learn lightgbm numpy
+  model_v4_profitable.pkl — production model (used by quant_engine.py)
+  model_v4_nopmarket.pkl  — microstructure-only variant
+  model_v4_direction.pkl  — direction model
+  model_v4_market.pkl     — market-level model
 """
 
 import os
@@ -99,26 +88,53 @@ def connect():
     return None  # no-op — using REST API
 
 
-def _rest_fetch(table, params, limit=1000) -> list:
+def _rest_fetch(table, params, limit=500) -> list:
+    """Fetch using created_at cursor instead of OFFSET to avoid Supabase timeouts."""
     rows = []
-    offset = 0
+    retries = 0
+    cursor = ""  # tracks last created_at for cursor-based pagination
     while True:
-        p = {**params, "limit": limit, "offset": offset}
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=REST_H, params=p, timeout=120)
-        if not r.text:
-            log.warning(f"Supabase returned empty body for {table} (status={r.status_code}) at offset={offset}")
-            break
+        p = {**params, "limit": limit}
+        if cursor:
+            p["created_at"] = f"gt.{cursor}"
         try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=REST_H, params=p, timeout=180)
+            if not r.text:
+                retries += 1
+                if retries > 3:
+                    log.warning(f"  Empty body after 3 retries (status={r.status_code})")
+                    break
+                import time; time.sleep(2)
+                continue
             batch = r.json()
+            if isinstance(batch, dict):
+                retries += 1
+                if retries > 3:
+                    log.warning(f"  API error after 3 retries: {batch}")
+                    break
+                log.warning(f"  API error, retry {retries}: {batch.get('message','?')}")
+                import time; time.sleep(2)
+                continue
+            if not batch or not isinstance(batch, list):
+                break
+            rows.extend(batch)
+            retries = 0
+            if len(rows) % 5000 == 0:
+                log.info(f"  Fetched {len(rows):,}...")
+            if len(batch) < limit:
+                break
+            # Use last row's created_at as cursor for next page
+            last_ts = batch[-1].get("created_at")
+            if not last_ts:
+                break
+            cursor = last_ts
         except Exception as e:
-            log.warning(f"Supabase JSON error for {table} offset={offset}: {e} — body: {r.text[:200]}")
-            break
-        if not batch or not isinstance(batch, list):
-            break
-        rows.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
+            retries += 1
+            if retries > 3:
+                log.warning(f"  Fetch stopped after 3 retries: {e}")
+                break
+            log.warning(f"  Retry {retries}: {e}")
+            import time; time.sleep(2)
     return rows
 
 
@@ -161,10 +177,11 @@ def _net_edge_correct(outcome_binary, fill_up, fill_down, p_market=None,
     Also computes continuous excess return for regression target:
     excess = outcome_binary - p_market - fees  (how much outcome beat crowd)
 
-    Returns (edge_chosen, profitable_int, side, excess_up, excess_down)
+    Returns (edge_chosen, profitable_int, side, excess_up, excess_down,
+            fill_edge_up, fill_edge_down)
     """
     if np.isnan(outcome_binary) or p_market is None or np.isnan(p_market):
-        return np.nan, np.nan, "NONE", np.nan, np.nan
+        return np.nan, np.nan, "NONE", np.nan, np.nan, np.nan, np.nan
 
     ob  = float(outcome_binary)
     rt  = taker_fee * 2
@@ -188,11 +205,17 @@ def _net_edge_correct(outcome_binary, fill_up, fill_down, p_market=None,
         side = "NONE"
 
     # Continuous regression targets (excess vs crowd, not vs fill)
-    # These measure how much outcome beat crowd's implied probability
     excess_up   = ob       - p_market       - rt
     excess_down = (1.0-ob) - (1.0-p_market) - rt
 
-    return round(float(edge_chosen), 6), profitable, side,            round(excess_up, 6), round(excess_down, 6)
+    # V5: Fill-based edge per side (execution-aware)
+    # These are the actual P&L you'd get buying each side at fill prices
+    fill_edge_up   = round(ob       - fu - rt, 6)
+    fill_edge_down = round((1.0-ob) - fd - rt, 6)
+
+    return (round(float(edge_chosen), 6), profitable, side,
+            round(excess_up, 6), round(excess_down, 6),
+            fill_edge_up, fill_edge_down)
 
 
 # ─────────────────────────────────────────────────────── WALK-FORWARD ────────
@@ -276,6 +299,44 @@ def _eval_fold(name, y_true, y_pred, base_rate):
     return brier, baseline, imp, acc
 
 
+def _compute_ece(y_true, y_pred, n_bins=10):
+    """
+    Expected Calibration Error — measures whether P=0.60 means 60% win rate.
+    Lower is better. Perfect calibration = 0.0.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    bins   = np.linspace(0.0, 1.0, n_bins + 1)
+    ece    = 0.0
+    rows   = []
+    for i in range(n_bins):
+        mask = (y_pred >= bins[i]) & (y_pred < bins[i + 1])
+        if mask.sum() == 0:
+            continue
+        bin_conf = float(y_pred[mask].mean())
+        bin_acc  = float(y_true[mask].mean())
+        weight   = mask.sum() / len(y_true)
+        ece     += weight * abs(bin_conf - bin_acc)
+        rows.append((bins[i], bins[i + 1], int(mask.sum()), bin_conf, bin_acc))
+    return ece, rows
+
+
+def _spearman(y_true, y_pred):
+    """Spearman rank correlation between predicted score and actual label."""
+    try:
+        from scipy.stats import spearmanr
+        r, p = spearmanr(y_pred, y_true)
+        return float(r), float(p)
+    except ImportError:
+        # scipy not installed — fallback to numpy rank correlation
+        n   = len(y_true)
+        rp  = np.argsort(np.argsort(y_pred)).astype(float)
+        ry  = np.argsort(np.argsort(y_true)).astype(float)
+        num = np.sum((rp - rp.mean()) * (ry - ry.mean()))
+        den = np.sqrt(np.sum((rp - rp.mean())**2) * np.sum((ry - ry.mean())**2))
+        return float(num / den) if den > 0 else 0.0, np.nan
+
+
 def _importance(model, feat_names, top_n=20):
     try:
         if hasattr(model, "feature_importances_"):
@@ -319,7 +380,7 @@ FLOW_LBL_MAP = {"LONG_CROWDED":1,"BALANCED":0,"SHORT_CROWDED":-1}
 def fetch_snapshots(conn) -> list:
     log.info("Fetching market_snapshots via REST...")
     cols = ",".join([
-        "condition_id","secs_left","secs_to_resolution","market_progress",
+        "created_at","condition_id","secs_left","secs_to_resolution","market_progress",
         "phase_early","phase_mid","phase_late","phase_final",
         "hour_sin","hour_cos","dow_sin","dow_cos",
         "price_vs_open_pct","price_vs_open_score",
@@ -334,6 +395,15 @@ def fetch_snapshots(conn) -> list:
         "volatility_pct","flow_score","funding_zscore",
         "regime","session","activity","day_type",
         "price_bucket",
+        "p_market_std","avg_ob_imbalance_abs","avg_funding_zscore_abs",
+        "avg_momentum_abs","btc_range_pct",
+        "tick_cvd_30s","tick_taker_buy_ratio_30s","tick_large_buy_usd_30s",
+        "tick_large_sell_usd_30s","tick_intensity_30s","tick_vwap_disp_30s",
+        "tick_cvd_60s","tick_taker_buy_ratio_60s","tick_intensity_60s",
+        "poly_flow_imb","poly_depth_ratio",
+        "poly_trade_imb","poly_up_buys","poly_down_buys","poly_trade_count","poly_large_pct",
+        "delta_funding","delta_basis","delta_trade_imb","xex_spread",
+        "delta_cvd","delta_taker_buy","delta_momentum","delta_poly","delta_score",
         "outcome_binary",
     ])
     rows = _rest_fetch("market_snapshots", {
@@ -344,6 +414,86 @@ def fetch_snapshots(conn) -> list:
     })
     log.info(f"  {len(rows):,} rows")
     return rows
+
+
+def _build_cross_market_lookup(rows) -> dict:
+    """
+    Pre-compute per-market aggregates and build a lookup so each row
+    can access the PREVIOUS market's outcome and features.
+
+    Returns dict: {condition_id: {prev_outcome, prev_momentum, prev_ob_imbalance,
+                                   prev_vol_range, prev_btc_range, streak_up, streak_down}}
+    """
+    from collections import OrderedDict
+
+    # Group rows by condition_id, preserving time order
+    market_rows = OrderedDict()
+    for row in rows:
+        cid = row.get("condition_id", "")
+        if cid not in market_rows:
+            market_rows[cid] = []
+        market_rows[cid].append(row)
+
+    # Compute per-market summary (using last snapshot as "final" state)
+    market_summaries = OrderedDict()
+    for cid, mrows in market_rows.items():
+        last = mrows[-1]  # last snapshot in time order
+        ob = _f(last.get("outcome_binary"))
+        market_summaries[cid] = {
+            "outcome":       ob if not np.isnan(ob) else np.nan,
+            "momentum_30s":  _f(last.get("momentum_30s")),
+            "ob_imbalance":  _f(last.get("ob_imbalance")),
+            "vol_range_pct": _f(last.get("vol_range_pct")),
+            "btc_range_pct": _f(last.get("btc_range_pct")),
+            "p_market":      _f(last.get("p_market")),
+            "funding_zscore":_f(last.get("funding_zscore")),
+        }
+
+    # Build cross-market lookup: for each market, store previous market's stats
+    cids = list(market_summaries.keys())
+    cross = {}
+    streak_up = 0
+    streak_down = 0
+    for i, cid in enumerate(cids):
+        if i == 0:
+            cross[cid] = {
+                "prev_outcome":       np.nan,
+                "prev_momentum":      np.nan,
+                "prev_ob_imbalance":  np.nan,
+                "prev_vol_range":     np.nan,
+                "prev_btc_range":     np.nan,
+                "prev_p_market_final":np.nan,
+                "prev_funding_zscore":np.nan,
+                "streak_up":          0.0,
+                "streak_down":        0.0,
+            }
+        else:
+            prev = market_summaries[cids[i-1]]
+            cross[cid] = {
+                "prev_outcome":       prev["outcome"],
+                "prev_momentum":      prev["momentum_30s"],
+                "prev_ob_imbalance":  prev["ob_imbalance"],
+                "prev_vol_range":     prev["vol_range_pct"],
+                "prev_btc_range":     prev["btc_range_pct"],
+                "prev_p_market_final":prev["p_market"],
+                "prev_funding_zscore":prev["funding_zscore"],
+                "streak_up":          float(streak_up),
+                "streak_down":        float(streak_down),
+            }
+
+        # Update streaks
+        cur_outcome = market_summaries[cid]["outcome"]
+        if not np.isnan(cur_outcome):
+            if cur_outcome == 1:
+                streak_up += 1
+                streak_down = 0
+            else:
+                streak_down += 1
+                streak_up = 0
+
+    log.info(f"  Cross-market lookup: {len(cross)} markets, "
+             f"avg streak_up={np.nanmean([v['streak_up'] for v in cross.values()]):.1f}")
+    return cross
 
 
 def build_snapshot_features(rows):
@@ -357,7 +507,10 @@ def build_snapshot_features(rows):
       pm_raw    — raw p_market for baseline computation
       best_sides — UP/DOWN/NONE for each row
     """
-    records, y_prof, y_edge, y_dir, cond_ids, pm_raws, best_sides = [], [], [], [], [], [], []
+    # Pre-compute cross-market features
+    cross_mkt = _build_cross_market_lookup(rows)
+
+    records, y_prof, y_prof_best, y_edge, y_edge_up, y_edge_down, y_dir, cond_ids, pm_raws, best_sides = [], [], [], [], [], [], [], [], [], []
     skipped = 0
 
     for row in rows:
@@ -389,22 +542,34 @@ def build_snapshot_features(rows):
         # Note: pm_uncertainty < 0.15 filter removed — too aggressive,
         # was removing legitimate rows with pm 0.075-0.925
         is_extreme = int(pm > PM_HI or pm < PM_LO)
+        _cross = cross_mkt.get(row.get("condition_id",""), {})
 
         fill_up   = _f(row.get("poly_fill_up"))
         fill_down = _f(row.get("poly_fill_down"))
 
         # Correct net edge: policy-free, best available side
-        net_edge, prof, best_side, edge_up, edge_down = _net_edge_correct(
+        net_edge, prof, best_side, edge_up, edge_down, fill_edge_up, fill_edge_down = _net_edge_correct(
             ob, fill_up, fill_down,
             p_market=pm,
             poly_spread=_f(row.get("poly_spread")),
             min_edge=MIN_EDGE
         )
         if np.isnan(net_edge):
-            prof     = 0
-            net_edge = 0.0
-            edge_up  = 0.0
-            edge_down = 0.0
+            prof           = 0
+            net_edge       = 0.0
+            edge_up        = 0.0
+            edge_down      = 0.0
+            fill_edge_up   = 0.0
+            fill_edge_down = 0.0
+
+        # Policy-free label: was there enough deviation from p_market to profit,
+        # regardless of which side you bet?
+        # edge_abs = |outcome - p_market| - round_trip_fee
+        # If positive → someone with direction knowledge could have profited.
+        # Unlike primary label, this does NOT depend on following the crowd.
+        _rt = TAKER_FEE * 2
+        _edge_abs = abs(ob - pm) - _rt if (not np.isnan(ob) and not np.isnan(pm)) else -1.0
+        prof_best = int(_edge_abs > MIN_EDGE)
 
         # Feature engineering
         m10  = _f(row.get("momentum_10s"))
@@ -525,6 +690,27 @@ def build_snapshot_features(rows):
                                       if not(np.isnan(vr) or np.isnan(_f(row.get("funding_zscore"))))
                                       else np.nan,
 
+            # ── Signal separation (#3): top discovery interactions ─────────────
+            # okx_funding_x_vol_x_funding_zscore corr=+0.072
+            # vol_range_pct_x_funding_zscore      corr=+0.059
+            # vol_range_pct_x_vol_x_funding_zscore corr=+0.057
+            # okx_funding_x_funding_rate          corr=+0.046
+            "okx_x_vol_fz": (
+                _f(row.get("okx_funding")) * vr * _f(row.get("funding_zscore"))
+                if not any(np.isnan(v) for v in [_f(row.get("okx_funding")), vr, _f(row.get("funding_zscore"))])
+                else np.nan
+            ),
+            "vr_x_fz_sq": (
+                vr * (_f(row.get("funding_zscore")) ** 2)
+                if not(np.isnan(vr) or np.isnan(_f(row.get("funding_zscore"))))
+                else np.nan
+            ),
+            "okx_x_fr": (
+                _f(row.get("okx_funding")) * fr
+                if not(np.isnan(_f(row.get("okx_funding"))) or np.isnan(fr))
+                else np.nan
+            ),
+
             # ── Time-to-resolution interactions (#7) ──────────────────────────
             # Early signal carries different weight than late signal
             # liq_imbalance at 250s is predictive; at 130s it may be noise
@@ -562,11 +748,60 @@ def build_snapshot_features(rows):
             "mom_accel_abs":          abs(m30 - m60)
                                       if not(np.isnan(m30) or np.isnan(m60))
                                       else np.nan,
+
+            # ── Market-level rolling aggregates ──────────────────────────────
+            "p_market_std":           _f(row.get("p_market_std")),
+            "avg_ob_imbalance_abs":   _f(row.get("avg_ob_imbalance_abs")),
+            "avg_funding_zscore_abs": _f(row.get("avg_funding_zscore_abs")),
+            "avg_momentum_abs":       _f(row.get("avg_momentum_abs")),
+            "btc_range_pct":          _f(row.get("btc_range_pct")),
+
+            # ── Polymarket order flow ─────────────────────────────────────
+            "poly_flow_imb":             _f(row.get("poly_flow_imb")),
+            "poly_depth_ratio":          _f(row.get("poly_depth_ratio")),
+            "poly_trade_imb":            _f(row.get("poly_trade_imb")),
+            "poly_up_buys":              _f(row.get("poly_up_buys")),
+            "poly_down_buys":            _f(row.get("poly_down_buys")),
+            "poly_trade_count":          _f(row.get("poly_trade_count")),
+            "poly_large_pct":            _f(row.get("poly_large_pct")),
+
+            # ── Regime interaction features (V5 only — pruned from V4) ─────
+            "prev_vol_x_momentum":       _cross.get("prev_vol_range", 0) * _cross.get("prev_momentum", 0),
+            "session_x_vol":             SESSION_MAP.get(row.get("session",""), 0) * vr if not np.isnan(vr) else np.nan,
+            "streak_length":             max(_cross.get("streak_up", 0), _cross.get("streak_down", 0)),
+
+            # ── Velocity features (rate of change) ────────────────────────
+            "delta_funding":             _f(row.get("delta_funding")),
+            "delta_basis":               _f(row.get("delta_basis")),
+
+            # ── Intra-market deltas (change since previous snapshot) ────────
+            "delta_cvd":                 _f(row.get("delta_cvd")),
+            "delta_taker_buy":           _f(row.get("delta_taker_buy")),
+            "delta_momentum":            _f(row.get("delta_momentum")),
+            "delta_poly":                _f(row.get("delta_poly")),
+            "delta_score":               _f(row.get("delta_score")),
+
+            # ── Tick-level order flow (Binance aggTrades) ────────────────────
+            "tick_cvd_30s":              _f(row.get("tick_cvd_30s")),
+            "tick_taker_buy_ratio_30s":  _f(row.get("tick_taker_buy_ratio_30s")),
+            "tick_large_buy_usd_30s":    _f(row.get("tick_large_buy_usd_30s")),
+            "tick_large_sell_usd_30s":   _f(row.get("tick_large_sell_usd_30s")),
+            "tick_intensity_30s":        _f(row.get("tick_intensity_30s")),
+            "tick_vwap_disp_30s":        _f(row.get("tick_vwap_disp_30s")),
+            "tick_cvd_60s":              _f(row.get("tick_cvd_60s")),
+            "tick_taker_buy_ratio_60s":  _f(row.get("tick_taker_buy_ratio_60s")),
+            "tick_intensity_60s":        _f(row.get("tick_intensity_60s")),
+
+            # ── Cross-market features (what happened in the previous market) ─
+            **{k: v for k, v in cross_mkt.get(row.get("condition_id",""), {}).items()},
         }
 
         records.append(f)
         y_prof.append(prof)
+        y_prof_best.append(prof_best)    # policy-free: max(edge_up, edge_down)
         y_edge.append(float(net_edge))   # continuous edge for regression
+        y_edge_up.append(float(fill_edge_up))    # v5: fill-based edge if buying UP
+        y_edge_down.append(float(fill_edge_down))  # v5: fill-based edge if buying DOWN
         y_dir.append(int(ob))
         pm_raws.append(pm)
         best_sides.append(best_side)
@@ -580,13 +815,55 @@ def build_snapshot_features(rows):
     log.info(f"  Best side: UP={pct_up:.1f}%  DOWN={pct_down:.1f}%  "
              f"NONE={100-pct_up-pct_down:.1f}%")
 
-    fn   = list(records[0].keys())
-    X    = np.array([[r[k] for k in fn] for r in records], dtype=np.float32)
-    yp   = np.array(y_prof, dtype=np.int32)
-    ye   = np.array(y_edge, dtype=np.float32)   # continuous edge
-    yd   = np.array(y_dir,  dtype=np.int32)
-    pm   = np.array(pm_raws, dtype=np.float32)
-    return X, yp, ye, yd, cond_ids, fn, pm
+    # Prune zero-importance features — these are either noise or have insufficient
+    # real data (e.g. tick/poly features backfilled as zeros). They stay in snapshots
+    # for future use but are excluded from training to reduce noise.
+    # Light prune: only features that are structurally useless (not just low importance).
+    # Keep: deltas (real backfill data), tick/poly (will gain data over time),
+    #        OB features (occasionally useful in specific folds)
+    PRUNE = {
+        # ── Agreement signals (zero importance) ──
+        "mom_all_agree", "mom_liq_agree", "mom_ob_agree", "liq_ob_agree",
+        # ── Phase indicators (redundant with secs_to_resolution) ──
+        "phase_mid", "phase_late", "phase_final",
+        # ── Cost features (near-constant) ──
+        "round_trip_cost", "effective_entry_cost",
+        # ── Categorical noise ──
+        "day_type_enc", "signal_strength", "signal_dispersion",
+        # ── Regime interactions (V5-only) ──
+        "prev_vol_x_momentum", "session_x_vol", "streak_length",
+        # ── Momentum family trim (prev_momentum carries 77%, rest is noise) ──
+        "momentum_10s", "momentum_30s", "momentum_score",
+        "mom_windows_positive", "mom_accel_short", "mom_accel_mid",
+        "mom_mean", "mom_x_secs", "mom_abs",
+        # ── OB family trim (prev_ob_imbalance carries 97%) ──
+        "ob_imbalance", "ob_bid_delta", "ob_ask_delta", "ob_abs_imbalance",
+        "ob_imbal_x_secs", "interact_ob_x_spread",
+        # ── Funding family trim (keep top 5, prune 7 low-value) ──
+        "okx_x_vol_fz", "vr_x_fz_sq", "vol_x_funding_zscore",
+        # ── Delta family (0.1% total, all dead) ──
+        "delta_cvd", "delta_taker_buy", "delta_momentum", "delta_poly",
+        "delta_score", "delta_funding", "delta_basis",
+        # ── Other low-value ──
+        "flow_score", "is_extreme_market",
+        "cl_divergence", "cl_abs_divergence", "cl_age",
+        "poly_slip_up",
+    }
+    fn_all  = list(records[0].keys())
+    fn      = [f for f in fn_all if f not in PRUNE]
+    pruned  = len(fn_all) - len(fn)
+    log.info(f"  Pruned {pruned} zero-importance features → {len(fn)} remaining")
+    X       = np.array([[r[k] for k in fn] for r in records], dtype=np.float32)
+    # Keep unpruned matrix for V5 (built later)
+    X_all   = np.array([[r[k] for k in fn_all] for r in records], dtype=np.float32)
+    yp      = np.array(y_prof,      dtype=np.int32)
+    yp_best = np.array(y_prof_best, dtype=np.int32)   # policy-free label
+    ye      = np.array(y_edge,      dtype=np.float32)  # continuous edge
+    ye_up   = np.array(y_edge_up,   dtype=np.float32)  # v5: fill-based UP edge
+    ye_down = np.array(y_edge_down, dtype=np.float32)  # v5: fill-based DOWN edge
+    yd      = np.array(y_dir,       dtype=np.int32)
+    pm      = np.array(pm_raws,     dtype=np.float32)
+    return X, yp, yp_best, ye, ye_up, ye_down, yd, cond_ids, fn, pm, X_all, fn_all
 
 
 # ═══════════════════════════════════════════ MARKET FEATURE ENGINEERING ══════
@@ -1128,6 +1405,158 @@ def run_discovery_pipeline(
     log.info(f"  [DISCOVERY] Report saved: {report_fname}")
     print(f"\n  Full report: {report_fname}")
 
+# ═══════════════════════════════════════════════════════════════ KILL TESTS ══
+
+def _run_kill_tests(X, yp, fn, folds, real_avg_imp, report):
+    """
+    Four diagnostic tests that should run after every training to confirm
+    the model is learning genuine signal rather than artefacts.
+
+    Kill Test 1 — Shuffle:    shuffle labels → improvement should collapse to ~0
+    Kill Test 2 — Time shift: predict next-fold labels with current features → drop expected
+    Kill Test 3 — Ablation:   remove top-5 features one at a time → smooth degradation
+    Kill Test 4 — Random:     random entry at same frequency → model should clearly win
+    """
+    print("\n" + "=" * 60)
+    print("  KILL TESTS — model validity")
+    print("=" * 60)
+
+    rng       = np.random.RandomState(99)
+    use_folds = folds[:6]
+    lite_kw   = dict(n_est=100, leaves=15)
+
+    # ── Kill Test 1: Shuffle ──────────────────────────────────────────────────
+    print("\n  [1] Shuffle Test")
+    print("      Shuffle outcome labels — improvement should collapse to ~0.")
+    print("      If it stays high: feature leakage is encoding the label.")
+    yp_shuf = yp.copy()
+    rng.shuffle(yp_shuf)
+    shuf_imps = []
+    for ti, vi, n_tr, _ in use_folds:
+        cal   = "isotonic" if n_tr >= 500 else "sigmoid"
+        m, imp = _train(X[ti], yp_shuf[ti], calibration=cal, **lite_kw)
+        preds  = m.predict_proba(imp.transform(X[vi]))[:, 1]
+        _, _, improvement, _ = _eval_fold("", yp_shuf[vi], preds, yp_shuf[ti].mean())
+        shuf_imps.append(improvement)
+    avg_shuf  = float(np.mean(shuf_imps))
+    collapsed = abs(avg_shuf) < 0.008
+    result1   = "PASS" if collapsed else "FAIL — possible label leakage"
+    print(f"      Real model imp : {real_avg_imp:+.4f}")
+    print(f"      Shuffled imp   : {avg_shuf:+.4f}")
+    print(f"      Result         : {result1}")
+    report.append(f"Kill Test 1 (shuffle): shuffled_imp={avg_shuf:+.4f}  {result1}")
+
+    # ── Kill Test 2: Time shift ───────────────────────────────────────────────
+    print("\n  [2] Time Shift Test")
+    print("      Predict next fold's labels using current fold's features.")
+    print("      Performance should drop — features predict present, not future.")
+    shift_imps = []
+    for i in range(len(use_folds) - 1):
+        ti, vi, n_tr, _  = use_folds[i]
+        _, vi_next, _, _ = use_folds[i + 1]
+        n_overlap = min(len(vi), len(vi_next))
+        if n_overlap < 10:
+            continue
+        X_te_curr = X[vi[:n_overlap]]
+        y_te_next = yp[vi_next[:n_overlap]]
+        cal   = "isotonic" if n_tr >= 500 else "sigmoid"
+        m, imp = _train(X[ti], yp[ti], calibration=cal, **lite_kw)
+        preds  = m.predict_proba(imp.transform(X_te_curr))[:, 1]
+        _, _, improvement, _ = _eval_fold("", y_te_next, preds, yp[ti].mean())
+        shift_imps.append(improvement)
+    if shift_imps:
+        avg_shift = float(np.mean(shift_imps))
+        drop      = real_avg_imp - avg_shift
+        result2   = "PASS" if drop > -0.005 else "WARN — features may encode future info"
+        print(f"      Real model imp    : {real_avg_imp:+.4f}")
+        print(f"      Time-shifted imp  : {avg_shift:+.4f}")
+        print(f"      Performance drop  : {drop:+.4f}")
+        print(f"      Result            : {result2}")
+        report.append(f"Kill Test 2 (time shift): shifted_imp={avg_shift:+.4f} drop={drop:+.4f}  {result2}")
+    else:
+        result2 = "SKIP"
+        print("      SKIP — not enough folds")
+
+    # ── Kill Test 3: Feature ablation ─────────────────────────────────────────
+    print("\n  [3] Feature Ablation Test")
+    print("      Remove top-5 features one at a time.")
+    print("      Smooth degradation = stable. Large single spike = fragile.")
+    ti_last, vi_last, n_tr_last, _ = folds[-1]
+    cal_last = "isotonic" if n_tr_last >= 500 else "sigmoid"
+    m_base, imp_base = _train(X[ti_last], yp[ti_last], calibration=cal_last, **lite_kw)
+    preds_base = m_base.predict_proba(imp_base.transform(X[vi_last]))[:, 1]
+    _, _, base_imp_abl, _ = _eval_fold("", yp[vi_last], preds_base, yp[ti_last].mean())
+    top5 = sorted(zip(fn, m_base.feature_importances_), key=lambda x: -x[1])[:5]
+    print(f"  {'Feature removed':<38} {'Imp':>8}  {'Drop':>8}  Status")
+    print(f"  {'─'*38} {'─'*8}  {'─'*8}  {'─'*6}")
+    print(f"  {'(baseline — no removal)':<38} {base_imp_abl:>+8.4f}  {'—':>8}")
+    ablation_ok = True
+    prev = base_imp_abl
+    for fname, _ in top5:
+        if fname not in fn:
+            continue
+        fidx        = fn.index(fname)
+        X_abl       = X.copy()
+        X_abl[:, fidx] = np.nan
+        m_abl, imp_abl = _train(X_abl[ti_last], yp[ti_last],
+                                calibration=cal_last, **lite_kw)
+        preds_abl = m_abl.predict_proba(imp_abl.transform(X_abl[vi_last]))[:, 1]
+        _, _, imp_abl_v, _ = _eval_fold("", yp[vi_last], preds_abl, yp[ti_last].mean())
+        drop  = prev - imp_abl_v
+        spike = abs(drop) > 0.025
+        if spike:
+            ablation_ok = False
+        print(f"  {fname:<38} {imp_abl_v:>+8.4f}  {drop:>+8.4f}  {'SPIKE' if spike else 'OK'}")
+        prev = imp_abl_v
+    result3 = "PASS" if ablation_ok else "WARN — model depends heavily on single feature(s)"
+    print(f"      Result: {result3}")
+    report.append(f"Kill Test 3 (ablation): {result3}")
+
+    # ── Kill Test 4: Random entry baseline ────────────────────────────────────
+    print("\n  [4] Random Entry Baseline")
+    print("      Random trades at same frequency as model (threshold=0.55).")
+    print("      Model win rate must clearly beat random selection.")
+    CLS_THRESH = 0.55
+    N_REPS     = 50
+    model_wrs, random_wrs = [], []
+    for ti, vi, n_tr, _ in use_folds:
+        cal   = "isotonic" if n_tr >= 500 else "sigmoid"
+        m, imp = _train(X[ti], yp[ti], calibration=cal, **lite_kw)
+        preds  = m.predict_proba(imp.transform(X[vi]))[:, 1]
+        mask   = preds > CLS_THRESH
+        n_sel  = int(mask.sum())
+        if n_sel < 5:
+            continue
+        model_wrs.append(float(yp[vi][mask].mean()))
+        rand_wr_reps = []
+        for _ in range(N_REPS):
+            idx = rng.choice(len(vi), size=n_sel, replace=False)
+            rand_wr_reps.append(float(yp[vi][idx].mean()))
+        random_wrs.append(float(np.mean(rand_wr_reps)))
+    if model_wrs:
+        avg_model_wr  = float(np.mean(model_wrs))
+        avg_random_wr = float(np.mean(random_wrs))
+        edge_vs_rand  = avg_model_wr - avg_random_wr
+        beats_random  = edge_vs_rand > 0.02
+        result4 = "PASS" if beats_random else "FAIL — no edge over random selection"
+        print(f"      Model WR (filtered) : {avg_model_wr*100:.1f}%")
+        print(f"      Random WR (same N)  : {avg_random_wr*100:.1f}%")
+        print(f"      Edge over random    : {edge_vs_rand*100:+.1f}pp")
+        print(f"      Result              : {result4}")
+        report.append(f"Kill Test 4 (random baseline): model_wr={avg_model_wr*100:.1f}% "
+                      f"random_wr={avg_random_wr*100:.1f}% edge={edge_vs_rand*100:+.1f}pp  {result4}")
+    else:
+        result4 = "SKIP"
+        print("      SKIP — no folds with filtered trades")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n  Kill test summary:")
+    print(f"    [1] Shuffle    : {result1}")
+    print(f"    [2] Time shift : {result2}")
+    print(f"    [3] Ablation   : {result3}")
+    print(f"    [4] Random     : {result4}")
+
+
 # ═══════════════════════════════════════════════════════════════════ MAIN ═════
 
 def main():
@@ -1171,7 +1600,7 @@ def main():
     print("=" * 60)
 
     snap_rows = fetch_snapshots(conn)
-    X, yp, ye, yd, cids, fn, pm = build_snapshot_features(snap_rows)
+    X, yp, yp_best, ye, ye_up, ye_down, yd, cids, fn, pm, X_all, fn_all = build_snapshot_features(snap_rows)
 
     folds = walk_forward_splits(cids)
     n_markets = len(set(cids))
@@ -1237,18 +1666,44 @@ def main():
             "reg_corr": float(np.corrcoef(preds_reg, ye_te)[0,1]) if len(ye_te) > 2 else 0.0,
         })
 
-        # Issue 4: Simulated PnL — filter by classifier + regressor threshold
-        # This is the economic sanity check: does filtering produce real edge?
-        cls_threshold = 0.55   # only bet when model confident crowd is right
+        # Simulated PnL — two strategies:
+        # (A) Fixed threshold at 0.55
+        # (B) Top-15% percentile ranking (#1)
+        cls_threshold = 0.55
         reg_threshold = MIN_EDGE
-        trade_mask    = (preds_cls > cls_threshold) & (preds_reg > reg_threshold)
-        n_trades      = trade_mask.sum()
+
+        # Strategy A: fixed threshold
+        trade_mask = (preds_cls > cls_threshold) & (preds_reg > reg_threshold)
+        n_trades   = trade_mask.sum()
         if n_trades > 0:
-            sim_pnl   = float(ye_te[trade_mask].sum())
-            pnl_per   = float(ye_te[trade_mask].mean())
-            win_rate  = float(yp_te[trade_mask].mean())
+            sim_pnl  = float(ye_te[trade_mask].sum())
+            pnl_per  = float(ye_te[trade_mask].mean())
+            win_rate = float(yp_te[trade_mask].mean())
         else:
             sim_pnl = pnl_per = win_rate = 0.0
+
+        # Strategy B: top-15% percentile (#1)
+        pct_cutoff   = np.percentile(preds_cls, 85)
+        rank_mask    = (preds_cls >= pct_cutoff) & (preds_reg > reg_threshold)
+        n_rank       = rank_mask.sum()
+        if n_rank > 0:
+            rank_pnl = float(ye_te[rank_mask].sum())
+            rank_wr  = float(yp_te[rank_mask].mean())
+            rank_per = float(ye_te[rank_mask].mean())
+        else:
+            rank_pnl = rank_wr = rank_per = 0.0
+
+        # Strategy C: stress test (#5) — top-15% with extra slippage + 5s delay penalty
+        # 5s delay: approximate by marking down entry by momentum_30s * 5s
+        # Extra slippage: 0.005 (0.5%) applied to edge
+        STRESS_SLIP  = 0.003   # 0.3% slippage (realistic for $1-10 bets)
+        STRESS_DELAY = 0.002   # ~5s of 0.04%/s average BTC drift cost
+        if n_rank > 0:
+            stressed_edges = ye_te[rank_mask] - STRESS_SLIP - STRESS_DELAY
+            stress_pnl = float(stressed_edges.sum())
+            stress_wr  = float(yp_te[rank_mask].mean())
+        else:
+            stress_pnl = stress_wr = 0.0
 
         # Baseline PnL: always bet (no filter)
         baseline_pnl = float(ye_te.sum())
@@ -1256,6 +1711,9 @@ def main():
         fold_results[-1].update({
             "sim_pnl": sim_pnl, "n_trades": int(n_trades),
             "pnl_per": pnl_per, "win_rate": win_rate,
+            "rank_pnl": rank_pnl, "n_rank": int(n_rank),
+            "rank_wr": rank_wr, "rank_per": rank_per,
+            "stress_pnl": stress_pnl, "stress_wr": stress_wr,
             "brier_follow": brier_follow, "brier_fade": brier_fade,
         })
 
@@ -1266,9 +1724,18 @@ def main():
         print(f"    Accuracy         : {acc*100:.1f}%")
         print(f"    Regressor MAE    : {fold_results[-1]['reg_mae']:.4f}  "
               f"Corr: {fold_results[-1]['reg_corr']:+.3f}")
-        print(f"    Simulated PnL    : {sim_pnl:+.4f}  ({n_trades} trades, "
+        print(f"    Sim PnL (thr=0.55): {sim_pnl:+.4f}  ({n_trades} trades, "
               f"WR={win_rate*100:.1f}%  edge/trade={pnl_per:+.4f})")
-        print(f"    Baseline PnL     : {baseline_pnl:+.4f}  (bet everything)")
+        print(f"    Sim PnL (top-15%) : {rank_pnl:+.4f}  ({n_rank} trades, "
+              f"WR={rank_wr*100:.1f}%  edge/trade={rank_per:+.4f})")
+        print(f"    Sim PnL (stress)  : {stress_pnl:+.4f}  (top-15% + 0.7% extra cost)")
+        print(f"    Baseline PnL      : {baseline_pnl:+.4f}  (bet everything)")
+
+        # #4 Spearman rank correlation — does higher score = higher actual edge?
+        sp_r, sp_p = _spearman(yp_te, preds_cls)
+        fold_results[-1]["spearman_r"] = sp_r
+        print(f"    Spearman rank r  : {sp_r:+.4f}  "
+              f"({'monotonic ✓' if sp_r > 0.05 else 'weak/flat — ranking unreliable'})")
 
         # Regime breakdown
         if regime_snap is not None:
@@ -1300,22 +1767,190 @@ def main():
     avg_acc    = np.mean([r["accuracy"] for r in fold_results])
     avg_mae    = np.mean([r["reg_mae"] for r in fold_results])
     avg_corr   = np.mean([r["reg_corr"] for r in fold_results])
-    total_pnl  = sum(r["sim_pnl"] for r in fold_results)
-    total_tr   = sum(r["n_trades"] for r in fold_results)
-    avg_follow = np.mean([r["brier_follow"] for r in fold_results])
-    avg_fade   = np.mean([r["brier_fade"] for r in fold_results])
-    avg_wr     = np.mean([r["win_rate"] for r in fold_results if r["n_trades"] > 0])
+    total_pnl    = sum(r["sim_pnl"]    for r in fold_results)
+    total_tr     = sum(r["n_trades"]   for r in fold_results)
+    total_rank   = sum(r["rank_pnl"]   for r in fold_results)
+    total_rank_n = sum(r["n_rank"]     for r in fold_results)
+    total_stress = sum(r["stress_pnl"] for r in fold_results)
+    avg_follow   = np.mean([r["brier_follow"] for r in fold_results])
+    avg_fade     = np.mean([r["brier_fade"]   for r in fold_results])
+    avg_wr       = np.mean([r["win_rate"] for r in fold_results if r["n_trades"] > 0])
+    avg_rank_wr  = np.mean([r["rank_wr"]  for r in fold_results if r["n_rank"]   > 0])
 
     print(f"\n  ── Walk-forward average ({len(folds)} folds) ──")
-    print(f"    Classifier Brier   : {avg_brier:.4f}  vs follow={avg_follow:.4f}  fade={avg_fade:.4f}")
-    print(f"    Avg Improvement    : {avg_imp:+.4f}  {'[OK]' if avg_imp > 0 else '[FAIL]'}")
-    print(f"    Avg Accuracy       : {avg_acc*100:.1f}%")
-    print(f"    Regressor MAE      : {avg_mae:.4f}  Avg Corr: {avg_corr:+.3f}")
-    print(f"    Total Sim PnL      : {total_pnl:+.4f}  ({total_tr} trades, WR={avg_wr*100:.1f}%)")
-    beat_follow = avg_brier < avg_follow
-    print(f"    Beats follow-crowd : {'YES' if beat_follow else 'NO'}")
+    print(f"    Classifier Brier     : {avg_brier:.4f}  vs follow={avg_follow:.4f}  fade={avg_fade:.4f}")
+    print(f"    Avg Improvement      : {avg_imp:+.4f}  {'[OK]' if avg_imp > 0 else '[FAIL]'}")
+    print(f"    Avg Accuracy         : {avg_acc*100:.1f}%")
+    print(f"    Regressor MAE        : {avg_mae:.4f}  Avg Corr: {avg_corr:+.3f}")
+    print(f"    Total PnL (thr=0.55) : {total_pnl:+.4f}  ({total_tr} trades, WR={avg_wr*100:.1f}%)")
+    print(f"    Total PnL (top-15%)  : {total_rank:+.4f}  ({total_rank_n} trades, WR={avg_rank_wr*100:.1f}%)")
+    print(f"    Total PnL (stress)   : {total_stress:+.4f}  (top-15% + 0.7% extra cost)")
+    beat_follow   = avg_brier < avg_follow
+    avg_spearman  = np.mean([r.get("spearman_r", 0) for r in fold_results])
+    print(f"    Beats follow-crowd   : {'YES' if beat_follow else 'NO'}")
+    print(f"    Avg Spearman r       : {avg_spearman:+.4f}  "
+          f"({'ranking consistent ✓' if avg_spearman > 0.05 else 'ranking weak'})")
     report.append(f"Primary model walk-forward: Brier={avg_brier:.4f} imp={avg_imp:+.4f} "
-                  f"reg_corr={avg_corr:+.3f} sim_pnl={total_pnl:+.4f}")
+                  f"reg_corr={avg_corr:+.3f} sim_pnl={total_pnl:+.4f} "
+                  f"rank_pnl={total_rank:+.4f} stress_pnl={total_stress:+.4f} "
+                  f"spearman={avg_spearman:+.4f}")
+
+    # ── #4 Where model works best — regime Spearman breakdown ────────────────
+    print("\n" + "=" * 60)
+    print("  WHERE MODEL WORKS (#4) — Spearman by regime")
+    print("  Restrict trading to zones where ranking is strongest.")
+    print("=" * 60)
+    # Collect all held-out predictions across all folds for regime analysis
+    all_yp_te   = np.concatenate([yp[vi]  for _, vi, _, _ in folds])
+    all_ye_te   = np.concatenate([ye[vi]  for _, vi, _, _ in folds])
+    all_pm_te   = np.concatenate([pm[vi]  for _, vi, _, _ in folds])
+
+    # Re-run walk-forward to collect predictions (lightweight, 100 est)
+    wf_preds_agg = []
+    for ti, vi, n_tr, _ in folds:
+        cal_lite = "isotonic" if n_tr >= 500 else "sigmoid"
+        m_lite, imp_lite = _train(X[ti], yp[ti], n_est=100, leaves=15,
+                                  calibration=cal_lite)
+        p_lite = m_lite.predict_proba(imp_lite.transform(X[vi]))[:, 1]
+        wf_preds_agg.append(p_lite)
+    all_preds_agg = np.concatenate(wf_preds_agg)
+
+    vol_idx = fn.index("vol_range_pct") if "vol_range_pct" in fn else None
+    str_idx = fn.index("secs_to_resolution") if "secs_to_resolution" in fn else None
+    fr_idx  = fn.index("funding_abs") if "funding_abs" in fn else None
+
+    all_X_te = np.concatenate([X[vi] for _, vi, _, _ in folds])
+
+    def _regime_spearman(mask, label):
+        if mask.sum() < 30:
+            return
+        sp_r, _ = _spearman(all_yp_te[mask], all_preds_agg[mask])
+        wr = all_yp_te[mask].mean()
+        rank_cut = np.percentile(all_preds_agg[mask], 85)
+        rank_m   = (all_preds_agg[mask] >= rank_cut)
+        rank_wr  = all_yp_te[mask][rank_m].mean() if rank_m.sum() > 0 else np.nan
+        print(f"    {label:<30} n={mask.sum():>5}  sp_r={sp_r:+.3f}  "
+              f"base_wr={wr*100:.1f}%  top15_wr={rank_wr*100:.1f}%")
+
+    print(f"\n  {'Zone':<30} {'N':>6}  {'Spearman':>9}  {'Base WR':>8}  {'Top15 WR':>9}")
+    print(f"  {'─'*30} {'─'*6}  {'─'*9}  {'─'*8}  {'─'*9}")
+
+    if vol_idx is not None:
+        vol_vals = all_X_te[:, vol_idx]
+        q33, q66 = np.nanpercentile(vol_vals, [33, 66])
+        _regime_spearman(vol_vals < q33,              "vol LOW  (<p33)")
+        _regime_spearman((vol_vals >= q33) & (vol_vals < q66), "vol MED  (p33-p66)")
+        _regime_spearman(vol_vals >= q66,              "vol HIGH (>p66)")
+
+    if str_idx is not None:
+        str_vals = all_X_te[:, str_idx]
+        _regime_spearman(str_vals > 600,  "secs_left > 600  (early)")
+        _regime_spearman((str_vals > 300) & (str_vals <= 600), "secs_left 300-600 (mid)")
+        _regime_spearman(str_vals <= 300, "secs_left <= 300 (late)")
+
+    if fr_idx is not None:
+        fr_vals = all_X_te[:, fr_idx]
+        fr_med  = np.nanpercentile(fr_vals, 66)
+        _regime_spearman(fr_vals < fr_med,  "funding LOW  (<p66)")
+        _regime_spearman(fr_vals >= fr_med, "funding HIGH (>p66)")
+
+    # pm_uncertainty breakdown
+    unc_idx = fn.index("pm_uncertainty") if "pm_uncertainty" in fn else None
+    if unc_idx is not None:
+        unc_vals = all_X_te[:, unc_idx]
+        unc_med  = np.nanmedian(unc_vals)
+        _regime_spearman(unc_vals >= unc_med, "pm_uncertainty HIGH")
+        _regime_spearman(unc_vals < unc_med,  "pm_uncertainty LOW")
+
+    report.append(f"Regime analysis: {len(folds)} folds aggregated — see WHERE MODEL WORKS section")
+
+    # ── #7 ECE — calibration check on full dataset ────────────────────────────
+    print("\n" + "=" * 60)
+    print("  CALIBRATION CHECK (#7) — does P=0.60 mean 60% win rate?")
+    print("=" * 60)
+    # Use last fold's held-out predictions for honest calibration estimate
+    last_ti, last_vi, last_n_tr, _ = folds[-1]
+    cal_last2 = "isotonic" if last_n_tr >= 500 else "sigmoid"
+    m_cal, imp_cal = _train(X[last_ti], yp[last_ti], n_est=150, leaves=20,
+                            calibration=cal_last2)
+    preds_cal = m_cal.predict_proba(imp_cal.transform(X[last_vi]))[:, 1]
+    ece_val, ece_bins = _compute_ece(yp[last_vi], preds_cal, n_bins=10)
+    print(f"\n  ECE (Expected Calibration Error): {ece_val:.4f}  "
+          f"({'well calibrated' if ece_val < 0.05 else 'needs calibration' if ece_val < 0.10 else 'poorly calibrated'})")
+    print(f"\n  {'Pred range':<14} {'N':>6}  {'Pred conf':>10}  {'Actual WR':>10}  {'Gap':>8}")
+    print(f"  {'─'*14} {'─'*6}  {'─'*10}  {'─'*10}  {'─'*8}")
+    for lo, hi, n_bin, conf, acc in ece_bins:
+        gap = acc - conf
+        flag = " ←" if abs(gap) > 0.08 else ""
+        print(f"  {lo:.2f}–{hi:.2f}       {n_bin:>6}  {conf:>10.3f}  {acc:>10.3f}  {gap:>+8.3f}{flag}")
+    report.append(f"Calibration ECE={ece_val:.4f}")
+
+    # ── #2 Post-hoc calibration improvement (isotonic) ────────────────────────
+    # Compare ranking quality before/after isotonic recalibration on held-out data
+    # Uses second-to-last fold as calibration set, last fold as test.
+    print("\n  Post-hoc recalibration (#2):")
+    if len(folds) >= 3:
+        from sklearn.isotonic import IsotonicRegression
+        cal_ti, cal_vi, cal_n_tr, _ = folds[-2]
+        cal_method_tmp = "isotonic" if cal_n_tr >= 500 else "sigmoid"
+        m_raw, imp_raw = _train(X[cal_ti], yp[cal_ti], n_est=150, leaves=20,
+                                calibration=cal_method_tmp)
+        # Get raw scores on calibration set, fit isotonic on top
+        raw_cal_preds = m_raw.predict_proba(imp_raw.transform(X[cal_vi]))[:, 1]
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(raw_cal_preds, yp[cal_vi])
+        # Evaluate on last fold
+        raw_test_preds   = m_raw.predict_proba(imp_raw.transform(X[last_vi]))[:, 1]
+        iso_test_preds   = iso.predict(raw_test_preds)
+        ece_before, _    = _compute_ece(yp[last_vi], raw_test_preds, n_bins=10)
+        ece_after, _     = _compute_ece(yp[last_vi], iso_test_preds, n_bins=10)
+        sp_before, _     = _spearman(yp[last_vi], raw_test_preds)
+        sp_after, _      = _spearman(yp[last_vi], iso_test_preds)
+        print(f"    ECE before: {ece_before:.4f}  after isotonic: {ece_after:.4f}  "
+              f"({'improved' if ece_after < ece_before else 'no improvement'})")
+        print(f"    Spearman before: {sp_before:+.4f}  after: {sp_after:+.4f}  "
+              f"(ranking {'preserved' if abs(sp_after - sp_before) < 0.02 else 'changed'})")
+        report.append(f"Post-hoc calibration: ECE {ece_before:.4f}->{ece_after:.4f}  "
+                      f"Spearman {sp_before:+.4f}->{sp_after:+.4f}")
+    else:
+        print("    Skipped — need 3+ folds")
+
+    # ── #1 Best-side model — policy-free label ────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  BEST-SIDE MODEL (#1) — policy-free label")
+    print("  y = 1 if max(edge_up, edge_down) > MIN_EDGE")
+    print("  Removes crowd-following bias from primary label.")
+    print("=" * 60)
+    base_rate_best = yp_best.mean()
+    log.info(f"  Best-side label: {yp_best.sum():,}/{len(yp_best):,} profitable "
+             f"({base_rate_best*100:.1f}%)")
+    print(f"\n  Primary label base rate : {yp.mean()*100:.1f}%  (follow crowd)")
+    print(f"  Best-side label base rate: {base_rate_best*100:.1f}%  (either direction)")
+    print(f"  Gap = {(base_rate_best - yp.mean())*100:+.1f}pp  "
+          f"(positive gap = crowd misses some edges)")
+    best_fold_results = []
+    for fold_i, (ti, vi, n_tr, n_te) in enumerate(folds):
+        yp_best_tr, yp_best_te = yp_best[ti], yp_best[vi]
+        cal = "isotonic" if n_tr >= 500 else "sigmoid"
+        m_b, imp_b = _train(X[ti], yp_best_tr, n_est=150, leaves=20, calibration=cal)
+        preds_b    = m_b.predict_proba(imp_b.transform(X[vi]))[:, 1]
+        base_b     = yp_best_tr.mean()
+        brier_b, baseline_b, imp_b_val, acc_b = _eval_fold("", yp_best_te, preds_b, base_b)
+        best_fold_results.append({"brier": brier_b, "imp": imp_b_val, "acc": acc_b})
+    avg_imp_best   = np.mean([r["imp"]   for r in best_fold_results])
+    avg_brier_best = np.mean([r["brier"] for r in best_fold_results])
+    avg_acc_best   = np.mean([r["acc"]   for r in best_fold_results])
+    print(f"\n  ── Best-side walk-forward ({len(folds)} folds) ──")
+    print(f"    Avg Brier imp  : {avg_imp_best:+.4f}  {'[OK]' if avg_imp_best > 0 else '[FAIL]'}")
+    print(f"    Avg Accuracy   : {avg_acc_best*100:.1f}%")
+    verdict = ("Better than primary → crowd-following bias was hiding real edge"
+               if avg_imp_best > avg_imp else
+               "Similar to primary → label choice doesn't matter much"
+               if abs(avg_imp_best - avg_imp) < 0.003 else
+               "Worse than primary → crowd-following label adds useful signal")
+    print(f"    vs primary imp : {avg_imp:+.4f} primary  vs  {avg_imp_best:+.4f} best-side")
+    print(f"    Verdict        : {verdict}")
+    report.append(f"Best-side model walk-forward: Brier={avg_brier_best:.4f} imp={avg_imp_best:+.4f}  {verdict}")
 
     # Train final models on ALL data for deployment
     log.info("  Training final classifier + regressor on all data...")
@@ -1382,6 +2017,111 @@ def main():
             "excludes":       list(NOPMARKET_EXCLUDE),
         }, f)
     log.info("  Saved model_v4_nopmarket.pkl")
+
+    # ── No-pmarket walk-forward validation ────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  NO-PMARKET MODEL — microstructure only")
+    print(f"  Excludes: {', '.join(sorted(NOPMARKET_EXCLUDE))}")
+    print("=" * 60)
+    npm_fold_results = []
+    for fold_i, (ti, vi, n_tr, n_te) in enumerate(folds):
+        X_npm_tr, yp_tr = X_npm[ti], yp[ti]
+        X_npm_te, yp_te = X_npm[vi], yp[vi]
+        cal_method = "isotonic" if n_tr >= 500 else "sigmoid"
+        npm_m, npm_i = _train(X_npm_tr, yp_tr, n_est=150, leaves=20,
+                              calibration=cal_method)
+        preds = npm_m.predict_proba(npm_i.transform(X_npm_te))[:, 1]
+        base_rate = yp_tr.mean()
+        brier, baseline, improvement, acc = _eval_fold(
+            f"Fold {fold_i+1}", yp_te, preds, base_rate)
+        npm_fold_results.append({
+            "brier": brier, "baseline": baseline,
+            "improvement": improvement, "accuracy": acc,
+        })
+    npm_avg_imp = np.mean([r["improvement"] for r in npm_fold_results])
+    npm_avg_brier = np.mean([r["brier"] for r in npm_fold_results])
+    npm_avg_base  = np.mean([r["baseline"] for r in npm_fold_results])
+    npm_avg_acc   = np.mean([r["accuracy"] for r in npm_fold_results])
+    print(f"\n  ── No-pmarket walk-forward average ({len(folds)} folds) ──")
+    print(f"    Classifier Brier : {npm_avg_brier:.4f}  vs baseline={npm_avg_base:.4f}")
+    print(f"    Avg Improvement  : {npm_avg_imp:+.4f}  {'[OK]' if npm_avg_imp > 0 else '[FAIL]'}")
+    print(f"    Avg Accuracy     : {npm_avg_acc*100:.1f}%")
+    print(f"    vs full model    : {avg_imp:+.4f} full  vs  {npm_avg_imp:+.4f} nopmarket")
+    report.append(f"NoPmarket model walk-forward: Brier={npm_avg_brier:.4f} imp={npm_avg_imp:+.4f}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # KILL TESTS — model validity checks
+    # ══════════════════════════════════════════════════════════════════════════
+    _run_kill_tests(X, yp, fn, folds, avg_imp, report)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DIRECTION MODEL: P(UP wins | features)
+    # Uses outcome_binary (1=UP, 0=DOWN) as label. Same features as primary.
+    # This tells you WHICH side to bet, while the primary model tells you
+    # WHETHER to bet at all.
+    # ══════════════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  DIRECTION MODEL — P(UP wins | features)")
+    print("  Label: outcome_binary (1=UP won, 0=DOWN won)")
+    print("  Same features as primary model")
+    print("=" * 60)
+
+    dir_fold_results = []
+    for fold_i, (ti, vi, n_tr, n_te) in enumerate(folds):
+        X_tr, yd_tr = X[ti], yd[ti]
+        X_te, yd_te = X[vi], yd[vi]
+        cal = "isotonic" if n_tr >= 500 else "sigmoid"
+        m_dir, imp_dir = _train(X_tr, yd_tr, n_est=150, leaves=20, calibration=cal)
+        preds_dir = m_dir.predict_proba(imp_dir.transform(X_te))[:, 1]
+
+        base_rate_dir = yd_tr.mean()
+        brier_dir     = brier_score_loss(yd_te, preds_dir)
+        baseline_dir  = brier_score_loss(yd_te, np.full(len(yd_te), base_rate_dir))
+        imp_dir_val   = baseline_dir - brier_dir
+        acc_dir       = np.mean((preds_dir >= 0.5) == yd_te)
+
+        # Compare to p_market baseline (Polymarket odds predict direction)
+        pm_te_dir = pm[vi]
+        brier_pm  = brier_score_loss(yd_te, pm_te_dir)
+        imp_vs_pm = brier_pm - brier_dir
+
+        dir_fold_results.append({
+            "fold": fold_i + 1, "brier": brier_dir, "baseline": baseline_dir,
+            "improvement": imp_dir_val, "accuracy": acc_dir,
+            "brier_pm": brier_pm, "imp_vs_pm": imp_vs_pm,
+        })
+
+    avg_imp_dir    = np.mean([r["improvement"] for r in dir_fold_results])
+    avg_acc_dir    = np.mean([r["accuracy"] for r in dir_fold_results])
+    avg_imp_vs_pm  = np.mean([r["imp_vs_pm"] for r in dir_fold_results])
+
+    print(f"\n  ── Direction model walk-forward ({len(folds)} folds) ──")
+    print(f"    Avg Brier imp vs base rate: {avg_imp_dir:+.4f}  "
+          f"{'[OK]' if avg_imp_dir > 0 else '[FAIL]'}")
+    print(f"    Avg Brier imp vs p_market:  {avg_imp_vs_pm:+.4f}  "
+          f"{'[BEATS CROWD]' if avg_imp_vs_pm > 0 else '[CROWD BETTER]'}")
+    print(f"    Avg Accuracy:               {avg_acc_dir*100:.1f}%")
+    print(f"    Base rate (UP wins):        {yd.mean()*100:.1f}%")
+    report.append(f"Direction model: imp={avg_imp_dir:+.4f} vs_pm={avg_imp_vs_pm:+.4f} acc={avg_acc_dir*100:.1f}%")
+
+    # Train final direction model on all data
+    dir_final, dir_imp_final = _train(X, yd, n_est=200, leaves=25,
+                                       calibration=cal_method_final)
+
+    # Direction model feature importance
+    print(f"\n  Direction model feature importance (top 15):")
+    _importance(dir_final, fn, top_n=15)
+
+    with open("model_v4_direction.pkl", "wb") as f:
+        pickle.dump({
+            "classifier":     dir_final,
+            "classifier_imp": dir_imp_final,
+            "features":       fn,
+            "target":         "outcome_binary (1=UP wins)",
+        }, f)
+    log.info("  Saved model_v4_direction.pkl")
+
+    # V5 training moved to train_v5.py (run separately)
 
     # ══════════════════════════════════════════════════════════════════════════
     # MARKET MODEL: strategy discovery (honest early-phase features only)
@@ -1467,15 +2207,20 @@ def main():
     print("=" * 60)
     print(f"  Primary model (profitable)  avg Brier imp: {avg_imp:+.4f}  "
           f"{'[OK]' if avg_imp > 0 else '[FAIL]'}")
-    print(f"  Market model (direction)    avg Brier imp: {avg_imp3:+.4f}  "
+    print(f"  Direction model (UP wins)   avg Brier imp: {avg_imp_dir:+.4f}  "
+          f"{'[OK]' if avg_imp_dir > 0 else '[FAIL]'}  "
+          f"vs crowd: {avg_imp_vs_pm:+.4f}")
+    print(f"  V5: run train_v5.py separately")
+    print(f"  Market model (discovery)    avg Brier imp: {avg_imp3:+.4f}  "
           f"{'[OK]' if avg_imp3 > 0 else '[FAIL]'}")
     print()
     print("  Saved: model_v4_profitable.pkl")
+    print("         model_v4_direction.pkl")
     print("         model_v4_nopmarket.pkl")
     print("         model_v4_market.pkl")
     print("=" * 60)
 
-    with open("training_report_v4.txt", "w") as f:
+    with open("training_report_v4.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(report))
 
 

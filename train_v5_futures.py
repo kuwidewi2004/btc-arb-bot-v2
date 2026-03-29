@@ -1,0 +1,598 @@
+"""
+V5 Futures Edge Regressor Training Pipeline
+=============================================
+Trains dual regressors for dYdX BTC-USD perpetual futures:
+  E(edge_long)  = (btc_resolution_price - btc_entry_price) / btc_entry_price - fees
+  E(edge_short) = (btc_entry_price - btc_resolution_price) / btc_entry_price - fees
+
+Labels: pure BTC price movement over 5-minute windows, minus 0.04% round-trip fees.
+Features: 82 including Polymarket sentiment (unique edge over other futures traders).
+
+This is the FUTURE production model for dYdX. V4 is the current production model.
+V5 replaces V4 when both correlations cross positive across 5+ folds.
+
+When ready, V5 enables:
+  - Model-driven direction: side = argmax(pred_long, pred_short)
+  - Model-driven sizing: size proportional to predicted edge
+  - No arbitrary threshold: predicted edge > 0 = trade
+
+Usage:
+  python train_v5_futures.py
+
+Output:
+  model_v5_edge.pkl — dual edge regressors for dYdX execution
+"""
+
+import sys
+import logging
+import pickle
+import math
+import warnings
+import numpy as np
+import requests
+from collections import OrderedDict, defaultdict
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+import lightgbm as lgb
+
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# Supabase config
+SUPABASE_URL = "https://kcluwyzyetmkxhvszpxi.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtjbHV3eXp5ZXRta3hodnN6cHhpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDA4NTY2NCwiZXhwIjoyMDg5NjYxNjY0fQ.IbxuXRW0K9_UFZKG1i951EoL9KtCsOXCaz5Z_YqsmYE"
+REST_H = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+LEAKAGE_SECS = 120
+REGIME_MAP   = {"TREND_UP":2,"TREND_DOWN":-2,"VOLATILE":1,"CALM":0,"DEAD":-1}
+SESSION_MAP  = {"OVERLAP":3,"US":2,"LONDON":1,"ASIA":0,"OFFPEAK":-1}
+ACTIVITY_MAP = {"HIGH":2,"NORMAL":1,"LOW":0,"DEAD":-1}
+WF_MIN_TRAIN = 100
+WF_TEST_SIZE = 60
+
+
+def _f(val):
+    if val is None:
+        return np.nan
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _rest_fetch(table, params, limit=500):
+    """Fetch using created_at cursor instead of OFFSET to avoid Supabase timeouts."""
+    rows = []
+    retries = 0
+    cursor = ""
+    while True:
+        p = {**params, "limit": limit}
+        if cursor:
+            p["created_at"] = f"gt.{cursor}"
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=REST_H, params=p, timeout=180)
+            if not r.text:
+                retries += 1
+                if retries > 3:
+                    break
+                import time; time.sleep(2)
+                continue
+            batch = r.json()
+            if isinstance(batch, dict):
+                retries += 1
+                if retries > 3:
+                    log.warning(f"  API error after 3 retries: {batch}")
+                    break
+                log.warning(f"  API error, retry {retries}: {batch.get('message','?')}")
+                import time; time.sleep(2)
+                continue
+            if not batch or not isinstance(batch, list):
+                break
+            rows.extend(batch)
+            retries = 0
+            if len(rows) % 5000 == 0:
+                log.info(f"  Fetched {len(rows):,}...")
+            if len(batch) < limit:
+                break
+            last_ts = batch[-1].get("created_at")
+            if not last_ts:
+                break
+            cursor = last_ts
+        except Exception as e:
+            retries += 1
+            if retries > 3:
+                log.warning(f"  Fetch stopped after 3 retries: {e}")
+                break
+            log.warning(f"  Retry {retries}: {e}")
+            import time; time.sleep(2)
+    return rows
+
+
+def walk_forward_splits(cond_ids):
+    markets = list(dict.fromkeys(cond_ids))
+    folds = []
+    for i in range(WF_MIN_TRAIN, len(markets) - WF_TEST_SIZE + 1, WF_TEST_SIZE):
+        tr_set = set(markets[:i])
+        te_set = set(markets[i:i + WF_TEST_SIZE])
+        ti = [j for j, c in enumerate(cond_ids) if c in tr_set]
+        vi = [j for j, c in enumerate(cond_ids) if c in te_set]
+        folds.append((ti, vi, len(tr_set), len(te_set)))
+    return folds
+
+
+def _train_regressor(X, y, n_est=150, leaves=20):
+    imp = SimpleImputer(strategy="median")
+    X_imp = imp.fit_transform(X)
+    model = lgb.LGBMRegressor(n_estimators=n_est, num_leaves=leaves,
+                               learning_rate=0.05, subsample=0.8,
+                               colsample_bytree=0.8, verbose=-1)
+    model.fit(X_imp, y)
+    return model, imp
+
+
+def _importance(model, fn, top_n=10):
+    imp = model.feature_importances_.astype(np.float64)
+    ranked = sorted(zip(fn, imp), key=lambda x: -x[1])
+    print(f"\n  Feature importance (top {top_n})")
+    print(f"  {'Feature':<40} {'Score':>8}")
+    for fname, sc in ranked[:top_n]:
+        bar = "#" * int(sc / ranked[0][1] * 20) if ranked[0][1] > 0 else ""
+        print(f"  {fname:<40} {sc:>8.1f}  {bar}")
+
+# Unified cost model — matches quant_engine.py and execution.py
+DYDX_TAKER_FEE = 0.0005   # 0.05% per side on dYdX
+ROUND_TRIP     = DYDX_TAKER_FEE * 2  # 0.10% round trip
+MIN_EDGE       = 0.0005   # 0.05% minimum edge for futures
+
+
+def _build_cross_market_lookup(rows) -> dict:
+    market_rows = OrderedDict()
+    for row in rows:
+        cid = row.get("condition_id", "")
+        if cid not in market_rows:
+            market_rows[cid] = []
+        market_rows[cid].append(row)
+
+    market_summaries = OrderedDict()
+    for cid, mrows in market_rows.items():
+        last = mrows[-1]
+        ob = _f(last.get("outcome_binary"))
+        market_summaries[cid] = {
+            "outcome": ob if not np.isnan(ob) else np.nan,
+            "momentum_30s": _f(last.get("momentum_30s")),
+            "ob_imbalance": _f(last.get("ob_imbalance")),
+            "vol_range_pct": _f(last.get("vol_range_pct")),
+            "btc_range_pct": _f(last.get("btc_range_pct")),
+            "p_market": _f(last.get("p_market")),
+            "funding_zscore": _f(last.get("funding_zscore")),
+        }
+
+    cids = list(market_summaries.keys())
+    cross = {}
+    streak_up = streak_down = 0
+    for i, cid in enumerate(cids):
+        if i == 0:
+            cross[cid] = {
+                "prev_outcome": np.nan, "prev_momentum": np.nan,
+                "prev_ob_imbalance": np.nan, "prev_vol_range": np.nan,
+                "prev_btc_range": np.nan, "prev_p_market_final": np.nan,
+                "prev_funding_zscore": np.nan,
+                "streak_up": 0.0, "streak_down": 0.0,
+            }
+        else:
+            prev = market_summaries[cids[i-1]]
+            cross[cid] = {
+                "prev_outcome": prev["outcome"],
+                "prev_momentum": prev["momentum_30s"],
+                "prev_ob_imbalance": prev["ob_imbalance"],
+                "prev_vol_range": prev["vol_range_pct"],
+                "prev_btc_range": prev["btc_range_pct"],
+                "prev_p_market_final": prev["p_market"],
+                "prev_funding_zscore": prev["funding_zscore"],
+                "streak_up": float(streak_up),
+                "streak_down": float(streak_down),
+            }
+        cur_outcome = market_summaries[cid]["outcome"]
+        if not np.isnan(cur_outcome):
+            if cur_outcome == 1:
+                streak_up += 1; streak_down = 0
+            else:
+                streak_down += 1; streak_up = 0
+    return cross
+
+
+def fetch_snapshots_v5() -> list:
+    """Fetch snapshots with btc_resolution_price for futures labels."""
+    log.info("Fetching market_snapshots for V5 (futures)...")
+    cols = ",".join([
+        "created_at","condition_id","secs_left","secs_to_resolution","market_progress",
+        "phase_early",
+        "hour_sin","hour_cos","dow_sin","dow_cos",
+        "price_vs_open_pct","price_vs_open_score",
+        "momentum_30s","momentum_60s","momentum_120s",
+        "cl_vs_open_pct",
+        "liq_total","liq_imbalance","liq_long_usd","liq_short_usd","liq_dominant_ratio",
+        "ob_imbalance","ob_bid_depth","ob_ask_depth",
+        "vol_range_pct","volume_buy_ratio",
+        "p_market","poly_fill_up","poly_fill_down","poly_spread",
+        "basis_pct","funding_rate","okx_funding","gate_funding",
+        "volatility_pct","flow_score","funding_zscore",
+        "regime","session","activity","day_type",
+        "avg_ob_imbalance_abs","avg_funding_zscore_abs",
+        "avg_momentum_abs","btc_range_pct","p_market_std",
+        "poly_flow_imb","poly_depth_ratio",
+        "poly_trade_imb","poly_up_buys","poly_down_buys","poly_trade_count","poly_large_pct",
+        "tick_cvd_30s","tick_taker_buy_ratio_30s","tick_large_buy_usd_30s",
+        "tick_large_sell_usd_30s","tick_intensity_30s","tick_vwap_disp_30s",
+        "tick_cvd_60s","tick_taker_buy_ratio_60s","tick_intensity_60s",
+        "delta_cvd","delta_taker_buy","delta_momentum","delta_poly","delta_score",
+        "delta_funding","delta_basis",
+        "btc_price","btc_resolution_price",
+        "outcome_binary",
+    ])
+    all_rows = _rest_fetch("market_snapshots", {
+        "select": cols,
+        "outcome_binary": "not.is.null",
+        "order": "created_at.asc",
+    })
+    log.info(f"  {len(all_rows):,} total resolved rows fetched")
+    rows = [r for r in all_rows if r.get("btc_resolution_price") is not None]
+    log.info(f"  {len(rows):,} rows with btc_resolution_price")
+    return rows
+
+
+def build_v5_features(rows):
+    """
+    Build feature matrix for V5 futures model.
+    Labels based on BTC price movement (not Polymarket fills).
+    Features include Polymarket data as unique signal source.
+    """
+    cross_mkt = _build_cross_market_lookup(rows)
+
+    records = []
+    y_edge_long = []
+    y_edge_short = []
+    cond_ids = []
+    skipped = 0
+
+    for row in rows:
+        ob = _f(row.get("outcome_binary"))
+        pm = _f(row.get("p_market"))
+        btc_price = _f(row.get("btc_price"))
+        btc_res   = _f(row.get("btc_resolution_price"))
+
+        str_val = _f(row.get("secs_to_resolution"))
+        sl_val  = _f(row.get("secs_left"))
+        if not np.isnan(str_val):
+            str_ = str_val
+        elif not np.isnan(sl_val):
+            str_ = sl_val
+        else:
+            str_ = np.nan
+
+        if np.isnan(ob) or np.isnan(pm) or np.isnan(str_):
+            skipped += 1; continue
+        if str_ < LEAKAGE_SECS:
+            skipped += 1; continue
+        if np.isnan(btc_price) or np.isnan(btc_res) or btc_price <= 0:
+            skipped += 1; continue
+
+        # Futures labels: pure BTC price movement minus fees
+        edge_long  = (btc_res - btc_price) / btc_price - ROUND_TRIP
+        edge_short = (btc_price - btc_res) / btc_price - ROUND_TRIP
+
+        _cross = cross_mkt.get(row.get("condition_id", ""), {})
+        mp = _f(row.get("market_progress"))
+        if np.isnan(mp): mp = max(0.0, min(1.0, 1.0 - str_ / 300.0))
+        vr = _f(row.get("vol_range_pct"))
+        fr = _f(row.get("funding_rate"))
+        fz = _f(row.get("funding_zscore"))
+        m30 = _f(row.get("momentum_30s"))
+        m60 = _f(row.get("momentum_60s"))
+        m120 = _f(row.get("momentum_120s"))
+        obi = _f(row.get("ob_imbalance"))
+        li = _f(row.get("liq_imbalance"))
+
+        f = {
+            "secs_to_resolution":     str_,
+            "log_secs_to_resolution": math.log1p(str_),
+            "market_progress":        mp,
+            "hour_sin": _f(row.get("hour_sin")), "hour_cos": _f(row.get("hour_cos")),
+            "dow_sin": _f(row.get("dow_sin")), "dow_cos": _f(row.get("dow_cos")),
+            "price_vs_open_pct": _f(row.get("price_vs_open_pct")),
+            "price_vs_open_score": _f(row.get("price_vs_open_score")),
+            "momentum_30s": m30, "momentum_60s": m60, "momentum_120s": m120,
+            "mom_accel_abs": abs(m30 - m60) if not (np.isnan(m30) or np.isnan(m60)) else np.nan,
+            "cl_vs_open_pct": _f(row.get("cl_vs_open_pct")),
+            "liq_total": min(_f(row.get("liq_total")), 5e6),
+            "liq_imbalance": li,
+            "liq_long_usd": min(_f(row.get("liq_long_usd")), 5e6),
+            "liq_short_usd": min(_f(row.get("liq_short_usd")), 5e6),
+            "liq_imbal_x_secs": li * str_ if not (np.isnan(li) or np.isnan(str_)) else np.nan,
+            "ob_imbalance": obi, "ob_bid_depth": _f(row.get("ob_bid_depth")),
+            "ob_ask_depth": _f(row.get("ob_ask_depth")),
+            "vol_range_pct": vr, "volatility_pct": _f(row.get("volatility_pct")),
+            "volume_buy_ratio": _f(row.get("volume_buy_ratio")),
+            # Polymarket
+            "p_market": pm, "pm_abs_deviation": abs(pm - 0.5),
+            "pm_uncertainty": 1.0 - abs(pm - 0.5) * 2,
+            "poly_flow_imb": _f(row.get("poly_flow_imb")),
+            "poly_depth_ratio": _f(row.get("poly_depth_ratio")),
+            "poly_trade_imb": _f(row.get("poly_trade_imb")),
+            "poly_up_buys": _f(row.get("poly_up_buys")),
+            "poly_down_buys": _f(row.get("poly_down_buys")),
+            "poly_trade_count": _f(row.get("poly_trade_count")),
+            "poly_large_pct": _f(row.get("poly_large_pct")),
+            # Funding
+            "basis_pct": _f(row.get("basis_pct")),
+            "funding_rate": fr, "funding_zscore": fz,
+            "okx_funding": _f(row.get("okx_funding")),
+            "gate_funding": _f(row.get("gate_funding")),
+            "funding_abs": abs(fr) if not np.isnan(fr) else np.nan,
+            # Regime
+            "regime_enc": REGIME_MAP.get(row.get("regime", ""), 0),
+            "session_enc": SESSION_MAP.get(row.get("session", ""), 0),
+            "activity_enc": ACTIVITY_MAP.get(row.get("activity", ""), 0),
+            # Interactions
+            "interact_mom_x_vol": m30 * vr if not (np.isnan(m30) or np.isnan(vr)) else np.nan,
+            "interact_liq_x_price": li * _f(row.get("price_vs_open_pct")) if not np.isnan(li) else np.nan,
+            "okx_x_fr": _f(row.get("okx_funding")) * fr if not np.isnan(fr) else np.nan,
+            # Rolling
+            "avg_ob_imbalance_abs": _f(row.get("avg_ob_imbalance_abs")),
+            "avg_funding_zscore_abs": _f(row.get("avg_funding_zscore_abs")),
+            "avg_momentum_abs": _f(row.get("avg_momentum_abs")),
+            "btc_range_pct": _f(row.get("btc_range_pct")),
+            "p_market_std": _f(row.get("p_market_std")),
+            # Tick
+            "tick_cvd_30s": _f(row.get("tick_cvd_30s")),
+            "tick_taker_buy_ratio_30s": _f(row.get("tick_taker_buy_ratio_30s")),
+            "tick_large_buy_usd_30s": _f(row.get("tick_large_buy_usd_30s")),
+            "tick_large_sell_usd_30s": _f(row.get("tick_large_sell_usd_30s")),
+            "tick_intensity_30s": _f(row.get("tick_intensity_30s")),
+            "tick_vwap_disp_30s": _f(row.get("tick_vwap_disp_30s")),
+            "tick_cvd_60s": _f(row.get("tick_cvd_60s")),
+            "tick_taker_buy_ratio_60s": _f(row.get("tick_taker_buy_ratio_60s")),
+            "tick_intensity_60s": _f(row.get("tick_intensity_60s")),
+            # Spot OB features REMOVED — permanently dead (Binance geo-block)
+            # Deltas
+            "delta_cvd": _f(row.get("delta_cvd")),
+            "delta_taker_buy": _f(row.get("delta_taker_buy")),
+            "delta_momentum": _f(row.get("delta_momentum")),
+            "delta_funding": _f(row.get("delta_funding")),
+            "delta_basis": _f(row.get("delta_basis")),
+            # Cross-market
+            **{k: v for k, v in _cross.items()},
+            "prev_vol_x_momentum": _cross.get("prev_vol_range", 0) * _cross.get("prev_momentum", 0),
+            "session_x_vol": SESSION_MAP.get(row.get("session", ""), 0) * vr if not np.isnan(vr) else np.nan,
+            "streak_length": max(_cross.get("streak_up", 0), _cross.get("streak_down", 0)),
+        }
+
+        records.append(f)
+        y_edge_long.append(round(edge_long, 6))
+        y_edge_short.append(round(edge_short, 6))
+        cond_ids.append(row.get("condition_id", ""))
+
+    log.info(f"  Engineered {len(records):,} rows ({skipped:,} skipped)")
+    if not records:
+        return None, None, None, None, None
+
+    fn = list(records[0].keys())
+    X  = np.array([[r[k] for k in fn] for r in records], dtype=np.float32)
+    ye_long  = np.array(y_edge_long,  dtype=np.float32)
+    ye_short = np.array(y_edge_short, dtype=np.float32)
+
+    log.info(f"  Features: {len(fn)}  |  avg edge_long={ye_long.mean():.6f}  avg edge_short={ye_short.mean():.6f}")
+
+    return X, ye_long, ye_short, cond_ids, fn
+
+
+def main():
+    print("=" * 60)
+    print("  V5 FUTURES EDGE REGRESSOR PIPELINE")
+    print("  E(edge_long) and E(edge_short) per snapshot")
+    print("  Labels: BTC price movement minus 0.04% round-trip fees")
+    print("  Features: full set including Polymarket sentiment")
+    print("=" * 60)
+
+    rows = fetch_snapshots_v5()
+    if not rows:
+        log.error("No data with btc_resolution_price. Is resolver running?")
+        return
+
+    result = build_v5_features(rows)
+    if result[0] is None:
+        log.error("No usable rows after feature engineering.")
+        return
+
+    X, ye_long, ye_short, cids, fn = result
+
+    folds = walk_forward_splits(cids)
+    n_markets = len(set(cids))
+    log.info(f"  {n_markets} markets, {len(X)} rows, {len(fn)} features, {len(folds)} folds")
+
+    # Walk-forward validation
+    fold_results = []
+    for fold_i, (ti, vi, n_tr, n_te) in enumerate(folds):
+        X_tr, X_te = X[ti], X[vi]
+        yl_tr, yl_te = ye_long[ti], ye_long[vi]
+        ys_tr, ys_te = ye_short[ti], ye_short[vi]
+
+        reg_up, imp_up   = _train_regressor(X_tr, yl_tr, n_est=150, leaves=20)
+        reg_down, imp_down = _train_regressor(X_tr, ys_tr, n_est=150, leaves=20)
+
+        pred_up  = reg_up.predict(imp_up.transform(X_te))
+        pred_down = reg_down.predict(imp_down.transform(X_te))
+
+        mae_up  = float(np.mean(np.abs(pred_up  - yl_te)))
+        mae_down = float(np.mean(np.abs(pred_down - ys_te)))
+        corr_up  = float(np.corrcoef(pred_up,  yl_te)[0,1])  if len(yl_te) > 2 else 0.0
+        corr_down = float(np.corrcoef(pred_down, ys_te)[0,1]) if len(ys_te) > 2 else 0.0
+
+        # Decision: go long or short based on higher predicted edge
+        chosen_up     = pred_up > pred_down
+        pred_edge   = np.where(chosen_up, pred_up, pred_down)
+        actual_edge = np.where(chosen_up, yl_te, ys_te)
+
+        trade_mask = pred_edge > MIN_EDGE
+        n_trades   = int(trade_mask.sum())
+
+        if n_trades > 0:
+            sim_pnl  = float(actual_edge[trade_mask].sum())
+            pnl_per  = float(actual_edge[trade_mask].mean())
+            win_rate = float((actual_edge[trade_mask] > 0).mean())
+            actual_up = yl_te > ys_te
+            side_acc = float((chosen_up[trade_mask] == actual_up[trade_mask]).mean())
+        else:
+            sim_pnl = pnl_per = win_rate = side_acc = 0.0
+
+        fold_results.append({
+            "fold": fold_i + 1, "n_train": n_tr, "n_test": n_te,
+            "mae_up": mae_up, "mae_down": mae_down,
+            "corr_up": corr_up, "corr_down": corr_down,
+            "n_trades": n_trades, "sim_pnl": sim_pnl,
+            "pnl_per": pnl_per, "win_rate": win_rate, "side_acc": side_acc,
+        })
+
+        print(f"\n  Fold {fold_i+1}  train={n_tr}  test={n_te}")
+        print(f"    MAE  long={mae_up:.6f}  short={mae_down:.6f}")
+        print(f"    Corr long={corr_up:+.3f}  short={corr_down:+.3f}")
+        print(f"    Trades: {n_trades}  PnL={sim_pnl:+.6f}  "
+              f"edge/trade={pnl_per:+.6f}  WR={win_rate*100:.1f}%")
+        print(f"    Side accuracy: {side_acc*100:.1f}%")
+
+    # Averages
+    avg_corr_up  = np.mean([r["corr_up"]  for r in fold_results])
+    avg_corr_down = np.mean([r["corr_down"] for r in fold_results])
+    total_pnl      = sum(r["sim_pnl"]   for r in fold_results)
+    total_trades   = sum(r["n_trades"]  for r in fold_results)
+    folds_with     = [r for r in fold_results if r["n_trades"] > 0]
+    avg_wr         = np.mean([r["win_rate"] for r in folds_with]) if folds_with else 0.0
+    avg_side       = np.mean([r["side_acc"] for r in folds_with]) if folds_with else 0.0
+
+    print(f"\n  ── V5 Futures walk-forward ({len(folds)} folds) ──")
+    print(f"    Corr long={avg_corr_up:+.4f}  short={avg_corr_down:+.4f}")
+    print(f"    Total PnL: {total_pnl:+.6f}  ({total_trades} trades)")
+    print(f"    Avg WR: {avg_wr*100:.1f}%  Side acc: {avg_side*100:.1f}%")
+
+    # Train final models
+    # ── KILL TESTS ────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  V5 KILL TESTS — signal validity")
+    print("=" * 60)
+
+    last_ti, last_vi = folds[-1][0], folds[-1][1]
+    X_last_tr, X_last_te = X[last_ti], X[last_vi]
+    yl_last_tr, yl_last_te = ye_long[last_ti], ye_long[last_vi]
+    ys_last_tr, ys_last_te = ye_short[last_ti], ye_short[last_vi]
+
+    # [1] Shuffle Test
+    print("\n  [1] Shuffle Test")
+    shuf_idx = np.random.permutation(len(yl_last_tr))
+    shuf_reg, shuf_imp = _train_regressor(X_last_tr, yl_last_tr[shuf_idx], n_est=100, leaves=15)
+    shuf_pred = shuf_reg.predict(shuf_imp.transform(X_last_te))
+    shuf_corr = float(np.corrcoef(shuf_pred, yl_last_te)[0,1]) if len(yl_last_te) > 2 else 0
+    real_corr = fold_results[-1]["corr_up"]
+    shuf_pass = abs(shuf_corr) < abs(real_corr) * 0.5
+    print(f"      Real corr:     {real_corr:+.4f}")
+    print(f"      Shuffled corr: {shuf_corr:+.4f}")
+    print(f"      Result:        {'PASS' if shuf_pass else 'FAIL'}")
+
+    # [2] Time Shift Test
+    print("\n  [2] Time Shift Test")
+    if len(folds) >= 3:
+        prev_ti = folds[-2][0]
+        ts_reg, ts_imp = _train_regressor(X[prev_ti], ye_long[prev_ti], n_est=100, leaves=15)
+        ts_pred = ts_reg.predict(ts_imp.transform(X_last_te))
+        ts_corr = float(np.corrcoef(ts_pred, yl_last_te)[0,1]) if len(yl_last_te) > 2 else 0
+        ts_pass = (real_corr - ts_corr) > -0.05
+        print(f"      Real corr:         {real_corr:+.4f}")
+        print(f"      Time-shifted corr: {ts_corr:+.4f}")
+        print(f"      Result:            {'PASS' if ts_pass else 'WARN'}")
+    else:
+        print("      Skipped — need 3+ folds")
+        ts_pass = True
+
+    # [3] Sign Test
+    print("\n  [3] Sign Test (Direction Accuracy)")
+    reg_up_t, imp_up_t = _train_regressor(X_last_tr, yl_last_tr, n_est=100, leaves=15)
+    reg_dn_t, imp_dn_t = _train_regressor(X_last_tr, ys_last_tr, n_est=100, leaves=15)
+    p_up_t = reg_up_t.predict(imp_up_t.transform(X_last_te))
+    p_dn_t = reg_dn_t.predict(imp_dn_t.transform(X_last_te))
+    model_picks_up = p_up_t > p_dn_t
+    actual_up_better = yl_last_te > ys_last_te
+    sign_acc = float((model_picks_up == actual_up_better).mean())
+    sign_pass = sign_acc > 0.52
+    print(f"      Side accuracy: {sign_acc*100:.1f}%")
+    print(f"      Edge vs random: {(sign_acc-0.5)*100:+.1f}pp")
+    print(f"      Result:        {'PASS' if sign_pass else 'FAIL'}")
+
+    # [4] Edge Magnitude Test
+    print("\n  [4] Edge Magnitude Test")
+    best_edge = np.maximum(p_up_t, p_dn_t)
+    actual_best = np.where(model_picks_up, yl_last_te, ys_last_te)
+    q75 = np.percentile(best_edge, 75)
+    q25 = np.percentile(best_edge, 25)
+    top_actual = actual_best[best_edge >= q75].mean() if (best_edge >= q75).sum() > 0 else 0
+    bot_actual = actual_best[best_edge <= q25].mean() if (best_edge <= q25).sum() > 0 else 0
+    mag_pass = top_actual > bot_actual
+    print(f"      Top-25% pred → actual: {top_actual:+.6f}")
+    print(f"      Bot-25% pred → actual: {bot_actual:+.6f}")
+    print(f"      Result:        {'PASS' if mag_pass else 'FAIL'}")
+
+    print(f"\n  Kill test summary:")
+    print(f"    [1] Shuffle:   {'PASS' if shuf_pass else 'FAIL'}")
+    print(f"    [2] Time shift:{'PASS' if ts_pass else 'WARN'}")
+    print(f"    [3] Sign:      {'PASS' if sign_pass else 'FAIL'}")
+    print(f"    [4] Magnitude: {'PASS' if mag_pass else 'FAIL'}")
+
+    log.info("  Training final V5 futures regressors...")
+    final_up,  imp_up  = _train_regressor(X, ye_long,  n_est=200, leaves=25)
+    final_down, imp_down = _train_regressor(X, ye_short, n_est=200, leaves=25)
+
+    print("\n  Edge UP importance (top 15):")
+    _importance(final_up, fn, top_n=15)
+    print("\n  Edge DOWN importance (top 15):")
+    _importance(final_down, fn, top_n=15)
+
+    # Save
+    with open("model_v5_edge.pkl", "wb") as f:
+        pickle.dump({
+            "regressor_up":      final_up,
+            "regressor_up_imp":  imp_up,
+            "regressor_down":     final_down,
+            "regressor_down_imp": imp_down,
+            "features":            fn,
+            "target_long":         "edge_long = (btc_res - btc_price) / btc_price - 0.04%",
+            "target_short":        "edge_short = (btc_price - btc_res) / btc_price - 0.04%",
+            "venue":               "futures",
+            "round_trip_fee":      ROUND_TRIP,
+            "min_edge":            MIN_EDGE,
+            "walk_forward": {
+                "n_folds":       len(folds),
+                "avg_corr_up": avg_corr_up,
+                "avg_corr_down":avg_corr_down,
+                "total_pnl":     total_pnl,
+            },
+        }, f)
+    log.info("  Saved model_v5_edge.pkl")
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("  V5 FUTURES SUMMARY")
+    print("=" * 60)
+    print(f"  Venue:       Futures (BTC perpetual)")
+    print(f"  Features:    {len(fn)} (incl. Polymarket sentiment)")
+    print(f"  Labels:      BTC price movement ± {ROUND_TRIP*100:.2f}% fees")
+    print(f"  Corr LONG:   {avg_corr_up:+.4f}")
+    print(f"  Corr SHORT:  {avg_corr_down:+.4f}")
+    print(f"  Total PnL:   {total_pnl:+.6f}")
+    print(f"  Side acc:    {avg_side*100:.1f}%")
+    ready = avg_corr_up > 0 and avg_corr_down > 0
+    print(f"  Status:      {'READY' if ready else 'NOT READY — correlations still negative'}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
