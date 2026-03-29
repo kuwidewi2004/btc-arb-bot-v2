@@ -831,39 +831,43 @@ def refresh_shared_data():
     if time.time() - _iv_cache["fetched_at"] >= 300:
         _fetch_deribit_iv()
 
-    # Binance open interest — how crowded is the BTC futures market?
+    # OKX open interest — how crowded is the BTC futures market?
     # Rapid OI increase + price stall = potential liquidation cascade
+    # (Binance fapi REST is geo-blocked from Railway US; OKX works fine)
     if now - _oi_cache["fetched_at"] >= 30:
         try:
             r = _session.get(
-                "https://fapi.binance.com/fapi/v1/openInterest",
-                params={"symbol": "BTCUSDT"}, timeout=5)
+                f"{OKX_BASE}/api/v5/public/open-interest",
+                params={"instType": "SWAP", "instId": OKX_BTC}, timeout=5)
             r.raise_for_status()
-            new_oi = float(r.json().get("openInterest", 0))
+            data = r.json().get("data", [{}])[0]
+            new_oi = float(data.get("oiCcy", 0))  # OI in BTC
             prev_oi = _oi_cache["open_interest"]
             _oi_cache["oi_change_5m"] = round((new_oi - prev_oi) / max(prev_oi, 1.0), 6) if prev_oi > 0 else 0.0
             _oi_cache["open_interest"] = new_oi
             _oi_cache["fetched_at"] = now
         except Exception as e:
-            log.warning(f"Binance OI fetch failed: {e}")
+            log.warning(f"OKX OI fetch failed: {e}")
 
-    # Binance long/short ratio — account-level positioning
+    # OKX long/short ratio — contract-level positioning
     # Extreme readings (>2.0 or <0.5) = contrarian signal
     if now - _lsr_cache["fetched_at"] >= 60:
         try:
             r = _session.get(
-                "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
-                params={"symbol": "BTCUSDT", "period": "5m", "limit": "1"}, timeout=5)
+                f"{OKX_BASE}/api/v5/rubik/stat/contracts/long-short-account-ratio-contract",
+                params={"instId": OKX_BTC, "period": "5m"}, timeout=5)
             r.raise_for_status()
-            data = r.json()
-            if data and isinstance(data, list):
-                entry = data[0]
-                _lsr_cache["long_short_ratio"] = round(float(entry.get("longShortRatio", 1.0)), 4)
-                _lsr_cache["long_account_pct"] = round(float(entry.get("longAccount", 0.5)), 4)
-                _lsr_cache["short_account_pct"] = round(float(entry.get("shortAccount", 0.5)), 4)
+            data = r.json().get("data", [])
+            if data:
+                ratio = float(data[0][1])  # [timestamp, ratio]
+                long_pct = round(ratio / (1.0 + ratio), 4)
+                short_pct = round(1.0 - long_pct, 4)
+                _lsr_cache["long_short_ratio"] = round(ratio, 4)
+                _lsr_cache["long_account_pct"] = long_pct
+                _lsr_cache["short_account_pct"] = short_pct
                 _lsr_cache["fetched_at"] = now
         except Exception as e:
-            log.warning(f"Binance LSR fetch failed: {e}")
+            log.warning(f"OKX LSR fetch failed: {e}")
 
     # Basis via OKX mark price vs spot
     if now - _basis_cache["fetched_at"] >= 10:
