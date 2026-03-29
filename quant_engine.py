@@ -1620,38 +1620,46 @@ def _on_poly_trade_message(ws, message):
     if message == "PONG":
         return
     try:
-        d = json.loads(message)
-        # Log non-trade events for debugging
-        evt = d.get("event_type", "")
-        if evt and evt != "last_trade_price":
-            log.debug(f"[Poly Trades] event: {evt}")
+        raw = json.loads(message)
+
+        # Polymarket sends trades as JSON array OR single object
+        if isinstance(raw, list):
+            trades = raw
+        elif isinstance(raw, dict):
+            # Single event object (e.g. last_trade_price, subscription confirmation)
+            evt = raw.get("event_type", "")
+            if evt and evt != "last_trade_price":
+                log.debug(f"[Poly Trades] event: {evt}")
+                return
+            if not evt:
+                log.info(f"[Poly Trades] msg: {str(message)[:200]}")
+                return
+            trades = [raw]
+        else:
             return
-        if not evt:
-            # Might be a subscription confirmation or error
-            log.info(f"[Poly Trades] msg: {str(message)[:200]}")
-            return
 
-        asset_id = d.get("asset_id", "")
-        price    = float(d.get("price", 0))
-        size     = float(d.get("size", 0))
-        side     = d.get("side", "")  # BUY or SELL
-        ts_ms    = int(d.get("timestamp", time.time() * 1000))
+        for d in trades:
+            asset_id = d.get("asset_id", "")
+            price    = float(d.get("price", 0))
+            size     = float(d.get("size", 0))
+            side     = d.get("side", "")  # BUY or SELL
+            ts_ms    = int(d.get("timestamp", time.time() * 1000))
 
-        # Determine if this is an UP or DOWN token trade
-        is_up_token = (asset_id == _poly_ws_token_ids[0]) if _poly_ws_token_ids else None
+            # Determine if this is an UP or DOWN token trade
+            is_up_token = (asset_id == _poly_ws_token_ids[0]) if _poly_ws_token_ids else None
 
-        _poly_last_trade_ts = time.time()
+            _poly_last_trade_ts = time.time()
 
-        with _poly_trades_lock:
-            _poly_trades_buffer.append({
-                "ts": ts_ms, "price": price, "size": size,
-                "usd": price * size, "side": side,
-                "is_up_token": is_up_token,
-            })
-            # Trim to last 2 minutes
-            cutoff = (time.time() - 120) * 1000
-            while _poly_trades_buffer and _poly_trades_buffer[0]["ts"] < cutoff:
-                _poly_trades_buffer.popleft()
+            with _poly_trades_lock:
+                _poly_trades_buffer.append({
+                    "ts": ts_ms, "price": price, "size": size,
+                    "usd": price * size, "side": side,
+                    "is_up_token": is_up_token,
+                })
+                # Trim to last 2 minutes
+                cutoff = (time.time() - 120) * 1000
+                while _poly_trades_buffer and _poly_trades_buffer[0]["ts"] < cutoff:
+                    _poly_trades_buffer.popleft()
     except Exception as e:
         log.warning(f"[Poly Trades] parse error: {e} | msg={str(message)[:200]}")
 
@@ -1742,19 +1750,16 @@ def update_poly_trade_subscription(market: "Market"):
     # Clear buffer on market change
     with _poly_trades_lock:
         _poly_trades_buffer.clear()
-    # Send new subscription if WS is connected
+    # Force reconnect to subscribe with new token IDs
+    # (Polymarket WS doesn't support resubscription on an existing connection)
     if _poly_ws_instance and _poly_ws_instance.sock and _poly_ws_instance.sock.connected:
+        log.info("[Poly Trades] Closing WS to reconnect with new tokens...")
         try:
-            sub_msg = json.dumps({
-                "assets_ids": _poly_ws_token_ids,
-                "type": "market",
-            })
-            _poly_ws_instance.send(sub_msg)
-            log.info(f"[Poly Trades] Resubscribed with {len(_poly_ws_token_ids)} tokens")
-        except Exception as e:
-            log.warning(f"[Poly Trades] Resubscribe failed: {e}")
+            _poly_ws_instance.close()
+        except Exception:
+            pass
     else:
-        log.warning(f"[Poly Trades] WS not connected — will subscribe on reconnect")
+        log.info("[Poly Trades] WS not connected — will subscribe on reconnect")
 
 
 def get_poly_trade_flow(lookback_secs: float = 30.0) -> dict:
