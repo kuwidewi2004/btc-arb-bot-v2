@@ -326,13 +326,6 @@ _prev_market: dict = {
     "streak_up":          0.0,
     "streak_down":        0.0,
 }
-if _lgbm_available:
-    try:
-        with open("model_v4_direction.pkl", "rb") as _mf3:
-            _ml_bundle_dir = _pickle.load(_mf3)
-        log.info(f"ML direction bundle loaded: {len(_ml_bundle_dir['features'])} features")
-    except Exception as _e:
-        log.warning(f"ML direction bundle NOT loaded: {_e}")
 
 
 def _update_ml_score(condition_id: str, secs_to_res: float, market_progress: float,
