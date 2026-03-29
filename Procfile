@@ -1,1 +1,1 @@
-web: python -c "import sys; print('Python', sys.version); [print(f'{m} OK') for m in ['requests','numpy','websocket','sklearn'] if __import__(m)]; print('Starting...')" && python quant_engine.py
+web: python start.py
