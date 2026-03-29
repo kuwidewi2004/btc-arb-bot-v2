@@ -2794,7 +2794,7 @@ def run():
                                 "entry_price":     round(spot, 2),
                                 "score":           round(quant_score, 4),
                                 "edge_predicted":  round(quant_fill - 0.5, 4) if quant_fill else None,
-                                "hold_secs":       round(secs_left, 1),
+                                "hold_secs":       180.0,  # 3-min hold (matches V5 lookahead)
                                 "features":        json.dumps({
                                     "p_market": round(poly_up_mid, 4),
                                     "ob_imbalance": round(float(_ob_cache.get("imbalance", 0.0)), 4),
