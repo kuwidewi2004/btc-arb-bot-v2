@@ -250,12 +250,15 @@ import pickle as _pickle
 
 # Pre-check: can lightgbm load? If not, skip all model loading to avoid segfault.
 _lgbm_available = False
-try:
-    import lightgbm
-    _lgbm_available = True
-    log.info(f"lightgbm {lightgbm.__version__} available")
-except Exception as _e:
-    log.warning(f"lightgbm NOT available: {_e} — ML scoring disabled")
+if os.environ.get("SKIP_LIGHTGBM") != "1":
+    try:
+        import lightgbm
+        _lgbm_available = True
+        log.info(f"lightgbm {lightgbm.__version__} available")
+    except Exception as _e:
+        log.warning(f"lightgbm NOT available: {_e} — ML scoring disabled")
+else:
+    log.warning("lightgbm SKIPPED via SKIP_LIGHTGBM=1 — ML scoring disabled")
 
 _ml_scores: dict  = {}    # condition_id -> latest P(profitable)
 _ml_bundle        = None
