@@ -53,6 +53,86 @@ ACTIVITY_MAP = {"HIGH":2,"NORMAL":1,"LOW":0,"DEAD":-1}
 WF_MIN_TRAIN = 100
 WF_TEST_SIZE = 60
 
+# ── V4 scoring for meta-feature ──────────────────────────────────────────
+# Load V4 model to score each snapshot with P(profitable) and P(UP).
+# These scores become features in V5 — proven +30% corr improvement.
+import pickle as _pickle
+
+_v4_clf = _v4_imp = _v4_features = None
+_v4d_clf = _v4d_imp = None
+try:
+    with open("models/model_v4_profitable.pkl", "rb") as _f4:
+        _v4 = _pickle.load(_f4)
+    _v4_clf = _v4["classifier"]
+    _v4_imp = _v4["classifier_imp"]
+    _v4_features = _v4["features"]
+    with open("models/model_v4_direction.pkl", "rb") as _f4d:
+        _v4d = _pickle.load(_f4d)
+    _v4d_clf = _v4d["classifier"]
+    _v4d_imp = _v4d["classifier_imp"]
+    log.info(f"V4 loaded for meta-feature: {len(_v4_features)} features")
+except Exception as _e:
+    log.warning(f"V4 NOT loaded (V5 will train without meta-feature): {_e}")
+
+_V4_REGIME_MAP   = {"TREND_UP":2,"TREND_DOWN":-2,"VOLATILE":1,"CALM":0,"DEAD":-1}
+_V4_SESSION_MAP  = {"OVERLAP":3,"US":2,"LONDON":1,"ASIA":0,"OFFPEAK":-1}
+_V4_ACTIVITY_MAP = {"HIGH":2,"NORMAL":1,"LOW":0,"DEAD":-1}
+_V4_DAY_MAP      = {"WEEKDAY":1,"WEEKEND":0}
+_V4_BUCKET_MAP   = {"heavy_fav":3,"favourite":2,"underdog":1,"longshot":0}
+
+
+def _score_v4(row):
+    """Score a single row with V4. Returns (P(profitable), P(UP))."""
+    if _v4_clf is None:
+        return 0.5, 0.5
+    try:
+        pm = _f(row.get("p_market"))
+        m30 = _f(row.get("momentum_30s"))
+        m60 = _f(row.get("momentum_60s"))
+        li = _f(row.get("liq_imbalance"))
+        vr = _f(row.get("vol_range_pct"))
+        fr = _f(row.get("funding_rate"))
+        str_val = _f(row.get("secs_to_resolution"))
+        sl_val = _f(row.get("secs_left"))
+        str_ = str_val if not np.isnan(str_val) else (sl_val if not np.isnan(sl_val) else 300.0)
+        if str_ < 0: str_ = 0.0
+        mp = _f(row.get("market_progress"))
+        if np.isnan(mp): mp = max(0.0, min(1.0, 1.0 - str_ / 300.0))
+
+        f = {}
+        for fname in _v4_features:
+            val = _f(row.get(fname))
+            if fname == "secs_to_resolution": val = str_
+            elif fname == "log_secs_to_resolution": val = math.log1p(str_)
+            elif fname == "market_progress": val = mp
+            elif fname == "mom_accel_abs": val = abs(m30 - m60) if not (np.isnan(m30) or np.isnan(m60)) else np.nan
+            elif fname == "pm_abs_deviation": val = abs(pm - 0.5) if not np.isnan(pm) else np.nan
+            elif fname == "pm_uncertainty": val = 1.0 - abs(pm - 0.5) * 2 if not np.isnan(pm) else np.nan
+            elif fname == "liq_imbal_x_secs": val = li * str_ if not np.isnan(li) else np.nan
+            elif fname == "liq_abs_imbalance": val = abs(li) if not np.isnan(li) else np.nan
+            elif fname == "funding_abs": val = abs(fr) if not np.isnan(fr) else np.nan
+            elif fname == "interact_mom_x_vol": val = m30 * vr if not (np.isnan(m30) or np.isnan(vr)) else np.nan
+            elif fname == "interact_liq_x_price": val = li * _f(row.get("price_vs_open_pct")) if not np.isnan(li) else np.nan
+            elif fname == "interact_mom_x_progress": val = m30 * mp if not np.isnan(m30) else np.nan
+            elif fname == "vol_x_pm_abs_dev": val = vr * abs(pm - 0.5) if not (np.isnan(vr) or np.isnan(pm)) else np.nan
+            elif fname == "okx_x_fr": val = _f(row.get("okx_funding")) * fr if not np.isnan(fr) else np.nan
+            elif fname == "regime_enc": val = _V4_REGIME_MAP.get(row.get("regime", ""), 0)
+            elif fname == "session_enc": val = _V4_SESSION_MAP.get(row.get("session", ""), 0)
+            elif fname == "activity_enc": val = _V4_ACTIVITY_MAP.get(row.get("activity", ""), 0)
+            elif fname == "day_enc": val = _V4_DAY_MAP.get(row.get("day_type", ""), 0)
+            elif fname == "bucket_enc": val = _V4_BUCKET_MAP.get(row.get("price_bucket", ""), 0)
+            elif fname == "is_extreme_market": val = 1.0 if (not np.isnan(pm) and (pm > 0.85 or pm < 0.15)) else 0.0
+            f[fname] = val if val is not None else np.nan
+
+        X = np.array([[f.get(k, np.nan) for k in _v4_features]], dtype=np.float32)
+        X = _v4_imp.transform(X)
+        p_prof = float(_v4_clf.predict_proba(X)[0][1])
+        X_dir = _v4d_imp.transform(X)
+        p_up = float(_v4d_clf.predict_proba(X_dir)[0][1])
+        return p_prof, p_up
+    except:
+        return 0.5, 0.5
+
 
 def _f(val):
     if val is None:
@@ -64,7 +144,7 @@ def _f(val):
 
 
 def _rest_fetch(table, params, limit=500):
-    """Fetch using created_at cursor instead of OFFSET to avoid Supabase timeouts."""
+    """Fetch using created_at cursor — matches V4 fetch (handles 100k+ rows)."""
     rows = []
     retries = 0
     cursor = ""
@@ -76,18 +156,18 @@ def _rest_fetch(table, params, limit=500):
             r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=REST_H, params=p, timeout=180)
             if not r.text:
                 retries += 1
-                if retries > 3:
+                if retries > 5:
                     break
                 import time; time.sleep(2)
                 continue
             batch = r.json()
             if isinstance(batch, dict):
                 retries += 1
-                if retries > 3:
-                    log.warning(f"  API error after 3 retries: {batch}")
+                if retries > 5:
+                    log.warning(f"  API error after 5 retries at {len(rows):,} rows: {batch.get('message','?')}")
                     break
-                log.warning(f"  API error, retry {retries}: {batch.get('message','?')}")
-                import time; time.sleep(2)
+                log.warning(f"  API error, retry {retries}: {batch.get('message','?')[:60]}")
+                import time; time.sleep(5)
                 continue
             if not batch or not isinstance(batch, list):
                 break
@@ -103,11 +183,11 @@ def _rest_fetch(table, params, limit=500):
             cursor = last_ts
         except Exception as e:
             retries += 1
-            if retries > 3:
-                log.warning(f"  Fetch stopped after 3 retries: {e}")
+            if retries > 5:
+                log.warning(f"  Fetch stopped at {len(rows):,} rows after 5 retries: {e}")
                 break
             log.warning(f"  Retry {retries}: {e}")
-            import time; time.sleep(2)
+            import time; time.sleep(5)
     return rows
 
 
@@ -351,6 +431,17 @@ def build_v5_features(rows):
     """
     # _compute_sequence_features(rows)  # disabled — sequence features not in V5 yet (accumulating in pipeline)
 
+    # Score all rows with V4 for meta-features
+    if _v4_clf is not None:
+        log.info("  Scoring rows with V4 for meta-features...")
+        for i, row in enumerate(rows):
+            p_prof, p_up = _score_v4(row)
+            row["v4_score"] = p_prof
+            row["v4_direction"] = p_up
+            if (i + 1) % 20000 == 0:
+                log.info(f"    {i+1:,} scored...")
+        log.info(f"    Done: {len(rows):,} rows scored")
+
     cross_mkt = _build_cross_market_lookup(rows)
 
     records = []
@@ -469,6 +560,11 @@ def build_v5_features(rows):
             "session_x_vol": SESSION_MAP.get(row.get("session", ""), 0) * vr if not np.isnan(vr) else np.nan,
             "streak_length": max(_cross.get("streak_up", 0), _cross.get("streak_down", 0)),
         }
+
+        # V4 meta-features — P(profitable) and P(UP) from Polymarket model
+        if _v4_clf is not None:
+            f["v4_p_profitable"] = row.get("v4_score", 0.5)
+            f["v4_p_up"] = row.get("v4_direction", 0.5)
 
         records.append(f)
         y_edge_long.append(round(edge_long, 6))
