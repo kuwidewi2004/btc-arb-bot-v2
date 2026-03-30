@@ -89,10 +89,10 @@ def connect():
 
 
 def _rest_fetch(table, params, limit=500) -> list:
-    """Fetch using created_at cursor instead of OFFSET to avoid Supabase timeouts."""
+    """Fetch using created_at cursor — same as V5 fetch (proven to handle 100k+ rows)."""
     rows = []
     retries = 0
-    cursor = ""  # tracks last created_at for cursor-based pagination
+    cursor = ""
     while True:
         p = {**params, "limit": limit}
         if cursor:
@@ -102,18 +102,17 @@ def _rest_fetch(table, params, limit=500) -> list:
             if not r.text:
                 retries += 1
                 if retries > 3:
-                    log.warning(f"  Empty body after 3 retries (status={r.status_code})")
                     break
                 import time; time.sleep(2)
                 continue
             batch = r.json()
             if isinstance(batch, dict):
                 retries += 1
-                if retries > 3:
-                    log.warning(f"  API error after 3 retries: {batch}")
+                if retries > 5:
+                    log.warning(f"  API error after 5 retries at {len(rows):,} rows: {batch.get('message','?')}")
                     break
-                log.warning(f"  API error, retry {retries}: {batch.get('message','?')}")
-                import time; time.sleep(2)
+                log.warning(f"  API error, retry {retries}: {batch.get('message','?')[:60]}")
+                import time; time.sleep(5)
                 continue
             if not batch or not isinstance(batch, list):
                 break
@@ -123,18 +122,17 @@ def _rest_fetch(table, params, limit=500) -> list:
                 log.info(f"  Fetched {len(rows):,}...")
             if len(batch) < limit:
                 break
-            # Use last row's created_at as cursor for next page
             last_ts = batch[-1].get("created_at")
             if not last_ts:
                 break
             cursor = last_ts
         except Exception as e:
             retries += 1
-            if retries > 3:
-                log.warning(f"  Fetch stopped after 3 retries: {e}")
+            if retries > 5:
+                log.warning(f"  Fetch stopped at {len(rows):,} rows after 5 retries: {e}")
                 break
             log.warning(f"  Retry {retries}: {e}")
-            import time; time.sleep(2)
+            import time; time.sleep(5)
     return rows
 
 
@@ -379,22 +377,22 @@ FLOW_LBL_MAP = {"LONG_CROWDED":1,"BALANCED":0,"SHORT_CROWDED":-1}
 
 def fetch_snapshots(conn) -> list:
     log.info("Fetching market_snapshots via REST...")
+    # Trimmed column list — only columns used in features or labels.
+    # Derived features (log_*, abs_*, interactions) are computed in Python.
     cols = ",".join([
         "created_at","condition_id","secs_left","secs_to_resolution","market_progress",
-        "phase_early","phase_mid","phase_late","phase_final",
+        "phase_early",
         "hour_sin","hour_cos","dow_sin","dow_cos",
         "price_vs_open_pct","price_vs_open_score",
-        "momentum_10s","momentum_30s","momentum_60s","momentum_120s","momentum_score",
-        "cl_divergence","cl_age","cl_vs_open_pct",
+        "momentum_30s","momentum_60s","momentum_120s",
+        "cl_vs_open_pct",
         "liq_total","liq_imbalance","liq_long_usd","liq_short_usd","liq_dominant_ratio",
-        "ob_imbalance","ob_bid_delta","ob_ask_delta",
+        "ob_imbalance",
         "vol_range_pct","volume_buy_ratio",
-        "p_market","poly_fill_up","poly_fill_down",
-        "poly_spread","poly_slip_up","poly_deviation",
+        "p_market","poly_spread",
         "basis_pct","funding_rate","okx_funding","gate_funding",
-        "volatility_pct","flow_score","funding_zscore",
-        "regime","session","activity","day_type",
-        "price_bucket",
+        "volatility_pct","funding_zscore",
+        "regime","session","activity","day_type","price_bucket",
         "p_market_std","avg_ob_imbalance_abs","avg_funding_zscore_abs",
         "avg_momentum_abs","btc_range_pct",
         "tick_cvd_30s","tick_taker_buy_ratio_30s","tick_large_buy_usd_30s",
@@ -402,13 +400,10 @@ def fetch_snapshots(conn) -> list:
         "tick_cvd_60s","tick_taker_buy_ratio_60s","tick_intensity_60s",
         "poly_flow_imb","poly_depth_ratio",
         "poly_trade_imb","poly_up_buys","poly_down_buys","poly_trade_count","poly_large_pct",
-        "delta_funding","delta_basis","delta_trade_imb","xex_spread",
-        "delta_cvd","delta_taker_buy","delta_momentum","delta_poly","delta_score",
         "outcome_binary",
     ])
     rows = _rest_fetch("market_snapshots", {
         "select": cols,
-        "resolved_outcome": "not.is.null",
         "outcome_binary": "not.is.null",
         "order": "created_at.asc",
     })
