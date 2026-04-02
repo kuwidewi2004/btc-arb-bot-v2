@@ -402,10 +402,9 @@ def fetch_snapshots(conn) -> list:
         "poly_trade_imb","poly_up_buys","poly_down_buys","poly_trade_count","poly_large_pct",
         "outcome_binary",
     ])
-    rows = _rest_fetch("market_snapshots", {
-        "select": cols,
+    from fetch_cache import cached_fetch
+    rows = cached_fetch("v4_snapshots", cols, {
         "outcome_binary": "not.is.null",
-        "order": "created_at.asc",
     })
     log.info(f"  {len(rows):,} rows")
     return rows

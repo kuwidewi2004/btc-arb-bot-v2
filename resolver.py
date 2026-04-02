@@ -174,7 +174,8 @@ def fetch_unresolved_condition_ids() -> set:
     signal_log or market_snapshots — regardless of whether a trade exists.
     """
     condition_ids = set()
-    for table in ("signal_log", "market_snapshots"):
+    # Only check market_snapshots — signal_log table doesn't exist, trades disabled
+    for table in ("market_snapshots",):
         try:
             rows = _sb_fetch_all(table, {
                 "resolved_outcome": "is.null",
@@ -565,7 +566,7 @@ def resolve_pending_trades(outcome_cache: dict) -> int:
                     outcome_cache[btc_res_key] = fetch_btc_price()
                 btc_res_price = outcome_cache[btc_res_key]
 
-                resolve_signal_logs(outcome, condition_id)
+                # resolve_signal_logs(outcome, condition_id)  # disabled — table doesn't exist
                 resolve_market_snapshots(
                     outcome, condition_id,
                     btc_resolution_price=btc_res_price,
@@ -736,7 +737,7 @@ def resolve_independent_signals(outcome_cache: dict):
                 outcome_cache[btc_res_key] = fetch_btc_price()
             btc_res_price = outcome_cache[btc_res_key]
 
-            resolve_signal_logs(outcome, condition_id)
+            # resolve_signal_logs(outcome, condition_id)  # disabled — table doesn't exist
             resolve_market_snapshots(
                 outcome, condition_id,
                 btc_resolution_price=btc_res_price,
@@ -802,21 +803,14 @@ def run():
             # for the same condition_id within one cycle
             outcome_cache: dict = {}
 
-            count = resolve_pending_trades(outcome_cache)
-            if count > 0:
-                log.info(f"Resolved {count} new trade(s) this cycle")
-
-            # Independently resolve snapshots/signal_log even with no trades
+            # Only resolve market_snapshots — trades/signal_log/paper_trades disabled
+            # to reduce Supabase load. Re-enable when needed.
             resolve_independent_signals(outcome_cache)
 
-            # Resolve paper trades — fill in exit_price and PnL
-            paper_count = resolve_paper_trades()
-            if paper_count > 0:
-                log.info(f"Resolved {paper_count} paper trade(s)")
-
-            if time.time() - last_summary > 1800:
-                print_summary()
-                last_summary = time.time()
+            # print_summary disabled — queries trades table which adds load
+            # if time.time() - last_summary > 1800:
+            #     print_summary()
+            #     last_summary = time.time()
 
             time.sleep(CHECK_INTERVAL)
 

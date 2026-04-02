@@ -319,11 +319,10 @@ def fetch_snapshots_v5() -> list:
         "btc_price",
         "outcome_binary",
     ])
-    all_rows = _rest_fetch("market_snapshots", {
-        "select": cols,
+    from fetch_cache import cached_fetch
+    all_rows = cached_fetch("v5_snapshots", cols, {
         "btc_price": "gt.0",
         "outcome_binary": "not.is.null",
-        "order": "created_at.asc",
     })
     log.info(f"  {len(all_rows):,} total rows with btc_price")
 
@@ -433,14 +432,53 @@ def build_v5_features(rows):
 
     # Score all rows with V4 for meta-features
     if _v4_clf is not None:
-        log.info("  Scoring rows with V4 for meta-features...")
+        log.info("  Batch scoring rows with V4 for meta-features...")
+        # Build feature matrix for all rows at once (100x faster than one-by-one)
+        v4_X = np.zeros((len(rows), len(_v4_features)), dtype=np.float32)
         for i, row in enumerate(rows):
-            p_prof, p_up = _score_v4(row)
-            row["v4_score"] = p_prof
-            row["v4_direction"] = p_up
-            if (i + 1) % 20000 == 0:
-                log.info(f"    {i+1:,} scored...")
-        log.info(f"    Done: {len(rows):,} rows scored")
+            pm = _f(row.get("p_market"))
+            m30 = _f(row.get("momentum_30s"))
+            m60 = _f(row.get("momentum_60s"))
+            li = _f(row.get("liq_imbalance"))
+            vr = _f(row.get("vol_range_pct"))
+            fr = _f(row.get("funding_rate"))
+            str_val = _f(row.get("secs_to_resolution"))
+            sl_val = _f(row.get("secs_left"))
+            str_ = str_val if not np.isnan(str_val) else (sl_val if not np.isnan(sl_val) else 300.0)
+            if str_ < 0: str_ = 0.0
+            mp = _f(row.get("market_progress"))
+            if np.isnan(mp): mp = max(0.0, min(1.0, 1.0 - str_ / 300.0))
+            for j, fname in enumerate(_v4_features):
+                val = _f(row.get(fname))
+                if fname == "secs_to_resolution": val = str_
+                elif fname == "log_secs_to_resolution": val = math.log1p(str_)
+                elif fname == "market_progress": val = mp
+                elif fname == "mom_accel_abs": val = abs(m30 - m60) if not (np.isnan(m30) or np.isnan(m60)) else np.nan
+                elif fname == "pm_abs_deviation": val = abs(pm - 0.5) if not np.isnan(pm) else np.nan
+                elif fname == "pm_uncertainty": val = 1.0 - abs(pm - 0.5) * 2 if not np.isnan(pm) else np.nan
+                elif fname == "liq_imbal_x_secs": val = li * str_ if not np.isnan(li) else np.nan
+                elif fname == "liq_abs_imbalance": val = abs(li) if not np.isnan(li) else np.nan
+                elif fname == "funding_abs": val = abs(fr) if not np.isnan(fr) else np.nan
+                elif fname == "interact_mom_x_vol": val = m30 * vr if not (np.isnan(m30) or np.isnan(vr)) else np.nan
+                elif fname == "interact_liq_x_price": val = li * _f(row.get("price_vs_open_pct")) if not np.isnan(li) else np.nan
+                elif fname == "interact_mom_x_progress": val = m30 * mp if not np.isnan(m30) else np.nan
+                elif fname == "vol_x_pm_abs_dev": val = vr * abs(pm - 0.5) if not (np.isnan(vr) or np.isnan(pm)) else np.nan
+                elif fname == "okx_x_fr": val = _f(row.get("okx_funding")) * fr if not np.isnan(fr) else np.nan
+                elif fname == "regime_enc": val = _V4_REGIME_MAP.get(row.get("regime", ""), 0)
+                elif fname == "session_enc": val = _V4_SESSION_MAP.get(row.get("session", ""), 0)
+                elif fname == "activity_enc": val = _V4_ACTIVITY_MAP.get(row.get("activity", ""), 0)
+                elif fname == "day_enc": val = _V4_DAY_MAP.get(row.get("day_type", ""), 0)
+                elif fname == "bucket_enc": val = _V4_BUCKET_MAP.get(row.get("price_bucket", ""), 0)
+                elif fname == "is_extreme_market": val = 1.0 if (not np.isnan(pm) and (pm > 0.85 or pm < 0.15)) else 0.0
+                v4_X[i, j] = val if val is not None and not (isinstance(val, float) and np.isnan(val)) else np.nan
+        # Batch impute + predict
+        v4_X = _v4_imp.transform(v4_X)
+        v4_probs = _v4_clf.predict_proba(v4_X)[:, 1]
+        v4d_probs = _v4d_clf.predict_proba(_v4d_imp.transform(v4_X))[:, 1]
+        for i, row in enumerate(rows):
+            row["v4_score"] = float(v4_probs[i])
+            row["v4_direction"] = float(v4d_probs[i])
+        log.info(f"    Done: {len(rows):,} rows scored (batch)")
 
     cross_mkt = _build_cross_market_lookup(rows)
 
