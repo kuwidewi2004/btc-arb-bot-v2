@@ -2610,7 +2610,9 @@ def run():
                 _fr_now = float(_funding_cache.get("rate", 0.0))
                 _basis_now = round((futures - spot) / spot * 100, 6) if spot > 0 and futures > 0 else 0.0
                 _pti_now = poly_flow["poly_trade_imb"]
-                delta_funding  = round(_fr_now - cur.get("prev_funding_rate", 0.0), 8)
+                # Funding change over ~3min window (60 snapshots back) instead of last snapshot
+                _fr_3m_ago = _funding_history_pct[-60] if len(_funding_history_pct) >= 60 else (_funding_history_pct[0] if _funding_history_pct else 0.0)
+                delta_funding  = round(_fr_now - _fr_3m_ago, 8)
                 delta_basis    = round(_basis_now - cur.get("prev_basis_pct", 0.0), 6)
                 delta_trade_imb = round(_pti_now - cur.get("prev_trade_imb", 0.0), 4)
 

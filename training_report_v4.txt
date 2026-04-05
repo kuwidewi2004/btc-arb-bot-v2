@@ -1,1 +1,11 @@
-Primary model walk-forward: Brier=0.2462 imp=-0.0104 reg_corr=+0.038 sim_pnl=+73.4567
+Primary model walk-forward: Brier=0.2125 imp=+0.0069 reg_corr=+0.020 sim_pnl=+580.1060 rank_pnl=+145.5350 stress_pnl=+97.2500 spearman=+0.2229
+Regime analysis: 44 folds aggregated — see WHERE MODEL WORKS section
+Calibration ECE=0.0401
+Post-hoc calibration: ECE 0.0318->0.0966  Spearman +0.2454->+0.2542
+Best-side model walk-forward: Brier=0.0008 imp=+0.0021  Worse than primary → crowd-following label adds useful signal
+NoPmarket model walk-forward: Brier=0.2184 imp=+0.0010
+Kill Test 1 (shuffle): shuffled_imp=-0.0115  FAIL — possible label leakage
+Kill Test 2 (time shift): shifted_imp=-0.0316 drop=+0.0385  PASS
+Kill Test 3 (ablation): PASS
+Kill Test 4 (random baseline): model_wr=69.1% random_wr=67.2% edge=+1.9pp  FAIL — no edge over random selection
+Direction model: imp=+0.0259 vs_pm=-0.0248 acc=64.9%

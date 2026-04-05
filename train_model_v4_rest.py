@@ -1564,7 +1564,7 @@ def main():
     # Strategy summary
     print("\n  Strategy summary:")
     print(f"  {'Strategy':<25} {'N':>5}  {'Wins':>5}  {'WR':>7}  {'PnL':>9}")
-    print(f"  {'─'*25} {'─'*5}  {'─'*5}  {'─'*7}  {'─'*9}")
+    print(f"  {'-'*25} {'-'*5}  {'-'*5}  {'-'*7}  {'-'*9}")
     from collections import defaultdict
     try:
         trade_data = _rest_fetch("trades", {
