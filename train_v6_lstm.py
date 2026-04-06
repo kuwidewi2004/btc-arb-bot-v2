@@ -415,14 +415,6 @@ def main():
     feat_matrix = np.array([features[i] for i in valid_idx], dtype=np.float32)
     log.info(f"  Feature matrix: {feat_matrix.shape}")
 
-    imp = SimpleImputer(strategy="median")
-    feat_matrix = imp.fit_transform(feat_matrix)
-
-    # Normalize features (important for LSTM)
-    feat_mean = feat_matrix.mean(axis=0)
-    feat_std = feat_matrix.std(axis=0) + 1e-8
-    feat_matrix = (feat_matrix - feat_mean) / feat_std
-
     labels_long = np.array([edge_longs[i] for i in valid_idx], dtype=np.float32)
     labels_short = np.array([edge_shorts[i] for i in valid_idx], dtype=np.float32)
 
@@ -466,11 +458,29 @@ def main():
     log.info(f"  Sequences: {len(X_seq):,} (shape {X_seq.shape})")
     log.info(f"  Avg edge_long: {y_long.mean():.6f}  edge_short: {y_short.mean():.6f}")
 
-    # Temporal split
+    # Temporal split BEFORE imputation/normalization (prevents leakage)
     n_train = int(len(X_seq) * TRAIN_RATIO)
-    X_train, X_test = X_seq[:n_train], X_seq[n_train:]
+    X_train_raw, X_test_raw = X_seq[:n_train], X_seq[n_train:]
     yl_train, yl_test = y_long[:n_train], y_long[n_train:]
     ys_train, ys_test = y_short[:n_train], y_short[n_train:]
+
+    # Fit imputer and scaler on TRAINING data only (no test leakage)
+    # Reshape to 2D for fitting, then back to 3D
+    n_tr_seq, seq_len, n_feat = X_train_raw.shape
+    train_2d = X_train_raw.reshape(-1, n_feat)
+    imp = SimpleImputer(strategy="median")
+    train_2d = imp.fit_transform(train_2d)
+    feat_mean = train_2d.mean(axis=0)
+    feat_std = train_2d.std(axis=0) + 1e-8
+    train_2d = (train_2d - feat_mean) / feat_std
+    X_train = train_2d.reshape(n_tr_seq, seq_len, n_feat).astype(np.float32)
+
+    # Transform test with train-fitted imputer/scaler
+    n_te_seq = X_test_raw.shape[0]
+    test_2d = X_test_raw.reshape(-1, n_feat)
+    test_2d = imp.transform(test_2d)
+    test_2d = (test_2d - feat_mean) / feat_std
+    X_test = test_2d.reshape(n_te_seq, seq_len, n_feat).astype(np.float32)
 
     log.info(f"  Train: {n_train:,}  Test: {len(X_test):,}")
 

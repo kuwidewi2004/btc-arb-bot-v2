@@ -430,11 +430,13 @@ def build_v5_features(rows):
     """
     # _compute_sequence_features(rows)  # disabled — sequence features not in V5 yet (accumulating in pipeline)
 
-    # Score all rows with V4 for meta-features
-    if _v4_clf is not None:
-        log.info("  Batch scoring rows with V4 for meta-features...")
-        # Build feature matrix for all rows at once (100x faster than one-by-one)
-        v4_X = np.zeros((len(rows), len(_v4_features)), dtype=np.float32)
+    # Build V4 feature matrix for fold-specific scoring (avoids leakage)
+    v4_feat_matrix = None
+    v4_labels = None
+    if _v4_features is not None:
+        log.info("  Building V4 feature matrix (fold-specific scoring, no leakage)...")
+        v4_feat_matrix = np.full((len(rows), len(_v4_features)), np.nan, dtype=np.float32)
+        v4_labels = np.full(len(rows), np.nan, dtype=np.float32)
         for i, row in enumerate(rows):
             pm = _f(row.get("p_market"))
             m30 = _f(row.get("momentum_30s"))
@@ -470,15 +472,10 @@ def build_v5_features(rows):
                 elif fname == "day_enc": val = _V4_DAY_MAP.get(row.get("day_type", ""), 0)
                 elif fname == "bucket_enc": val = _V4_BUCKET_MAP.get(row.get("price_bucket", ""), 0)
                 elif fname == "is_extreme_market": val = 1.0 if (not np.isnan(pm) and (pm > 0.85 or pm < 0.15)) else 0.0
-                v4_X[i, j] = val if val is not None and not (isinstance(val, float) and np.isnan(val)) else np.nan
-        # Batch impute + predict
-        v4_X = _v4_imp.transform(v4_X)
-        v4_probs = _v4_clf.predict_proba(v4_X)[:, 1]
-        v4d_probs = _v4d_clf.predict_proba(_v4d_imp.transform(v4_X))[:, 1]
-        for i, row in enumerate(rows):
-            row["v4_score"] = float(v4_probs[i])
-            row["v4_direction"] = float(v4d_probs[i])
-        log.info(f"    Done: {len(rows):,} rows scored (batch)")
+                v4_feat_matrix[i, j] = val if val is not None and not (isinstance(val, float) and np.isnan(val)) else np.nan
+            ob = _f(row.get("outcome_binary"))
+            v4_labels[i] = ob
+        log.info(f"    V4 feature matrix built: {v4_feat_matrix.shape}")
 
     cross_mkt = _build_cross_market_lookup(rows)
 
@@ -486,9 +483,10 @@ def build_v5_features(rows):
     y_edge_long = []
     y_edge_short = []
     cond_ids = []
+    row_indices = []  # maps to original row index (for V4 fold-specific scoring)
     skipped = 0
 
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         pm = _f(row.get("p_market"))
         btc_price = _f(row.get("btc_price"))
         btc_future = _f(row.get("btc_future_price"))
@@ -599,28 +597,34 @@ def build_v5_features(rows):
             "streak_length": max(_cross.get("streak_up", 0), _cross.get("streak_down", 0)),
         }
 
-        # V4 meta-features — P(profitable) and P(UP) from Polymarket model
-        if _v4_clf is not None:
-            f["v4_p_profitable"] = row.get("v4_score", 0.5)
-            f["v4_p_up"] = row.get("v4_direction", 0.5)
+        # V4 meta-features — placeholder, scored per-fold to avoid leakage
+        if _v4_features is not None:
+            f["v4_p_profitable"] = 0.5  # filled per-fold in walk-forward
+            f["v4_p_up"] = 0.5          # filled per-fold in walk-forward
 
         records.append(f)
         y_edge_long.append(round(edge_long, 6))
         y_edge_short.append(round(edge_short, 6))
         cond_ids.append(row.get("condition_id", ""))
+        row_indices.append(row_idx)
 
     log.info(f"  Engineered {len(records):,} rows ({skipped:,} skipped)")
     if not records:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
     fn = list(records[0].keys())
     X  = np.array([[r[k] for k in fn] for r in records], dtype=np.float32)
     ye_long  = np.array(y_edge_long,  dtype=np.float32)
     ye_short = np.array(y_edge_short, dtype=np.float32)
+    row_indices = np.array(row_indices, dtype=np.int64)
+
+    # Subset V4 data to only the rows that survived feature engineering
+    v4_X_subset = v4_feat_matrix[row_indices] if v4_feat_matrix is not None else None
+    v4_y_subset = v4_labels[row_indices] if v4_labels is not None else None
 
     log.info(f"  Features: {len(fn)}  |  avg edge_long={ye_long.mean():.6f}  avg edge_short={ye_short.mean():.6f}")
 
-    return X, ye_long, ye_short, cond_ids, fn
+    return X, ye_long, ye_short, cond_ids, fn, v4_X_subset, v4_y_subset, row_indices
 
 
 def main():
@@ -637,11 +641,15 @@ def main():
         return
 
     result = build_v5_features(rows)
-    if result[0] is None:
+    if result is None or result[0] is None:
         log.error("No usable rows after feature engineering.")
         return
 
-    X, ye_long, ye_short, cids, fn = result
+    X, ye_long, ye_short, cids, fn, v4_X, v4_y, v5_row_idx = result
+
+    # Find V4 meta-feature column indices in V5 feature matrix
+    v4_prof_col = fn.index("v4_p_profitable") if "v4_p_profitable" in fn else None
+    v4_up_col = fn.index("v4_p_up") if "v4_p_up" in fn else None
 
     folds = walk_forward_splits(cids)
     n_markets = len(set(cids))
@@ -649,10 +657,45 @@ def main():
 
     # Walk-forward validation
     fold_results = []
+    all_fold_pred_edge = []   # for evaluation metrics
+    all_fold_actual_edge = []
+    all_fold_chosen_up = []
+    all_fold_sessions = []
+    all_fold_regimes = []
+
     for fold_i, (ti, vi, n_tr, n_te) in enumerate(folds):
-        X_tr, X_te = X[ti], X[vi]
+        X_tr, X_te = X[ti].copy(), X[vi].copy()
         yl_tr, yl_te = ye_long[ti], ye_long[vi]
         ys_tr, ys_te = ye_short[ti], ye_short[vi]
+
+        # Fold-specific V4 scoring — train V4 on fold's train data only
+        if v4_X is not None and v4_prof_col is not None:
+            v4_tr = v4_X[ti]
+            v4_te = v4_X[vi]
+            v4_y_tr = v4_y[ti]
+
+            # Only train on rows with valid outcome_binary
+            valid_v4 = ~np.isnan(v4_y_tr)
+            if valid_v4.sum() >= 50:
+                v4_imp_fold = SimpleImputer(strategy="median")
+                v4_tr_imp = v4_imp_fold.fit_transform(v4_tr[valid_v4])
+                v4_clf_fold = lgb.LGBMClassifier(n_estimators=80, num_leaves=15,
+                                                  learning_rate=0.05, subsample=0.8,
+                                                  colsample_bytree=0.8, verbose=-1)
+                v4_clf_fold.fit(v4_tr_imp, v4_y_tr[valid_v4])
+                # Score test rows with fold-specific V4
+                v4_te_imp = v4_imp_fold.transform(v4_te)
+                v4_probs = v4_clf_fold.predict_proba(v4_te_imp)[:, 1]
+                X_te[:, v4_prof_col] = v4_probs
+                # Score train rows too (for consistent training)
+                v4_tr_all_imp = v4_imp_fold.transform(v4_tr)
+                v4_tr_probs = v4_clf_fold.predict_proba(v4_tr_all_imp)[:, 1]
+                X_tr[:, v4_prof_col] = v4_tr_probs
+                # Direction model (predict UP vs DOWN among profitable)
+                up_mask = valid_v4 & (v4_y_tr == 1)  # simplified: outcome=1 means UP won
+                if up_mask.sum() >= 20:
+                    X_te[:, v4_up_col] = v4_probs  # reuse P(profitable) as proxy
+                    X_tr[:, v4_up_col] = v4_tr_probs
 
         reg_up, imp_up   = _train_regressor(X_tr, yl_tr, n_est=150, leaves=20)
         reg_down, imp_down = _train_regressor(X_tr, ys_tr, n_est=150, leaves=20)
@@ -690,6 +733,15 @@ def main():
             "pnl_per": pnl_per, "win_rate": win_rate, "side_acc": side_acc,
         })
 
+        # Collect data for extended evaluation
+        all_fold_pred_edge.extend(pred_edge)
+        all_fold_actual_edge.extend(actual_edge)
+        all_fold_chosen_up.extend(chosen_up)
+        for idx in vi:
+            orig_idx = int(v5_row_idx[idx]) if v5_row_idx is not None else 0
+            all_fold_sessions.append(rows[orig_idx].get("session", "UNKNOWN") if orig_idx < len(rows) else "UNKNOWN")
+            all_fold_regimes.append(rows[orig_idx].get("regime", "UNKNOWN") if orig_idx < len(rows) else "UNKNOWN")
+
         print(f"\n  Fold {fold_i+1}  train={n_tr}  test={n_te}")
         print(f"    MAE  long={mae_up:.6f}  short={mae_down:.6f}")
         print(f"    Corr long={corr_up:+.3f}  short={corr_down:+.3f}")
@@ -710,6 +762,69 @@ def main():
     print(f"    Corr long={avg_corr_up:+.4f}  short={avg_corr_down:+.4f}")
     print(f"    Total PnL: {total_pnl:+.6f}  ({total_trades} trades)")
     print(f"    Avg WR: {avg_wr*100:.1f}%  Side acc: {avg_side*100:.1f}%")
+
+    # ── EXTENDED EVALUATION ──────────────────────────────────────────
+    pe = np.array(all_fold_pred_edge)
+    ae = np.array(all_fold_actual_edge)
+    cu = np.array(all_fold_chosen_up)
+
+    if len(pe) > 100:
+        print(f"\n  ── Extended Evaluation ({len(pe):,} test predictions) ──")
+
+        # Top-decile analysis: when model is most confident, does it work?
+        pct = np.percentile(pe, [90, 75, 50])
+        for label, thresh in [("Top 10%", pct[0]), ("Top 25%", pct[1]), ("Top 50%", pct[2])]:
+            mask = pe >= thresh
+            n = int(mask.sum())
+            if n > 0:
+                edge = float(ae[mask].mean())
+                wr = float((ae[mask] > 0).mean())
+                pnl = float(ae[mask].sum())
+                print(f"    {label} (n={n:,}):  avg edge={edge:+.6f}  WR={wr*100:.1f}%  PnL={pnl:+.4f}")
+
+        # Long-only vs Short-only breakdown
+        long_mask = cu.astype(bool)
+        short_mask = ~long_mask
+        for label, mask in [("Long-only", long_mask), ("Short-only", short_mask)]:
+            n = int(mask.sum())
+            if n > 0:
+                edge = float(ae[mask].mean())
+                wr = float((ae[mask] > 0).mean())
+                pnl = float(ae[mask].sum())
+                print(f"    {label} (n={n:,}):  avg edge={edge:+.6f}  WR={wr*100:.1f}%  PnL={pnl:+.4f}")
+
+        # Session breakdown
+        sessions = np.array(all_fold_sessions)
+        print(f"\n    By session:")
+        for sess in sorted(set(sessions)):
+            mask = sessions == sess
+            n = int(mask.sum())
+            if n >= 20:
+                edge = float(ae[mask].mean())
+                wr = float((ae[mask] > 0).mean())
+                print(f"      {sess:<10} (n={n:>5,}):  avg edge={edge:+.6f}  WR={wr*100:.1f}%")
+
+        # Regime breakdown
+        regimes = np.array(all_fold_regimes)
+        print(f"\n    By regime:")
+        for reg in sorted(set(regimes)):
+            mask = regimes == reg
+            n = int(mask.sum())
+            if n >= 20:
+                edge = float(ae[mask].mean())
+                wr = float((ae[mask] > 0).mean())
+                print(f"      {reg:<12} (n={n:>5,}):  avg edge={edge:+.6f}  WR={wr*100:.1f}%")
+
+        # Confidence calibration: binned predicted edge vs actual
+        print(f"\n    Confidence calibration:")
+        bins = np.percentile(pe, [0, 20, 40, 60, 80, 100])
+        for i in range(len(bins) - 1):
+            mask = (pe >= bins[i]) & (pe < bins[i+1]) if i < len(bins)-2 else (pe >= bins[i])
+            n = int(mask.sum())
+            if n > 0:
+                pred_avg = float(pe[mask].mean())
+                actual_avg = float(ae[mask].mean())
+                print(f"      Pred [{bins[i]:+.5f}, {bins[i+1]:+.5f}):  n={n:>5,}  pred={pred_avg:+.6f}  actual={actual_avg:+.6f}")
 
     # Train final models
     # ── KILL TESTS ────────────────────────────────────────────────────
