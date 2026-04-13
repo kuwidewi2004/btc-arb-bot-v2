@@ -500,10 +500,6 @@ def build_v5_features(rows):
         else:
             str_ = np.nan
 
-        if np.isnan(pm):
-            skipped += 1; continue
-        if np.isnan(str_) or str_ < 0:
-            str_ = 0.0  # snapshot after market expiry — treat as zero time left
         if np.isnan(btc_price) or np.isnan(btc_future) or btc_price <= 0:
             skipped += 1; continue
 
@@ -524,9 +520,7 @@ def build_v5_features(rows):
         li = _f(row.get("liq_imbalance"))
 
         f = {
-            "secs_to_resolution":     str_,
-            "log_secs_to_resolution": math.log1p(str_),
-            "market_progress":        mp,
+            # secs_to_resolution / market_progress REMOVED — Polymarket lifecycle, leaky for BTC
             "hour_sin": _f(row.get("hour_sin")), "hour_cos": _f(row.get("hour_cos")),
             "dow_sin": _f(row.get("dow_sin")), "dow_cos": _f(row.get("dow_cos")),
             "price_vs_open_pct": _f(row.get("price_vs_open_pct")),
@@ -538,21 +532,12 @@ def build_v5_features(rows):
             "liq_imbalance": li,
             "liq_long_usd": min(_f(row.get("liq_long_usd")), 5e6),
             "liq_short_usd": min(_f(row.get("liq_short_usd")), 5e6),
-            "liq_imbal_x_secs": li * str_ if not (np.isnan(li) or np.isnan(str_)) else np.nan,
+            # liq_imbal_x_secs REMOVED — depended on secs_to_resolution
             "ob_imbalance": obi, "ob_bid_depth": _f(row.get("ob_bid_depth")),
             "ob_ask_depth": _f(row.get("ob_ask_depth")),
             "vol_range_pct": vr, "volatility_pct": _f(row.get("volatility_pct")),
             "volume_buy_ratio": _f(row.get("volume_buy_ratio")),
-            # Polymarket
-            "p_market": pm, "pm_abs_deviation": abs(pm - 0.5),
-            "pm_uncertainty": 1.0 - abs(pm - 0.5) * 2,
-            "poly_flow_imb": _f(row.get("poly_flow_imb")),
-            "poly_depth_ratio": _f(row.get("poly_depth_ratio")),
-            "poly_trade_imb": _f(row.get("poly_trade_imb")),
-            "poly_up_buys": _f(row.get("poly_up_buys")),
-            "poly_down_buys": _f(row.get("poly_down_buys")),
-            "poly_trade_count": _f(row.get("poly_trade_count")),
-            "poly_large_pct": _f(row.get("poly_large_pct")),
+            # Polymarket features REMOVED — don't predict BTC price direction
             # Funding
             "basis_pct": _f(row.get("basis_pct")),
             "funding_rate": fr, "funding_zscore": fz,
@@ -572,7 +557,7 @@ def build_v5_features(rows):
             "avg_funding_zscore_abs": _f(row.get("avg_funding_zscore_abs")),
             "avg_momentum_abs": _f(row.get("avg_momentum_abs")),
             "btc_range_pct": _f(row.get("btc_range_pct")),
-            "p_market_std": _f(row.get("p_market_std")),
+            # p_market_std REMOVED — Polymarket feature
             # Tick
             "tick_cvd_30s": _f(row.get("tick_cvd_30s")),
             "tick_taker_buy_ratio_30s": _f(row.get("tick_taker_buy_ratio_30s")),
@@ -590,11 +575,14 @@ def build_v5_features(rows):
             "delta_momentum": _f(row.get("delta_momentum")),
             "delta_funding": _f(row.get("delta_funding")),
             "delta_basis": _f(row.get("delta_basis")),
-            # Cross-market
-            **{k: v for k, v in _cross.items()},
+            # Cross-market (BTC-relevant only, Polymarket features removed)
+            "prev_momentum": _cross.get("prev_momentum", np.nan),
+            "prev_ob_imbalance": _cross.get("prev_ob_imbalance", np.nan),
+            "prev_vol_range": _cross.get("prev_vol_range", np.nan),
+            "prev_btc_range": _cross.get("prev_btc_range", np.nan),
+            "prev_funding_zscore": _cross.get("prev_funding_zscore", np.nan),
             "prev_vol_x_momentum": _cross.get("prev_vol_range", 0) * _cross.get("prev_momentum", 0),
             "session_x_vol": SESSION_MAP.get(row.get("session", ""), 0) * vr if not np.isnan(vr) else np.nan,
-            "streak_length": max(_cross.get("streak_up", 0), _cross.get("streak_down", 0)),
         }
 
         # V4 meta-features — placeholder, scored per-fold to avoid leakage
@@ -731,6 +719,10 @@ def main():
             "corr_up": corr_up, "corr_down": corr_down,
             "n_trades": n_trades, "sim_pnl": sim_pnl,
             "pnl_per": pnl_per, "win_rate": win_rate, "side_acc": side_acc,
+            # Save for ensemble: test indices, predictions, actuals
+            "test_row_indices": np.array([int(v5_row_idx[j]) for j in vi]),
+            "pred_up": pred_up, "pred_down": pred_down,
+            "actual_long": yl_te, "actual_short": ys_te,
         })
 
         # Collect data for extended evaluation
@@ -748,6 +740,17 @@ def main():
         print(f"    Trades: {n_trades}  PnL={sim_pnl:+.6f}  "
               f"edge/trade={pnl_per:+.6f}  WR={win_rate*100:.1f}%")
         print(f"    Side accuracy: {side_acc*100:.1f}%")
+
+    # Save fold predictions for ensemble eval
+    import os
+    os.makedirs("cache", exist_ok=True)
+    save_dict = {}
+    for i, r in enumerate(fold_results):
+        for k in ["test_row_indices", "pred_up", "pred_down", "actual_long", "actual_short"]:
+            if k in r and r[k] is not None:
+                save_dict[f"fold_{i}_{k}"] = np.array(r[k])
+    np.savez("cache/v5_fold_predictions.npz", **save_dict)
+    log.info(f"  Saved V5 fold predictions to cache/v5_fold_predictions.npz")
 
     # Averages
     avg_corr_up  = np.mean([r["corr_up"]  for r in fold_results])
