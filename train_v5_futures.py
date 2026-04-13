@@ -1,27 +1,22 @@
 """
 V5 Futures Edge Regressor Training Pipeline
 =============================================
-Trains dual regressors for dYdX BTC-USD perpetual futures:
+Dual LightGBM regressors for dYdX BTC-USD perpetual futures:
   E(edge_long)  = (btc_price_3min_later - btc_price_now) / btc_price_now - fees
   E(edge_short) = (btc_price_now - btc_price_3min_later) / btc_price_now - fees
 
-Labels: 3-minute lookahead BTC price movement (NOT market resolution),
-  minus 0.02% maker round-trip fees (0.01% per side, dYdX Tier 1).
-Features: 78 including Polymarket sentiment.
-Data fetch: cursor-based pagination (not OFFSET) to avoid Supabase timeouts.
-Spot OB features removed — permanently dead (Binance geo-block).
-
-Walk-forward validation by condition_id grouping.
-_compute_sequence_features() available but disabled — accumulating in
-pipeline for future LSTM use.
-
-Current best: corr ~+0.092, near break-even PnL with maker fees.
+Labels: 3-minute lookahead BTC price movement minus 0.02% maker round-trip fees.
+Features: 60 pure BTC microstructure (Polymarket features removed).
+Walk-forward validation by condition_id grouping with fold-specific V4 scoring.
+Extended evaluation: top-decile edge, regime/session breakdown, confidence calibration.
+Saves per-fold predictions for ensemble evaluation.
 
 Usage:
   python train_v5_futures.py
 
 Output:
-  model_v5_edge.pkl — dual edge regressors for dYdX execution
+  models/model_v5_edge.pkl          -- dual edge regressors
+  cache/v5_fold_predictions.npz     -- per-fold test predictions
 """
 
 import sys
@@ -520,7 +515,6 @@ def build_v5_features(rows):
         li = _f(row.get("liq_imbalance"))
 
         f = {
-            # secs_to_resolution / market_progress REMOVED — Polymarket lifecycle, leaky for BTC
             "hour_sin": _f(row.get("hour_sin")), "hour_cos": _f(row.get("hour_cos")),
             "dow_sin": _f(row.get("dow_sin")), "dow_cos": _f(row.get("dow_cos")),
             "price_vs_open_pct": _f(row.get("price_vs_open_pct")),
@@ -532,12 +526,10 @@ def build_v5_features(rows):
             "liq_imbalance": li,
             "liq_long_usd": min(_f(row.get("liq_long_usd")), 5e6),
             "liq_short_usd": min(_f(row.get("liq_short_usd")), 5e6),
-            # liq_imbal_x_secs REMOVED — depended on secs_to_resolution
             "ob_imbalance": obi, "ob_bid_depth": _f(row.get("ob_bid_depth")),
             "ob_ask_depth": _f(row.get("ob_ask_depth")),
             "vol_range_pct": vr, "volatility_pct": _f(row.get("volatility_pct")),
             "volume_buy_ratio": _f(row.get("volume_buy_ratio")),
-            # Polymarket features REMOVED — don't predict BTC price direction
             # Funding
             "basis_pct": _f(row.get("basis_pct")),
             "funding_rate": fr, "funding_zscore": fz,
@@ -557,7 +549,6 @@ def build_v5_features(rows):
             "avg_funding_zscore_abs": _f(row.get("avg_funding_zscore_abs")),
             "avg_momentum_abs": _f(row.get("avg_momentum_abs")),
             "btc_range_pct": _f(row.get("btc_range_pct")),
-            # p_market_std REMOVED — Polymarket feature
             # Tick
             "tick_cvd_30s": _f(row.get("tick_cvd_30s")),
             "tick_taker_buy_ratio_30s": _f(row.get("tick_taker_buy_ratio_30s")),
@@ -568,14 +559,13 @@ def build_v5_features(rows):
             "tick_cvd_60s": _f(row.get("tick_cvd_60s")),
             "tick_taker_buy_ratio_60s": _f(row.get("tick_taker_buy_ratio_60s")),
             "tick_intensity_60s": _f(row.get("tick_intensity_60s")),
-            # Spot OB features REMOVED — permanently dead (Binance geo-block)
             # Deltas
             "delta_cvd": _f(row.get("delta_cvd")),
             "delta_taker_buy": _f(row.get("delta_taker_buy")),
             "delta_momentum": _f(row.get("delta_momentum")),
             "delta_funding": _f(row.get("delta_funding")),
             "delta_basis": _f(row.get("delta_basis")),
-            # Cross-market (BTC-relevant only, Polymarket features removed)
+            # Cross-market
             "prev_momentum": _cross.get("prev_momentum", np.nan),
             "prev_ob_imbalance": _cross.get("prev_ob_imbalance", np.nan),
             "prev_vol_range": _cross.get("prev_vol_range", np.nan),
@@ -936,7 +926,7 @@ def main():
     print("  V5 FUTURES SUMMARY")
     print("=" * 60)
     print(f"  Venue:       Futures (BTC perpetual)")
-    print(f"  Features:    {len(fn)} (incl. Polymarket sentiment)")
+    print(f"  Features:    {len(fn)} (BTC microstructure)")
     print(f"  Labels:      BTC price movement ± {ROUND_TRIP*100:.2f}% fees")
     print(f"  Corr LONG:   {avg_corr_up:+.4f}")
     print(f"  Corr SHORT:  {avg_corr_down:+.4f}")

@@ -4,22 +4,20 @@ V6 LSTM Edge Prediction Pipeline
 Time-sequence model for dYdX BTC-USD perpetual futures.
 
 Architecture:
-  - Input: last SEQ_LEN snapshots (60 snapshots = ~3 minutes of context)
-  - Each snapshot: 80 features (same as V5 + V4 meta-features)
-  - LSTM backbone -> shared temporal pattern learning
-  - Two output heads: E(edge_long), E(edge_short)
-  - 3-minute lookahead labels (same as V5)
+  - Input: 60 consecutive snapshots (~3 min of context at ~3s intervals)
+  - 42 pure BTC microstructure features (no Polymarket)
+  - 3-layer LSTM (128 hidden) with attention pooling
+  - 6 output heads: edge_long, edge_short, MFE, MAE, time_in_profit, path_efficiency
+  - Multi-component loss: Huber + edge weighting + ranking
 
-Advantages over LightGBM (V5):
-  - Sees sequences: "momentum accelerating for 10 snapshots" vs single point
-  - Learns temporal patterns: reversals, breakouts, regime transitions
-  - Asymmetric heads: long and short predictions can diverge
-
-Labels: (btc_price_3min_later - btc_price_now) / btc_price_now - maker_fees
-Fees: 0.01% per side = 0.02% round trip (dYdX Tier 1 maker)
+Labels: (btc_price_3min_later - btc_price_now) / btc_price_now - 0.02% maker fees
+Evaluation: Walk-forward (5 folds), 3-way split (train/val/test), Spearman correlation
 
 Usage:
-  python train_v6_lstm.py
+  python train_v6_lstm.py           # full eval (5 folds, ~50 min)
+  python train_v6_lstm.py --quick   # quick eval (3 folds, ~15 min)
+  python train_v6_lstm.py --fast    # train + save only, no eval (~10 min)
+  python train_v6_lstm.py --pnl-loss  # experimental PnL-aware loss
 """
 
 import os
@@ -156,81 +154,9 @@ def _rest_fetch(table, params, limit=500):
     return rows
 
 
-# ── V4 scoring (same as train_v5_futures.py) ──────────────────────────────
-_v4_clf = _v4_imp = _v4_features = None
-_v4d_clf = _v4d_imp = None
-try:
-    with open("models/model_v4_profitable.pkl", "rb") as f:
-        _v4 = pickle.load(f)
-    _v4_clf = _v4["classifier"]
-    _v4_imp = _v4["classifier_imp"]
-    _v4_features = _v4["features"]
-    with open("models/model_v4_direction.pkl", "rb") as f:
-        _v4d = pickle.load(f)
-    _v4d_clf = _v4d["classifier"]
-    _v4d_imp = _v4d["classifier_imp"]
-    log.info(f"V4 loaded: {len(_v4_features)} features")
-except Exception as e:
-    log.warning(f"V4 NOT loaded: {e}")
-
-_REGIME_MAP = {"TREND_UP":2,"TREND_DOWN":-2,"VOLATILE":1,"CALM":0,"DEAD":-1}
-_SESSION_MAP = {"OVERLAP":3,"US":2,"LONDON":1,"ASIA":0,"OFFPEAK":-1}
-_ACTIVITY_MAP = {"HIGH":2,"NORMAL":1,"LOW":0,"DEAD":-1}
-_DAY_MAP = {"WEEKDAY":1,"WEEKEND":0}
-_BUCKET_MAP = {"heavy_fav":3,"favourite":2,"underdog":1,"longshot":0}
-
-
-def _score_v4(row):
-    if _v4_clf is None:
-        return 0.5, 0.5
-    try:
-        pm = _f(row.get("p_market"))
-        m30 = _f(row.get("momentum_30s"))
-        m60 = _f(row.get("momentum_60s"))
-        li = _f(row.get("liq_imbalance"))
-        vr = _f(row.get("vol_range_pct"))
-        fr = _f(row.get("funding_rate"))
-        str_val = _f(row.get("secs_to_resolution"))
-        sl_val = _f(row.get("secs_left"))
-        str_ = str_val if not np.isnan(str_val) else (sl_val if not np.isnan(sl_val) else 300.0)
-        if str_ < 0: str_ = 0.0
-        mp = _f(row.get("market_progress"))
-        if np.isnan(mp): mp = max(0.0, min(1.0, 1.0 - str_ / 300.0))
-
-        feat = {}
-        for fname in _v4_features:
-            val = _f(row.get(fname))
-            if fname == "secs_to_resolution": val = str_
-            elif fname == "log_secs_to_resolution": val = math.log1p(str_)
-            elif fname == "market_progress": val = mp
-            elif fname == "mom_accel_abs": val = abs(m30 - m60) if not (np.isnan(m30) or np.isnan(m60)) else np.nan
-            elif fname == "pm_abs_deviation": val = abs(pm - 0.5) if not np.isnan(pm) else np.nan
-            elif fname == "pm_uncertainty": val = 1.0 - abs(pm - 0.5) * 2 if not np.isnan(pm) else np.nan
-            elif fname == "liq_imbal_x_secs": val = li * str_ if not np.isnan(li) else np.nan
-            elif fname == "liq_abs_imbalance": val = abs(li) if not np.isnan(li) else np.nan
-            elif fname == "funding_abs": val = abs(fr) if not np.isnan(fr) else np.nan
-            elif fname == "interact_mom_x_vol": val = m30 * vr if not (np.isnan(m30) or np.isnan(vr)) else np.nan
-            elif fname == "interact_liq_x_price": val = li * _f(row.get("price_vs_open_pct")) if not np.isnan(li) else np.nan
-            elif fname == "interact_mom_x_progress": val = m30 * mp if not np.isnan(m30) else np.nan
-            elif fname == "vol_x_pm_abs_dev": val = vr * abs(pm - 0.5) if not (np.isnan(vr) or np.isnan(pm)) else np.nan
-            elif fname == "okx_x_fr": val = _f(row.get("okx_funding")) * fr if not np.isnan(fr) else np.nan
-            elif fname == "regime_enc": val = _REGIME_MAP.get(row.get("regime", ""), 0)
-            elif fname == "session_enc": val = _SESSION_MAP.get(row.get("session", ""), 0)
-            elif fname == "activity_enc": val = _ACTIVITY_MAP.get(row.get("activity", ""), 0)
-            elif fname == "day_enc": val = _DAY_MAP.get(row.get("day_type", ""), 0)
-            elif fname == "bucket_enc": val = _BUCKET_MAP.get(row.get("price_bucket", ""), 0)
-            elif fname == "is_extreme_market": val = 1.0 if (not np.isnan(pm) and (pm > 0.85 or pm < 0.15)) else 0.0
-            feat[fname] = val if val is not None else np.nan
-        X = np.array([[feat.get(k, np.nan) for k in _v4_features]], dtype=np.float32)
-        X = _v4_imp.transform(X)
-        return float(_v4_clf.predict_proba(X)[0][1]), float(_v4d_clf.predict_proba(_v4d_imp.transform(X))[0][1])
-    except:
-        return 0.5, 0.5
-
-
-# ── Feature engineering (matches V5) ─────────────────────────────────────
+# ── Feature engineering ───────────────────────────────────────────────────
 FEATURE_COLS = [
-    # Time features (no Polymarket lifecycle — secs_to_resolution/market_progress removed)
+    # Time features
     "hour_sin", "hour_cos", "dow_sin", "dow_cos",
     # BTC price features
     "price_vs_open_pct", "momentum_30s", "momentum_60s", "momentum_120s",
@@ -252,9 +178,6 @@ FEATURE_COLS = [
     "tick_cvd_60s", "tick_taker_buy_ratio_60s", "tick_intensity_60s",
     # Velocity
     "delta_cvd", "delta_taker_buy", "delta_momentum", "delta_funding", "delta_basis",
-    # Polymarket features REMOVED — don't predict BTC price
-    # p_market, poly_spread, p_market_std, poly_flow_imb, poly_depth_ratio,
-    # poly_trade_imb, poly_up_buys, poly_down_buys, poly_trade_count, poly_large_pct
 ]
 
 
@@ -263,8 +186,6 @@ def build_feature_vector(row):
     vec = []
     for col in FEATURE_COLS:
         vec.append(_f(row.get(col)))
-    # V4 meta-features
-    # V4 meta-features REMOVED — leaky (V4 trained on all data) and adds latency
     return vec
 
 
@@ -384,9 +305,6 @@ def main():
     ts_arr = np.array(timestamps)
     px_arr = np.array(prices)
     log.info(f"  Timeline: {len(ts_arr):,} points, {(ts_arr[-1]-ts_arr[0])/3600:.1f} hours")
-
-    # V4 scoring REMOVED — leaky (trained on all data) and adds 2.5 min latency
-    # V6 features are pure BTC microstructure, no Polymarket dependency
 
     # Build feature vectors + lookahead labels + MFE/MAE
     log.info("  Building feature vectors and labels (with MFE/MAE)...")
