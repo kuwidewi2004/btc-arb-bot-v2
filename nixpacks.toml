@@ -1,8 +1,0 @@
-[phases.setup]
-aptPkgs = ["libgomp1", "gcc", "g++"]
-
-[phases.install]
-cmds = ["pip install -r requirements.txt"]
-
-[start]
-cmd = "python quant_engine.py"
