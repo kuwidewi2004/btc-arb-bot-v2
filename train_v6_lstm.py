@@ -284,12 +284,10 @@ def main():
         "tick_cvd_60s", "tick_taker_buy_ratio_60s", "tick_intensity_60s",
         "delta_cvd", "delta_taker_buy", "delta_momentum", "delta_funding", "delta_basis",
         "regime", "session", "activity", "day_type", "price_bucket",
-        "outcome_binary",
     ])
     log.info("Fetching snapshots (cached)...")
     rows = cached_fetch("v6_snapshots", cols, {
         "btc_price": "gt.0",
-        "outcome_binary": "not.is.null",
         "order": "created_at.asc",
     })
     log.info(f"  {len(rows):,} rows fetched")

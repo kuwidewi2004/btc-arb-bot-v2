@@ -312,12 +312,10 @@ def fetch_snapshots_v5() -> list:
         "delta_cvd","delta_taker_buy","delta_momentum","delta_poly","delta_score",
         "delta_funding","delta_basis",
         "btc_price",
-        "outcome_binary",
     ])
     from fetch_cache import cached_fetch
     all_rows = cached_fetch("v5_snapshots", cols, {
         "btc_price": "gt.0",
-        "outcome_binary": "not.is.null",
     })
     log.info(f"  {len(all_rows):,} total rows with btc_price")
 
